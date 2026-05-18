@@ -1,0 +1,62 @@
+# V2 Full ML pipeline experiment
+# Wires: ostrack_256 (tier-2) + ml_scene scheduler + scene classifier + appearance memory + motion predictor
+
+trackers:
+  0:
+    name: kcf_henriques
+  1:
+    name: mobiletrack
+  2:
+    name: ostrack_256
+
+detectors:
+  3:
+    name: yolov8n
+
+signals:
+  - name: motion_entropy
+    n_bins: 16
+    alpha: 0.8
+    mag_threshold: 1.0
+  - name: tracker_confidence
+
+scheduler:
+  name: ml_scene
+  fallback_scheduler_name: multi_tier
+  confidence_threshold: 0.60
+  override_frames: 15
+  risk_prearm_frames: 3
+  scene_to_tier:
+    0: 0  # CLEAR -> tier 0 (KCF)
+    1: 1  # MODERATE -> tier 1 (MobileTrack)
+    2: 2  # CHALLENGING -> tier 2 (OSTrack)
+    3: 2  # RISK_LOSS -> tier 2
+    4: 3  # RECOVERY -> tier 3 (YOLO)
+    5: 1  # LOW_RES -> tier 1
+
+scene_classifier:
+  name: mobilenetv3_tiny
+  classify_interval: 5
+  confidence_threshold: 0.60
+  device: cpu
+
+appearance_memory:
+  name: cosine_memory
+  max_templates: 50
+  forgetting_factor: 0.95
+  store_interval: 10
+  min_confidence: 0.60
+
+motion_predictor:
+  name: lstm_online
+  hidden_size: 32
+  seq_len: 10
+
+warmer:
+  name: default
+  lazy: true
+  n_warmup_passes: 3
+  target_latency_ms: 200.0
+
+dataset: synthetic
+seed: 42

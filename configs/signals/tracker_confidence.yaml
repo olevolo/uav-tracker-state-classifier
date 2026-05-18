@@ -1,0 +1,9 @@
+# TrackerConfidence switching signal (Phase 3 trivial switch).
+#
+# Emits the tracker's own TrackState.confidence as the scheduler input. Not a
+# replacement for motion entropy — serves to validate the Scheduler abstraction
+# end-to-end before Phase 4 ships the paper's method.
+
+name: tracker_confidence
+range: [0.0, 1.0]
+args: {}

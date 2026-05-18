@@ -1,0 +1,27 @@
+# Paper baseline — KCF+Kalman (T0) + MobileTrack (T1)
+# with a FixedPeriodicScheduler (alternate every K frames regardless of entropy).
+#
+# NOTE: FixedPeriodicScheduler is NOT YET IMPLEMENTED.
+# This config file is a stub so the sweep YAML can reference it.
+# The `fixed_periodic` variant in paper_table2.yaml carries a skip_note
+# so run_benchmark.py will skip it gracefully without error.
+#
+# When the scheduler is implemented:
+#   1. Add src/uav_tracker/schedulers/fixed_periodic.py
+#   2. Register it as "fixed_periodic" in SCHEDULERS
+#   3. Import it in schedulers/__init__.py
+#   4. Remove skip_note from configs/experiments/paper_table2.yaml
+#
+# Intended config once implemented:
+#
+# trackers:
+#   0: {name: kcf_kalman, args: {}}
+#   1: {name: mobiletrack, args: {device: cpu, dtype: float32}}
+# signals:
+#   - {name: motion_entropy, args: {n_bins: 16, alpha: 0.8, mag_threshold: 1.0}}
+# scheduler:
+#   name: fixed_periodic
+#   args: {period: 10, signal_name: motion_entropy}
+# dataset: {name: synthetic}
+# limit: null
+# seed: 42

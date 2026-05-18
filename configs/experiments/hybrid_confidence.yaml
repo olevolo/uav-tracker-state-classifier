@@ -1,0 +1,37 @@
+# Confidence-based hybrid: KCF Henriques (T0, ego-motion + APCE-proxy) + MobileTrack (T1).
+# Escalates when KCF peak drops below 60% of init (signal=1-conf ≥ E_hi=0.40).
+#
+# Improvements over paper_entropy_hybrid:
+#   - kcf_henriques tier-0 (ego-motion compensated, raised min_peak_ratio)
+#   - tracker_confidence signal (failure-reactive, not complexity-reactive)
+#   - faster thresholds: E_hi=0.40, E_lo=0.25, confirm=3, cooldown=10
+
+trackers:
+  0:
+    name: kcf_henriques
+    args:
+      min_peak_ratio: 0.25
+  1:
+    name: mobiletrack
+    args:
+      device: cpu
+      dtype: float32
+
+signals:
+  - name: tracker_confidence
+    args: {}
+
+scheduler:
+  name: hysteresis_binary
+  args:
+    E_hi: 0.40
+    E_lo: 0.25
+    confirm_frames: 3
+    cooldown_frames: 10
+    signal_name: tracker_confidence
+
+dataset:
+  name: uav123
+
+limit: null
+seed: 42

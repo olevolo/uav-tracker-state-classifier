@@ -1,0 +1,15 @@
+# OTB100 dataset (Wu et al. 2015) — Object Tracking Benchmark 2015.
+#
+# 100 generic sequences spanning color and grayscale. Used for paper Table 2
+# second column (OTB100 AUC/Pr) and for APCE calibration via its OTB50 subset
+# (ADR-0007).
+
+name: otb100
+root: ${oc.env:UAV_DATA_ROOT,data}/OTB100
+split: all                      # {all, otb50}
+# Attribute short-codes shared with UAV123 (see uav123.yaml for the legend).
+attributes: []
+streaming: true
+frame_ext: jpg
+gt_filename: groundtruth_rect.txt
+attributes_manifest: ${.root}/attributes.json

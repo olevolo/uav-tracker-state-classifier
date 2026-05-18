@@ -1,0 +1,98 @@
+# ---- Local tool state (never commit) ----
+.claude/
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+.eggs/
+build/
+dist/
+wheels/
+pip-wheel-metadata/
+.installed.cfg
+MANIFEST
+*.manifest
+*.spec
+*.pyc
+
+# ---- Virtual envs ----
+.venv/
+venv/
+env/
+ENV/
+
+# ---- Test / coverage / caches ----
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+*.cover
+.cache/
+.tox/
+.nox/
+
+# ---- Tooling secrets ----
+.env
+.envrc
+.secrets.baseline
+
+# ---- OS cruft ----
+.DS_Store
+Thumbs.db
+
+# ---- Project-local runtime artefacts (anchored to repo root) ----
+# Datasets (can be symlinks to external storage).
+/data/
+# Tracker weights.
+/weights/
+# Benchmark / ablation / figure outputs.
+/outputs/
+# Rendered demo MP4s.
+/demos/
+# Legacy: results/ was the pre-refactor output dir. Kept gitignored so
+# existing CSVs don't get accidentally committed.
+/results/
+Desktop.ini
+
+# ---- Editors / IDEs ----
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+.settings/
+
+# ---- Hydra / ML tooling outputs ----
+outputs/
+multirun/
+wandb/
+lightning_logs/
+mlruns/
+
+# ---- Project-specific data roots (must never be committed) ----
+data/
+weights/
+results/
+notebooks/.ipynb_checkpoints/
+
+# ---- Node (for any frontend we might accrete later) ----
+node_modules/
+
+# ---- Terraform ----
+*.tfstate
+*.tfstate.*
+.terraform/
+.terraform.lock.hcl
+
+# ---- Docker ----
+.dockerignore.local

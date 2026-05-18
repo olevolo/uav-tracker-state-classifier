@@ -1,0 +1,15 @@
+# CircularResultantSignal — directional-statistics switching signal (Phase 5).
+#
+# Computes mean resultant length R over magnitude-weighted residual-flow
+# orientation vectors; emits 1 - R as the disorder signal.
+# Uses same Shi-Tomasi + LK + global-motion front-end as motion_entropy.
+
+name: circular_resultant
+range: [0.0, 1.0]
+args:
+  mag_threshold: 1.0      # minimum residual-flow magnitude (px)
+  alpha: 0.8              # EMA smoothing factor
+  max_corners: 200        # Shi-Tomasi maxCorners
+  quality_level: 0.01     # Shi-Tomasi qualityLevel
+  background_band: 20     # background band width (px) for global-motion
+  seed: 42                # RANSAC RNG seed

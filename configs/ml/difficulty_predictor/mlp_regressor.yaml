@@ -1,0 +1,3 @@
+name: mlp_regressor
+device: cpu
+horizon_frames: 10

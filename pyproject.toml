@@ -1,0 +1,211 @@
+[build-system]
+requires = ["hatchling>=1.24"]
+build-backend = "hatchling.build"
+
+[project]
+name = "uav-tracker"
+version = "0.0.1"
+description = "Entropy-Guided Tracker Switching Method for UAV Real-Time Tracking (Oleksiuk & Velhosh, 2026) — modular, plugin-based reproduction and extension."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10,<3.11"
+authors = [
+    { name = "Volodymyr Oleksiuk" },
+    { name = "Serhiy Velhosh" },
+]
+keywords = [
+    "uav",
+    "tracking",
+    "computer-vision",
+    "entropy",
+    "kcf",
+    "siamese",
+    "hybrid-tracker",
+]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS :: MacOS X",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Topic :: Scientific/Engineering :: Image Recognition",
+]
+dependencies = [
+    "numpy<2",  # opencv-contrib-python 4.9.0.80 wheel is built against NumPy 1.x ABI (_ARRAY_API)
+    "scipy",
+    "torch==2.1.0",
+    "torchvision==0.16.0",
+    "opencv-contrib-python==4.9.0.80",
+    "hydra-core",
+    "omegaconf",
+    "typer",
+    "structlog",
+    "thop",
+    "fvcore",
+    "rich",
+    "pyyaml",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "pytest-cov",
+    "pytest-benchmark",
+    "hypothesis",
+    "ruff",
+    "mypy",
+    "pre-commit",
+    "detect-secrets",
+]
+# Phase 6+ detection tier + richer metrics + change-point schedulers.
+phase6 = [
+    "ultralytics",
+    "torchmetrics",
+    "ruptures",
+]
+
+[project.scripts]
+uav-tracker = "uav_tracker.cli:app"
+
+[project.urls]
+Homepage = "https://github.com/voleksiuk/uav-entropy-tracker"
+Issues = "https://github.com/voleksiuk/uav-entropy-tracker/issues"
+Changelog = "https://github.com/voleksiuk/uav-entropy-tracker/blob/master/CHANGELOG.md"
+
+# --- Hatch packaging metadata ---------------------------------------------
+[tool.hatch.build.targets.wheel]
+packages = ["src/uav_tracker"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "src/uav_tracker",
+    "configs",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md",
+    "pyproject.toml",
+]
+
+# --- uv ------------------------------------------------------------------
+# Extra indexes for CUDA 11.8 wheels (PyTorch) used on Linux GPU hosts.
+# Apple Silicon / macOS falls back to the default PyPI CPU wheels.
+[tool.uv]
+dev-dependencies = [
+    "pytest",
+    "pytest-cov",
+    "pytest-benchmark",
+    "hypothesis",
+    "ruff",
+    "mypy",
+    "pre-commit",
+    "detect-secrets",
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu118"
+url = "https://download.pytorch.org/whl/cu118"
+explicit = true
+
+[tool.uv.sources]
+# Opt-in per-host: default is PyPI CPU wheels; Linux+CUDA contributors set
+# UV_INDEX_STRATEGY=unsafe-first-match and point torch at pytorch-cu118.
+# DevOps: formalize in Makefile setup via env detection before Phase 2.
+
+# --- ruff ----------------------------------------------------------------
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+extend-exclude = [
+    "data",
+    "weights",
+    "results",
+    "outputs",
+    "multirun",
+    "wandb",
+    ".venv",
+]
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "F",   # pyflakes
+    "I",   # isort
+    "UP",  # pyupgrade
+    "B",   # flake8-bugbear
+    "C4",  # flake8-comprehensions
+    "SIM", # flake8-simplify
+]
+ignore = []
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+skip-magic-trailing-comma = false
+
+# --- mypy ---------------------------------------------------------------
+[tool.mypy]
+python_version = "3.10"
+strict = true
+warn_unused_configs = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+no_implicit_optional = true
+show_error_codes = true
+files = ["src"]
+
+[[tool.mypy.overrides]]
+module = [
+    "cv2.*",
+    "thop.*",
+    "fvcore.*",
+    "scipy.*",
+    "hydra.*",
+    "omegaconf.*",
+    "ultralytics.*",
+    "torchmetrics.*",
+    "ruptures.*",
+]
+ignore_missing_imports = true
+
+# --- pytest -------------------------------------------------------------
+[tool.pytest.ini_options]
+minversion = "7.0"
+testpaths = ["tests"]
+addopts = [
+    "-ra",
+    "--strict-markers",
+    "--strict-config",
+    "--tb=short",
+    "-m", "not slow",
+]
+markers = [
+    "unit: fast, isolated unit tests (default)",
+    "integration: end-to-end with fixtures",
+    "property: hypothesis-based property tests",
+    "contract: plugin protocol conformance tests",
+    "slow: takes >1s; skipped in quick runs",
+]
+filterwarnings = [
+    "error",
+    "ignore::DeprecationWarning:torch.*",
+    "ignore::UserWarning:torchvision.*",
+]
+
+# --- coverage -----------------------------------------------------------
+[tool.coverage.run]
+source = ["src/uav_tracker"]
+branch = true
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = false
+exclude_lines = [
+    "pragma: no cover",
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+]

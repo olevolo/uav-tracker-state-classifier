@@ -1,0 +1,50 @@
+# Normalize line endings to LF for all text files
+* text=auto eol=lf
+
+# Python source always LF
+*.py text eol=lf
+*.pyi text eol=lf
+*.toml text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+*.md text eol=lf
+*.cfg text eol=lf
+*.ini text eol=lf
+*.json text eol=lf
+
+# Shell / config files
+Makefile text eol=lf
+*.sh text eol=lf
+Dockerfile* text eol=lf
+
+# Mark binary types so git doesn't try to diff them
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.pth binary
+*.onnx binary
+*.pt binary
+*.bin binary
+*.npz binary
+*.npy binary
+*.mp4 binary
+*.webm binary
+*.mov binary
+*.pdf binary
+*.docx binary
+*.pptx binary
+*.xlsx binary
+
+# NOTE: Git LFS track patterns below. We declare these so that contributors who
+# DO have git-lfs installed will route large binaries through LFS. Contributors
+# without LFS can still operate because none of these files are committed in
+# Phase 0. LFS install becomes mandatory only from Phase 8 (figures + demo MP4).
+# See docs/runbooks/branch-protection.md for enablement steps.
+results/figures/*.png filter=lfs diff=lfs merge=lfs -text
+results/figures/*.svg filter=lfs diff=lfs merge=lfs -text
+results/figures/*.pdf filter=lfs diff=lfs merge=lfs -text
+demo/*.mp4 filter=lfs diff=lfs merge=lfs -text
+*.pth filter=lfs diff=lfs merge=lfs -text
+*.onnx filter=lfs diff=lfs merge=lfs -text

@@ -1,0 +1,88 @@
+name: plugin-contract
+#
+# Enumerates every registered plugin and asserts:
+#   - Protocol conformance (runtime_checkable).
+#   - reset() idempotency.
+#   - No cross-plugin imports.
+# Blocks merge on failure.  See PLAN §4.4.
+#
+# Security note: third-party Actions are pinned to version tags (matching the
+# style used in .github/workflows/ci.yml and smoke-eval.yml).  Tag pins are
+# NOT immutable — supply-chain hardening to full 40-char SHA pins is tracked
+# in docs/runbooks/branch-protection.md and should be done before enforcing
+# branch protection on this check.
+#
+# No secrets used.  No dataset or weight downloads.
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+permissions:
+  contents: read
+
+concurrency:
+  # Cancel superseded runs for the same PR; group by PR number when available,
+  # fall back to ref (handles push-to-master).  Mirrors smoke-eval.yml style.
+  group: plugin-contract-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  plugin-contract:
+    name: "plugin protocol conformance"
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+
+    steps:
+      # -----------------------------------------------------------------------
+      # 1. Checkout
+      # -----------------------------------------------------------------------
+      # Tag pin matches ci.yml / smoke-eval.yml style.  Harden to SHA before
+      # branch-protection enforcement — see docs/runbooks/branch-protection.md.
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      # -----------------------------------------------------------------------
+      # 2. Set up Python 3.10
+      # -----------------------------------------------------------------------
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      # -----------------------------------------------------------------------
+      # 3. Install uv
+      # -----------------------------------------------------------------------
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+
+      # -----------------------------------------------------------------------
+      # 4. Cache .venv (keyed on lockfile + pyproject only — not '**/*')
+      # -----------------------------------------------------------------------
+      - name: Cache .venv
+        id: cache-venv
+        uses: actions/cache@v4
+        with:
+          path: .venv
+          key: venv-${{ runner.os }}-py3.10-${{ hashFiles('uv.lock', 'pyproject.toml') }}
+          restore-keys: |
+            venv-${{ runner.os }}-py3.10-
+
+      # -----------------------------------------------------------------------
+      # 5. Install deps on cache miss
+      #    numpy<2 pin is declared in pyproject.toml — uv honours it automatically.
+      # -----------------------------------------------------------------------
+      - name: Install dependencies
+        if: steps.cache-venv.outputs.cache-hit != 'true'
+        run: |
+          uv venv .venv --python 3.10
+          uv pip install --python .venv/bin/python -e ".[dev]"
+
+      # -----------------------------------------------------------------------
+      # 6. Run plugin contract tests
+      # -----------------------------------------------------------------------
+      - name: pytest tests/contract/
+        run: .venv/bin/pytest tests/contract/ -v

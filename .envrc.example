@@ -1,0 +1,18 @@
+# direnv sample — copy to `.envrc` and run `direnv allow`.
+#
+# NOTE: the project now defaults to repo-local paths (<repo>/data, /weights,
+# /outputs, /demos) via src/uav_tracker/paths.py.  These env vars are
+# OPTIONAL overrides; uncomment if you want to point data/weights/outputs
+# at external storage (e.g. a big disk or a shared network mount).
+#
+# export UAV_DATA_ROOT=/path/to/big/disk/uav-tracker-data
+# export UAV_WEIGHTS_ROOT=/path/to/big/disk/uav-tracker-weights
+# export UAV_RESULTS_ROOT=/path/to/big/disk/uav-tracker-results
+
+# Private mirror base URL for datasets + weights. DevOps populates with the
+# real S3/B2 bucket URL once provisioned via infra/terraform.
+# export UAV_MIRROR_URL=
+
+# Make `src/` importable without an editable install (handy for throwaway
+# scratch scripts). The make-managed venv does a real editable install.
+export PYTHONPATH=$PWD/src

@@ -1,0 +1,93 @@
+name: ci
+#
+# Phase 0 CI gate. Runs on every PR and every push to master.
+# Budget: <10 min per PR on the default matrix. Keep it CPU-only and cached.
+#
+# DevOps: swap @v4/@v5 tags for full commit SHAs before enforcing branch
+# protection. Tags are fine for Phase 0 bootstrap — supply-chain hardening
+# is tracked in docs/runbooks/branch-protection.md.
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality-gates:
+    name: "lint + type + test (${{ matrix.os }} / py${{ matrix.python }})"
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python: ["3.10"]
+    steps:
+      # DevOps: swap to full SHA before enforcing branch protection
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      # DevOps: swap to full SHA before enforcing branch protection
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+          cache-dependency-glob: |
+            **/pyproject.toml
+            **/uv.lock
+            **/requirements*.txt
+
+      # DevOps: swap to full SHA before enforcing branch protection
+      - name: Set up Python ${{ matrix.python }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Cache pip/uv resolver state
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/uv
+            .venv
+          key: uv-${{ runner.os }}-${{ matrix.python }}-${{ hashFiles('pyproject.toml', 'uv.lock', 'requirements*.txt') }}
+          restore-keys: |
+            uv-${{ runner.os }}-${{ matrix.python }}-
+
+      - name: make setup
+        run: make setup
+
+      - name: make lint
+        run: make lint
+
+      - name: make typecheck
+        run: make typecheck
+
+      - name: make test
+        run: |
+          .venv/bin/pytest tests/ \
+            -m "unit or property" \
+            --cov=src/uav_tracker \
+            --cov-report=xml \
+            --cov-report=term-missing
+
+      - name: make test-contract
+        run: make test-contract
+
+      - name: Upload coverage artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-${{ matrix.os }}-py${{ matrix.python }}
+          path: |
+            coverage.xml
+            htmlcov/
+          if-no-files-found: ignore
+          retention-days: 14

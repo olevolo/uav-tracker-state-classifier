@@ -1,0 +1,35 @@
+name: nightly-eval
+#
+# Nightly per-phase demo on the self-hosted T4 runner. See
+# docs/runbooks/t4-runner.md for provisioning.
+# Stubbed body — implementations land per PLAN §11.
+
+on:
+  schedule:
+    # 03:00 UTC daily. Evaluated against master HEAD.
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nightly-eval
+  cancel-in-progress: true
+
+jobs:
+  nightly-eval:
+    name: "nightly T4 eval"
+    runs-on: [self-hosted, gpu-t4, linux, x64]
+    timeout-minutes: 240
+    steps:
+      # DevOps: swap to full SHA before enforcing branch protection
+      - uses: actions/checkout@v4
+
+      - name: nightly stub
+        run: |
+          echo "nightly-eval: implementations land per PLAN §11."
+          echo "Phase 1: KCF baseline UAV123 full."
+          echo "Phase 4: paper_entropy_hybrid UAV123+OTB100."
+          echo "Phase 7: all ablations."
+          exit 0

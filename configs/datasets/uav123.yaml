@@ -1,0 +1,30 @@
+# UAV123 dataset (Mueller et al. 2016).
+#
+# 123 aerial sequences, ~110K frames. Per-sequence attributes drive the filter
+# logic in ADR-0002's Dataset.filter(). Standard attribute short-codes:
+#   ARC  Aspect Ratio Change
+#   BC   Background Clutter
+#   CM   Camera Motion
+#   FM   Fast Motion
+#   FOC  Full Occlusion
+#   IV   Illumination Variation
+#   LR   Low Resolution
+#   OV   Out of View
+#   POC  Partial Occlusion
+#   SOB  Similar Object
+#   SV   Scale Variation
+#   VC   Viewpoint Change
+
+name: uav123
+root: ${oc.env:UAV_DATA_ROOT,data}/UAV123
+split: all                      # {all, 20L (long-term subset), attribute-named}
+# Attributes to include; empty set = include everything
+attributes: []
+# Streaming mode avoids loading full sequences into RAM (ADR-0002).
+streaming: true
+# Frame format (png for UAV123)
+frame_ext: jpg
+# Ground truth file name inside each sequence folder
+gt_filename: groundtruth_rect.txt
+# Path to attribute manifest (DevOps provisions this during dataset download)
+attributes_manifest: ${.root}/attributes.json

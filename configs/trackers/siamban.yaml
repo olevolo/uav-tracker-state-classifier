@@ -1,0 +1,27 @@
+# SiamBAN R50 tracker hyperparameters (Chen et al., CVPR 2020).
+#
+# Weights: siamban_r50_l234.pth — epoch-20 checkpoint trained on
+# VID+YouTube-BB+COCO+DET+GOT-10k; downloaded alongside MobileTrack weights.
+# Weights live at: $UAV_WEIGHTS_ROOT/mobiletrack/siamban_r50_l234.pth
+#
+# Tracking hypers come from the SiamBAN paper defaults (Table 1) and match
+# the UAV123 tuned values in experiments/siamban_mobilev2_l234/config.yaml.
+
+name: siamban
+tier_hint: 1
+args:
+  device: cuda              # CPU fallback handled by the tracker impl
+  dtype: float32            # float16 on CUDA saves ~20% memory; set to float16 if on GPU
+  weights_path: null        # null → resolve via $UAV_WEIGHTS_ROOT/mobiletrack/siamban_r50_l234.pth
+
+  # Crop / scale settings (SiamBAN defaults)
+  exemplar_size: 127
+  instance_size: 255
+  base_size: 8
+  context_amount: 0.5
+  stride: 8
+
+  # Response post-processing (UAV123-tuned values from MobileTrack experiments)
+  penalty_k: 0.14
+  window_influence: 0.45
+  lr: 0.30

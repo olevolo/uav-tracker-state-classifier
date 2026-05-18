@@ -1,0 +1,25 @@
+model:
+  name: mobilenetv3_tiny
+  n_classes: 6
+  classify_interval: 5
+
+data:
+  root: ${oc.env:UAV_DATA_ROOT,data}/uav123
+  labels_cache: ${oc.env:UAV_DATA_ROOT,data}/uav123_labels.npz
+  train_batch_size: 64
+  val_batch_size: 128
+  num_workers: 4
+  sample_interval: 2
+  augment: true
+
+training:
+  max_epochs: 30
+  warmup_epochs: 3
+  lr: 1.0e-3
+  weight_decay: 1.0e-4
+  early_stopping_patience: 5
+  seed: 42
+
+output:
+  checkpoint_dir: weights/scene_classifier
+  log_dir: outputs/training/scene_classifier

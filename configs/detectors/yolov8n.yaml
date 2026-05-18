@@ -1,0 +1,23 @@
+# YOLOv8-n detector default configuration.
+#
+# Used by the Phase 6 multi-tier scheduler (Engineer B) to instantiate the
+# tier-2 re-detection stage via:
+#
+#   detector = DETECTORS.build(cfg["name"], **cfg["args"])
+#
+# All fields map 1-to-1 to YOLOv8Detector.__init__ parameters.
+#
+# Weight auto-download: ultralytics fetches yolov8n.pt to its cache on first
+# use (default: ~/.config/Ultralytics/).  Override with the YOLO_CONFIG_DIR
+# env-var or by pointing model_name at a local path.
+#
+# License note: ultralytics is AGPL-3.0 — see docs/model_cards/yolov8n.md.
+
+name: yolov8n
+
+args:
+  model_name: yolov8n.pt
+  device: cpu
+  conf_threshold: 0.25
+  iou_threshold: 0.45
+  classes: null  # null = all 80 COCO classes; set to [0] for person-only, etc.

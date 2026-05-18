@@ -1,0 +1,6 @@
+name: ostrack_256
+device: cuda
+dtype: float32
+search_size: 256
+template_size: 128
+scale_factor: 2.0

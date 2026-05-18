@@ -1,0 +1,6 @@
+name: stark_s50
+device: cuda
+dtype: float32
+search_size: 320
+template_size: 128
+scale_factor: 2.5

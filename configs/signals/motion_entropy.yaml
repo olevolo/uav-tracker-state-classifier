@@ -1,0 +1,24 @@
+# MotionEntropy switching signal (paper's method).
+#
+# Paper defaults (Oleksiuk & Velhosh 2026, §3.2):
+#   n_bins = 16 (22.5 degrees each, covering [0, 2*pi))
+#   alpha = 0.8 (EMA smoothing on normalized entropy)
+#   mag_threshold = 1.0 px (vectors below are dropped)
+#   max_corners = 200 (Shi-Tomasi maxCorners)
+#   quality_level = 0.01 (Shi-Tomasi qualityLevel)
+#   background_band = 20 (background band width in pixels around ROI)
+# Range: H_tilde in [0, 1] after normalization by log2(n_bins).
+
+name: motion_entropy
+range: [0.0, 1.0]
+args:
+  n_bins: 16
+  alpha: 0.8
+  mag_threshold: 1.0
+  max_corners: 200
+  quality_level: 0.01
+  background_band: 20
+  # Global-motion fallback (ADR-0006) — strict improvement on by default
+  # Level 1: RANSAC homography (primary)
+  # Level 2: LMedS affine if RANSAC < 4 inliers
+  # Level 3: reuse prior estimate + reliable=False

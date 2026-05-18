@@ -1,0 +1,6 @@
+name: cosine_memory
+max_templates: 50
+forgetting_factor: 0.95
+store_interval: 10
+min_confidence: 0.60
+embedding_dim: 64

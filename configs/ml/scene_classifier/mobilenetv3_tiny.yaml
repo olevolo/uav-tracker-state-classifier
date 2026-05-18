@@ -1,0 +1,5 @@
+name: mobilenetv3_tiny
+device: cpu
+dtype: float32
+classify_interval: 5
+confidence_threshold: 0.60

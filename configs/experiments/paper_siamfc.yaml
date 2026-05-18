@@ -1,0 +1,35 @@
+# Paper Phase 2 baseline: SiamFC (Bertinetto 2016) on synthetic dataset.
+#
+# This config drives the Phase 2 exit demo:
+#   uav-tracker evaluate --config configs/experiments/paper_siamfc.yaml --limit 3
+#
+# AUC will be low without real pre-trained weights (random init) — that
+# is expected and explicitly noted in PLAN §11 Phase 2. The gates are:
+#   1. Plugin loads (no error), 2. config flow drives evaluation end-to-end.
+
+tracker:
+  name: siamfc
+  args:
+    device: cpu
+    dtype: float32
+    # weights_path: null  # Use $UAV_WEIGHTS_ROOT/siamfc/siamfc_alexnet_e50.pth when available
+
+dataset:
+  name: synthetic
+
+# Evaluation settings
+limit: 3
+seed: 42
+
+# SiamFC hyperparameters (from configs/trackers/siamfc.yaml)
+# Included here for self-contained experiment reproducibility.
+# _hyper:
+#   exemplar_size: 127
+#   instance_size: 255
+#   score_size: 17
+#   scale_num: 3
+#   scale_step: 1.0375
+#   scale_penalty: 0.9745
+#   window_influence: 0.176
+#   total_stride: 8
+#   response_up: 16

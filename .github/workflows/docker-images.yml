@@ -1,0 +1,59 @@
+name: docker-images
+#
+# Build and push cpu / gpu / jetson images on v* tags. Stub-level — wired
+# for full release in Phase 7 alongside release.yml + SBOM.
+#
+# DevOps: swap @v4/@v5 tags for full SHAs before enforcing branch protection.
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: docker-images-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: "build ${{ matrix.variant }}"
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: cpu
+            dockerfile: infra/docker/Dockerfile.cpu
+            platforms: linux/amd64
+          - variant: gpu
+            dockerfile: infra/docker/Dockerfile.gpu
+            platforms: linux/amd64
+          - variant: jetson
+            dockerfile: infra/docker/Dockerfile.jetson
+            platforms: linux/arm64
+    steps:
+      # DevOps: swap to full SHA before enforcing branch protection
+      - uses: actions/checkout@v4
+
+      # DevOps: swap to full SHA before enforcing branch protection
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      # DevOps: swap to full SHA before enforcing branch protection
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Stub build
+        run: |
+          echo "docker-images: stub. Actual push to GHCR deferred."
+          echo "variant=${{ matrix.variant }} dockerfile=${{ matrix.dockerfile }}"
+          # TODO(DevOps): once GHCR namespace is set up, uncomment the buildx push.
+          # docker buildx build \
+          #   --platform ${{ matrix.platforms }} \
+          #   -f ${{ matrix.dockerfile }} \
+          #   -t ghcr.io/${{ github.repository_owner }}/uav-tracker:${{ matrix.variant }}-${{ github.ref_name }} \
+          #   --push .

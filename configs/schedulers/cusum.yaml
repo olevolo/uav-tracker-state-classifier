@@ -1,0 +1,17 @@
+# CUSUMScheduler — change-point detection scheduler (Phase 5).
+#
+# Uses ruptures.Pelt (L2 cost) to detect change-points in the rolling
+# signal history. Escalates to tier 1 when a change-point falls within
+# the last `lookback` frames.
+#
+# Requires: uv pip install ruptures
+
+name: cusum
+tiers: 2
+args:
+  penalty: 3.0            # Pelt penalty (higher = fewer change-points)
+  min_size: 5             # minimum segment length for Pelt
+  lookback: 10            # frames to search for a fresh change-point
+  history_len: 50         # rolling history window length
+  cooldown_frames: 5      # hold tier after change-point detected
+  signal_name: motion_entropy

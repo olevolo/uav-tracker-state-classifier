@@ -1,0 +1,31 @@
+# Phase 6: 3-tier hybrid with YOLOv8-n detection fallback.
+#
+# Tier 0: KCF+Kalman (fast, always-on)
+# Tier 1: MobileTrack (deep, high-entropy)
+# Tier 2: YOLOv8n (detector — re-initialises lower tiers on recovery)
+#
+# Consumed by `uav-tracker evaluate --config hybrid_with_detection.yaml`
+
+trackers:
+  0: {name: kcf_kalman, args: {}}
+  1: {name: mobiletrack, args: {device: cpu, dtype: float32}}
+
+detectors:
+  2: {name: yolov8n, args: {model_name: yolov8n.pt, device: cpu, conf_threshold: 0.25}}
+
+signals:
+  - {name: motion_entropy, args: {n_bins: 16, alpha: 0.8}}
+  - {name: tracker_confidence, args: {}}
+
+scheduler:
+  name: multi_tier
+  args:
+    tier_thresholds: [[0.50, 0.35], [0.80, 0.65]]
+    confirm_frames: 5
+    cooldown_frames: 5
+    signal_name: motion_entropy
+    lost_frames_threshold: 15
+
+dataset: {name: uav123, args: {root: /Users/voleksiuk/uav-tracker-data/uav123}}
+limit: 3
+seed: 42

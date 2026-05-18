@@ -1,0 +1,31 @@
+# KCF Henriques 2015 tracker hyperparameters.
+#
+# Reference: Henriques et al., "High-Speed Tracking with Kernelized
+# Correlation Filters", TPAMI 2015.  DOI: 10.1109/TPAMI.2014.2345390
+#
+# These values match the paper's preferred HOG configuration (§4.2):
+#   sigma = 0.5       (RBF kernel bandwidth)
+#   lambda = 1e-4     (ridge regularisation)
+#   interp_factor     = 0.075 (HOG appearance update rate)
+#   padding           = 2.5   (search window relative to target)
+#   output_sigma_factor = 0.1 (Gaussian label bandwidth)
+#   cell_size         = 4     (4x4 pixel HOG cells)
+#   scale_step        = 1.05  (3-level scale pyramid)
+#   scale_penalty     = 0.95  (off-centre scale response penalty)
+#
+# Tracker is registered as `kcf_henriques`.
+
+name: kcf_henriques
+tier_hint: 0
+args:
+  sigma: 0.5                   # RBF kernel bandwidth (paper value)
+  lambda_: 0.0001              # ridge regularisation
+  interp_factor: 0.075         # appearance model update rate (HOG config)
+  padding: 2.2                 # search window relative to object size (2.2 vs paper's 2.5)
+  output_sigma_factor: 0.1     # Gaussian label bandwidth factor
+  cell_size: 4                 # HOG cell size in pixels (4 = paper default)
+  scale_step: 1.05             # scale pyramid step
+  scale_penalty: 0.95          # penalty for off-centre scale responses
+  min_peak_ratio: 0.10         # peak threshold for model update (failure guard)
+  max_disp_factor: 0.50        # max per-frame displacement as fraction of search window
+  scale_lr: 1.0                # scale update learning rate (1.0 = instantaneous)

@@ -1,0 +1,34 @@
+# CODEOWNERS
+#
+# Last-match-wins. Keep architect-owned paths AFTER engineer-wide rules so
+# that `base.py`, `types.py`, and `registry.py` stay with Architect even
+# when living under src/uav_tracker/.
+#
+# Usernames are placeholders (user will replace with real GitHub handles
+# before enabling branch protection enforcement).
+
+# ---- Engineer-wide defaults under src/ + tests/ + notebooks/ --------------
+/src/uav_tracker/**         @engineer
+/tests/**                   @engineer
+/notebooks/**               @engineer
+
+# ---- Architect overrides for Protocol + registry + types ------------------
+/src/uav_tracker/**/base.py @architect
+/src/uav_tracker/types.py   @architect
+/src/uav_tracker/registry.py @architect
+
+# ---- Architect: planning, ADRs, experiment configs -----------------------
+/docs/adr/**                @architect
+/configs/experiments/**     @architect
+/PLAN.md                    @architect
+/AGENTS.md                  @architect
+
+# ---- DevOps: packaging, CI, infra, dataset/weight pipelines --------------
+/pyproject.toml             @devops
+/Makefile                   @devops
+/.github/**                 @devops
+/infra/**                   @devops
+/scripts/download_*.py      @devops
+
+# ---- Joint ownership -----------------------------------------------------
+/CODEOWNERS                 @architect @devops

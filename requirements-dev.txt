@@ -1,0 +1,14 @@
+# generated via: uv pip compile pyproject.toml --extra dev -o requirements-dev.txt
+# DevOps: regenerate via 'make compile-deps' after editing pyproject.toml
+# NOTE: this is a hand-written faithful snapshot of the dev deps.
+
+-r requirements.txt
+
+pytest
+pytest-cov
+pytest-benchmark
+hypothesis
+ruff
+mypy
+pre-commit
+detect-secrets

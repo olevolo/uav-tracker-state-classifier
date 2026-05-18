@@ -1,0 +1,42 @@
+# Phase 5 scheduler-sweep ablation.
+#
+# Compares 4 scheduler alternatives with identical base hybrid:
+#   tier-0: kcf_kalman, tier-1: mobiletrack,
+#   signal: motion_entropy (paper defaults)
+# Dataset: synthetic (seed 42), no external data required.
+#
+# Usage:
+#   .venv/bin/uav-tracker ablate --sweep configs/experiments/ablation_schedulers.yaml --limit 3
+
+sweep_type: schedulers
+
+base:
+  dataset: {name: synthetic}
+  seed: 42
+  trackers:
+    0: {name: kcf_kalman, args: {}}
+    1: {name: mobiletrack, args: {device: cpu, dtype: float32}}
+  signal:
+    name: motion_entropy
+    args: {n_bins: 16, alpha: 0.8, mag_threshold: 1.0}
+
+variants:
+  - name: hysteresis_binary
+    scheduler:
+      name: hysteresis_binary
+      args: {E_hi: 0.65, E_lo: 0.50, confirm_frames: 5, cooldown_frames: 5, signal_name: motion_entropy}
+
+  - name: cusum
+    scheduler:
+      name: cusum
+      args: {penalty: 3.0, min_size: 5, lookback: 10, history_len: 50, cooldown_frames: 5, signal_name: motion_entropy}
+
+  - name: adaptive_threshold
+    scheduler:
+      name: adaptive_threshold
+      args: {window_size: 30, high_percentile: 75.0, low_percentile: 25.0, warmup_E_hi: 0.65, warmup_E_lo: 0.50, confirm_frames: 5, cooldown_frames: 5, signal_name: motion_entropy}
+
+  - name: trajectory_aware
+    scheduler:
+      name: trajectory_aware
+      args: {E_hi: 0.65, E_lo: 0.50, confirm_frames: 5, cooldown_frames: 5, tau: 0.1, signal_name: motion_entropy}

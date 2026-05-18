@@ -1,0 +1,19 @@
+# generated via: uv pip compile pyproject.toml -o requirements.txt
+# DevOps: regenerate via 'make compile-deps' after editing pyproject.toml
+# NOTE: this is a hand-written faithful snapshot of the runtime deps in
+# pyproject.toml. Real resolved pins + hashes are produced by uv compile
+# at CI time and committed as uv.lock.
+
+numpy
+scipy
+torch==2.1.0
+torchvision==0.16.0
+opencv-contrib-python==4.9.0.80
+hydra-core
+omegaconf
+typer
+structlog
+thop
+fvcore
+rich
+pyyaml

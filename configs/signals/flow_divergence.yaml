@@ -1,0 +1,15 @@
+# FlowDivergenceSignal — residual-flow divergence switching signal (Phase 5).
+#
+# Computes mean(∂u/∂x + ∂v/∂y) over sparse residual-flow grid inside ROI.
+# High |divergence| indicates expanding/contracting motion or tracking drift.
+# Normalized: |div| / (|div| + 1) ∈ [0, 1).
+
+name: flow_divergence
+range: [0.0, 1.0]
+args:
+  mag_threshold: 0.5      # minimum residual-flow magnitude (px)
+  alpha: 0.6              # EMA smoothing factor
+  max_corners: 200        # Shi-Tomasi maxCorners
+  quality_level: 0.01     # Shi-Tomasi qualityLevel
+  background_band: 20     # background band width (px) for global-motion
+  seed: 42                # RANSAC RNG seed
