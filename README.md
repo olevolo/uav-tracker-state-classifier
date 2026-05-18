@@ -1,4 +1,6 @@
-# UAV Entropy-Guided Tracker
+# UAV Tracker — ML-Detection Pipeline
+
+> **v2-ml-extension: ML-driven scene classification and detection-based routing**
 
 ![ci](https://img.shields.io/badge/ci-pending-lightgrey) ![license](https://img.shields.io/badge/license-pending-lightgrey)
 
