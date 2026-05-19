@@ -509,3 +509,42 @@ CI = (np.percentile(ci_samples, 2.5), np.percentile(ci_samples, 97.5))
 → Задокументувати: "scalar telemetry insufficient for identity-level failure detection"
 → Цей negative result + LoRAT = окрема стаття
 ```
+
+---
+
+## Papers Analysis — SALT-RD Competitive Positioning (2026-05-19)
+
+### Positioning Summary
+
+| SALT-RD claim | Closest competitor | Novel? | Key differentiator |
+|---|---|---|---|
+| `false_confirmed` detection (high APCE, wrong identity) | None — unaddressed in all papers | **Yes, fully novel** | uav0000164: 99% CONFIRMED, AUC=0.174. σ_OOTU and UncL-STARK confidence are HIGH here — they cannot detect it |
+| GT-supervised multi-label tracking-risk policy | All use task-loss or heuristic supervision | **Yes, novel training regime** | Only work using GT IoU-derived labels for false_confirmed/failure_in_5/recoverable |
+| `failure_in_5` proactive failure prediction | MATA NT2F (retrospective measure) | **Yes** — MATA measures duration, SALT-RD predicts 5 frames ahead | Frame as: "MATA quantifies failure duration; SALT-RD predicts failure proactively" |
+| Calibrated failure probability (ECE/AUPRC/Brier) | OOTU (localization uncertainty KL loss) | **Yes** — OOTU calibrates localization σ², SALT-RD calibrates identity failure P | Must show: σ_OOTU negatively correlates with P(false_confirmed) on uav0000164 |
+| `needs_full_compute` oracle-supervised compute | UTPTrack CVPR26, ABTrack PR25, BDTrack ESWA25, UncL-STARK 26 | **Partially** — oracle from full-vs-cheap replay is new | Reframe: "others decide by visual difficulty; SALT-RD by oracle regret — catches visually-easy false-confirmed cases" |
+| Wrapper over frozen tracker | All adaptive-compute papers modify backbone | **Yes** | Zero changes to SGLATrack; wrappable around any ViT tracker |
+| `hard_dynamic_scene` from GT-derived labels | BDTrack, SMTrack — scene difficulty from backbone | **Partially** | SALT-RD dynamicity is tracking-outcome-derived, not appearance-category derived |
+| NT2F evaluation metric | MATA 2026 (introduced NT2F) | **Not novel as metric** | Claim: "first to evaluate proactive failure predictor using NT2F" |
+
+### Features to add for v1 (from papers)
+
+From MSTFT: `response_peak_ratio` (peak/map_mean), `temporal_response_consistency` (APCE deviation from 5-frame mean), `motion_stability` (bbox centroid delta / search_size), `scale_consistency` (area / 5-frame mean area)
+
+From UncL-STARK: `heatmap_top3_mass` (top-3 sum of spatially-softmaxed score map) — BETTER calibrated confidence proxy than APCE; specifically, σ_OOTU and this are both HIGH during false_confirmed → empirical differentiator
+
+From MATA: `ego_motion_confidence` (fraction of Lucas-Kanade flow points tracked successfully)
+
+From PTDT/CoTracker3 (Phase 4): `points_inside_ratio`, `fwd_bwd_error`, `point_visibility_mean`
+
+### Critical empirical argument (must be in paper)
+
+uav0000164: σ_OOTU small (distractor well-localized), UncL-STARK confidence HIGH, APCE HIGH — but IoU < 0.2, P(false_confirmed) HIGH. Show scatter plot proving near-zero correlation between localization-uncertainty and identity-failure-probability. This is the paper's central empirical differentiator.
+
+### eval.py must-implement metrics
+
+- NT2F at IoU ∈ {0.5, 0.2} (MATA formula: mean over sequences of (t_failure - t_init) / seq_len)
+- False-confirmed recall @ 5% FPR (SALT-RD signature metric — no competitor reports this)
+- AUC vs % full-compute frames Pareto (comparable to UncL-STARK GFLOPs table)
+- ECE / Brier / NLL on P(false_confirmed) and P(failure_in_5)
+- AUROC / AUPRC per head with base rates
