@@ -1,8 +1,8 @@
 # HANDOFF — SALT-RD: Reliability + Neural Scene Dynamicity for UAV SOT
 
 **Дата:** 2026-05-19  
-**Оновлено:** 2026-05-19 (Phase 0 complete)  
-**Статус:** Phase 0 DONE — наступна сесія стартує з Phase 1a (data collection)  
+**Оновлено:** 2026-05-19 (Phase 1a complete)  
+**Статус:** Phase 1a DONE — наступна сесія запускає збірку NPZ, потім Phase 1b (модель)  
 **Читай також:** `THOUGHTS.md`, `ANALYSIS.md`, `papers/README.md`, `FROZEN.md`
 
 ---
