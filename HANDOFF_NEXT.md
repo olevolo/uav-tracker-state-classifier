@@ -1,8 +1,50 @@
 # HANDOFF — SALT-RD: Reliability + Neural Scene Dynamicity for UAV SOT
 
-**Дата:** 2026-05-19
-**Статус:** фінальний pre-implementation план після Staff ML/CV Architect review
-**Читай також:** `THOUGHTS.md`, `ANALYSIS.md`, `papers/README.md`
+**Дата:** 2026-05-19  
+**Оновлено:** 2026-05-19 (Phase 0 complete)  
+**Статус:** Phase 0 DONE — наступна сесія стартує з Phase 1a (data collection)  
+**Читай також:** `THOUGHTS.md`, `ANALYSIS.md`, `papers/README.md`, `FROZEN.md`
+
+---
+
+## ✅ Реалізовано — Phase 0 (commit ecfcb0f)
+
+| Завдання | Статус | Файл |
+|---|---|---|
+| `FROZEN.md` — policy freeze | ✅ done | `FROZEN.md` |
+| Config gates в YAML | ✅ done | `configs/prod/salt.yaml` |
+| `enable_ce` gate → runtime | ✅ done | `sglatrack.py` + `salt_runner.py` |
+| `enable_velocity_drift` gate → runtime | ✅ done | `target_state_assessor.py` + `salt_runner.py` |
+| `enable_dynamic` / `enable_salt_rd` в YAML | ✅ done | `configs/prod/salt.yaml` (motion_predictor.enabled вже був false) |
+| `TrackState` extended: +5 fields | ✅ done | `types.py` |
+| `score_map_stats` computation в SGLATracker | ✅ done | `sglatrack.py` (обидва update/update_with_state) |
+| `saltr/` scaffold | ✅ done | `saltr/src/salt_r/` |
+| `collect_features.py` skeleton + NPZ schema | ✅ done | `saltr/src/salt_r/collect_features.py` |
+| `model.py` / `train.py` / `eval.py` stubs | ✅ done | `saltr/src/salt_r/` |
+| 174 тести проходять | ✅ verified | — |
+
+### Що реально gate-ується в runtime
+
+| Gate | YAML ключ | Де читається | Ефект при `false` |
+|---|---|---|---|
+| `enable_ce` | top-level | `salt_runner.py:183` → `SGLATracker.__init__` | `ce_keep_rate = 1.0` (no pruning) |
+| `enable_velocity_drift` | top-level | `salt_runner.py:193` → `TargetStateAssessor.__init__` | `is_drifted()` не викликається, DISTRACTOR_RISK недосяжний |
+| `enable_dynamic` (alias) | `motion_predictor.enabled` | вже `false` у YAML — `lstm_pred` завжди `None` | DYNAMIC state недосяжний |
+| `enable_salt_rd` | top-level | **не читається ще** — для Phase 2 |
+
+### score_map_stats — поля в TrackState
+
+```python
+track_state.score_map_stats = {
+    "top1":             float,   # highest response value (raw)
+    "top2":             float,   # second highest
+    "peak_margin":      float,   # top1 - top2 (ambiguity metric)
+    "peak_width":       int,     # cells above 50% of peak
+    "n_secondary":      int,     # 0 placeholder (v1: local-maxima detection)
+    "peak_distance":    float,   # peak location distance from map center (cells)
+    "heatmap_mass_topk":float,   # fraction of total mass in top-10 cells
+}
+```
 
 ---
 
@@ -437,30 +479,47 @@ Priority rule:
 
 ## Стартовий промпт для наступної coding сесії
 
+> Phase 0 DONE. Наступна сесія = Phase 1a: реальна збірка NPZ датасету.
+
 ```text
-Прочитай HANDOFF_NEXT.md, THOUGHTS.md, CURRENT_PHASE.md і papers/README.md.
+Прочитай HANDOFF_NEXT.md (секцію "Реалізовано — Phase 0"), THOUGHTS.md, FROZEN.md.
 
-ЗАДАЧА: реалізуй Фазу 0 + Фазу 1a для SALT-RD.
+СТАН: Phase 0 done (commit ecfcb0f). saltr/src/salt_r/collect_features.py — скелет
+з NPZ schema, FEATURE_NAMES (28), compute_labels() і SavedDataset. Треба реалізувати
+collection loop.
 
-Фаза 0:
-- Додай FROZEN.md.
-- Додай config gates: enable_ce, enable_dynamic, enable_velocity_drift, enable_salt_rd.
-- Runtime code має реально honor gates.
-- Розшир TrackState telemetry: score_map_stats, motion_stats, flow_stats, appearance_stats, compute_mode.
-- Не видаляй CE/DYNAMIC/VelocityDrift physically.
-- pytest + doctor мають пройти.
+ЗАДАЧА: Phase 1a — реалізуй collection loop в collect_features.py
 
-Фаза 1a:
-- Створи saltr/src/salt_r/collect_features.py.
-- Збирай features з frozen SGLATrack/SALT v3.
-- Labels тільки GT/teacher-derived: correct, false_confirmed, failure_in_5, recoverable,
-  target_dynamic, camera_dynamic, hard_dynamic_scene, needs_full_compute.
-- Не використовуй scene_class, TargetState, _decide_state(), APCE rule labels як training targets.
-- Збережи NPZ schema з feature_names, label_names, units, iou_trace, bbox_pred, bbox_gt,
-  sequence_name, dataset, split, tracker_version, tracker_config_hash.
-- Split by sequence. Diagnostic suite окремо: uav0000164, bike2, Gull2, Sheep1, StreetBasketball1.
+1. Підключи SALTRunner (frozen) через configs/prod/salt.yaml:
+   - runner = SALTRunner.from_config("configs/prod/salt.yaml")
+   - Запустити на UAV123 + VisDrone-SOT + DTB70 послідовностях
 
-Після Фази 1a не тренуй модель, доки NPZ schema і label base rates не будуть перевірені.
+2. Для кожного кадру збери features в FEATURE_NAMES порядку:
+   Score map: track_state.score_map_stats (top1, top2, peak_margin, peak_width,
+     n_secondary, peak_distance, heatmap_mass_topk) + track_state.apce, psr,
+     response_entropy
+   Temporal: rolling windows (5/20 кадрів) для apce_ratio, entropy_delta,
+     confirmed_streak, low_conf_streak
+   Target dynamics: bbox velocity/accel/scale/aspect від frame до frame
+   Camera/flow: optical flow (cv2.calcOpticalFlowFarneback між кадрами)
+     global_flow_mag, target_flow_mag, ego_motion_residual
+
+3. Рахуй GT IoU (iou_trace) з GT bbox — iou(track_state.bbox, gt_bbox)
+
+4. Після послідовності виклик compute_labels(iou_trace, ...) → labels int8
+
+5. SavedDataset.add_sequence() → save NPZ
+
+КРИТИЧНО:
+- Split by sequence (не frame): UAV123 train/val 80/43, VisDrone 25/10, DTB70 50/20
+- DIAGNOSTIC_SEQUENCES окремо, не в train/val
+- Labels тільки GT/teacher-derived: НІЯКИХ _decide_state(), TargetState, APCE rules
+- Зберегти tracker_config_hash (sha256 configs/prod/salt.yaml)
+
+ПІСЛЯ collection:
+- Надрукуй base rates для кожного label: false_confirmed base ≈ 1-3%
+- Якщо false_confirmed > 10% або < 0.5% — ЗУПИНИСЬ і перевір label logic
+- Не тренуй модель доки NPZ і base rates не верифіковані
 ```
 
 ---
