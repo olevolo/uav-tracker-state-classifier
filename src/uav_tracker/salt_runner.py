@@ -180,7 +180,7 @@ class SALTRunner:
         from uav_tracker.ml.tsa.target_state_assessor import TargetStateAssessor
 
         tracker_name = cfg.get("tracker", {}).get("name", "sglatrack")
-        tracker = TRACKERS.build(tracker_name)
+        tracker = TRACKERS.build(tracker_name, enable_ce=cfg.get("enable_ce", True))
 
         tsa = TargetStateAssessor(
             device=cfg.get("tsa", {}).get("device", "auto"),
@@ -190,6 +190,7 @@ class SALTRunner:
             drift_threshold=cfg.get("tsa", {}).get("drift_threshold", 0.35),
             adapt_enabled=cfg.get("tsa", {}).get("adapt_enabled", True),
             weights_path=cfg.get("tsa", {}).get("weights_path"),
+            enable_velocity_drift=cfg.get("enable_velocity_drift", True),
         )
 
         det_cfg = cfg.get("detector", {})

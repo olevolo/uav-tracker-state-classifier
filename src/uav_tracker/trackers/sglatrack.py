@@ -216,12 +216,14 @@ class SGLATracker:
         device: str = "auto",
         weights_path: str | None = None,
         pruning_mode: str = "ce",
+        enable_ce: bool = True,
     ) -> None:
         if pruning_mode not in ("ce", "ctem"):
             raise ValueError(f"pruning_mode must be 'ce' or 'ctem', got {pruning_mode!r}")
         self._device_str = device
         self._weights_path = weights_path
         self._pruning_mode = pruning_mode
+        self._enable_ce = enable_ce
         self._model = None
         self._hann: torch.Tensor | None = None
         self._z_tensor: torch.Tensor | None = None    # template tensor on device
@@ -326,6 +328,24 @@ class SGLATracker:
             probs = f_pos / (f_pos.sum() + 1e-8)
             response_entropy = float(-(probs * (probs + 1e-8).log()).sum())
 
+        # Score map geometry for SALT-RD feature extraction
+        f_sorted_vals = torch.sort(f, descending=True).values
+        _top1 = float(f_sorted_vals[0])
+        _top2 = float(f_sorted_vals[1])
+        _half_max_count = int((f >= float(f_sorted_vals[0]) * 0.5).sum().item())
+        _flat_peak = int(f.argmax().item())
+        _peak_r_sm, _peak_c_sm = _flat_peak // 16, _flat_peak % 16
+        _map_sum = float(f_sorted_vals.sum()) + 1e-8
+        _score_map_stats = {
+            "top1": _top1,
+            "top2": _top2,
+            "peak_margin": _top1 - _top2,
+            "peak_width": _half_max_count,
+            "n_secondary": 0,  # placeholder: full local-maxima detection in v1
+            "peak_distance": float((((_peak_r_sm - 7.5) ** 2 + (_peak_c_sm - 7.5) ** 2) ** 0.5)),
+            "heatmap_mass_topk": float(f_sorted_vals[:10].sum()) / _map_sum,
+        }
+
         pred_boxes = self._model.box_head.cal_bbox(
             score_map, out["size_map"], out["offset_map"]
         ).view(-1, 4)                                         # [cx,cy,w,h] normalised
@@ -367,6 +387,7 @@ class SGLATracker:
             apce=apce,
             psr=psr,
             response_entropy=response_entropy,
+            score_map_stats=_score_map_stats,
         )
 
     def update_with_state(self, frame: np.ndarray, target_state: int,
@@ -389,6 +410,9 @@ class SGLATracker:
         """
         _, keep_ratios = _STATE_COMPUTE_MAP.get(target_state, _DEFAULT_COMPUTE)
         ce_keep_rate = keep_ratios[0]  # same ratio at all CE layers
+
+        if not self._enable_ce:
+            ce_keep_rate = 1.0  # CE disabled via config gate
 
         # APCE gate: skip CE pruning when tracker was in genuine LOST territory last frame.
         # Threshold 25 = just above LOST threshold (APCE < 20) — only disables CE when
@@ -446,6 +470,24 @@ class SGLATracker:
             probs = f_pos / (f_pos.sum() + 1e-8)
             response_entropy = float(-(probs * (probs + 1e-8).log()).sum())
 
+        # Score map geometry for SALT-RD feature extraction
+        f_sorted_vals = torch.sort(f, descending=True).values
+        _top1 = float(f_sorted_vals[0])
+        _top2 = float(f_sorted_vals[1])
+        _half_max_count = int((f >= float(f_sorted_vals[0]) * 0.5).sum().item())
+        _flat_peak = int(f.argmax().item())
+        _peak_r_sm, _peak_c_sm = _flat_peak // 16, _flat_peak % 16
+        _map_sum = float(f_sorted_vals.sum()) + 1e-8
+        _score_map_stats = {
+            "top1": _top1,
+            "top2": _top2,
+            "peak_margin": _top1 - _top2,
+            "peak_width": _half_max_count,
+            "n_secondary": 0,  # placeholder: full local-maxima detection in v1
+            "peak_distance": float((((_peak_r_sm - 7.5) ** 2 + (_peak_c_sm - 7.5) ** 2) ** 0.5)),
+            "heatmap_mass_topk": float(f_sorted_vals[:10].sum()) / _map_sum,
+        }
+
         pred_boxes = self._model.box_head.cal_bbox(
             score_map, out["size_map"], out["offset_map"]
         ).view(-1, 4)
@@ -495,6 +537,7 @@ class SGLATracker:
             apce=apce,
             psr=psr,
             response_entropy=response_entropy,
+            score_map_stats=_score_map_stats,
         )
 
     def try_update_template(

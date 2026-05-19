@@ -445,10 +445,12 @@ class TargetStateAssessor:
         adapt_enabled: bool = True,
         oracle_mode: bool = False,
         weights_path: str | None = None,
+        enable_velocity_drift: bool = True,
     ) -> None:
         self._motion_threshold = motion_threshold
         self._drift_threshold  = drift_threshold
         self._oracle_mode      = oracle_mode
+        self._enable_velocity_drift = enable_velocity_drift
 
         # Accepted for config compatibility — no longer used
         _ = device
@@ -657,7 +659,7 @@ class TargetStateAssessor:
         # ------------------------------------------------------------------ #
         self._velocity_drift.update(tracker_pred_bbox)
         self._velocity_drift.update_psr(float(psr))
-        if state == TargetState.CONFIRMED and self._velocity_drift.is_drifted(
+        if self._enable_velocity_drift and state == TargetState.CONFIRMED and self._velocity_drift.is_drifted(
             psr=float(psr),
             consistency_score=consistency_score,
             apce=float(apce),

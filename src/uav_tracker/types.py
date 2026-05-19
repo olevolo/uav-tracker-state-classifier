@@ -62,6 +62,11 @@ class TrackState:
     apce: float = 0.0
     psr: float = 0.0
     response_entropy: float = 0.0
+    score_map_stats: dict = field(default_factory=dict)
+    motion_stats: dict = field(default_factory=dict)
+    flow_stats: dict = field(default_factory=dict)
+    appearance_stats: dict = field(default_factory=dict)
+    compute_mode: str = "full"
 
 
 # --------------------------------------------------------------------------- #

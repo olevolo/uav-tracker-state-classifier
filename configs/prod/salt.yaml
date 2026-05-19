@@ -1,6 +1,12 @@
 # SALT — Scene-Adaptive Learning Tracker
 # Full pipeline: SGLATrack + TSA routing + YOLOv8n recovery
 
+# SALT-RD phase gates — set to false to disable for ablation
+enable_ce: false
+enable_dynamic: false        # alias: motion_predictor.enabled already handles this
+enable_velocity_drift: false
+enable_salt_rd: false
+
 tracker:
   name: sglatrack
   device: auto
