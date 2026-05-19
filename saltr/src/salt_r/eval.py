@@ -706,16 +706,32 @@ def evaluate(
             if hi >= lab.shape[1]:
                 break
             all_y_true[head].append(lab[:, hi])
-            if hi < pred.shape[1]:
-                all_y_pred[head].append(pred[:, hi])
+            # Use name-based prediction lookup (model predicts HEAD_NAMES only,
+            # not "correct"). Avoids off-by-one when "correct" is label index 0.
+            if has_preds and seq_key in preds_dict:
+                p = preds_dict[seq_key]  # (n_frames, n_head_preds)
+                try:
+                    from salt_r.model import HEAD_NAMES as _HN
+                    if head in _HN:
+                        pred_col = _HN.index(head)
+                        all_y_pred[head].append(p[:, pred_col] if pred_col < p.shape[1] else np.full(len(lab), 0.5, np.float32))
+                    else:
+                        all_y_pred[head].append(np.full(len(lab), 0.5, np.float32))
+                except Exception:
+                    all_y_pred[head].append(p[:, hi] if hi < p.shape[1] else np.full(len(lab), 0.5, np.float32))
             else:
                 all_y_pred[head].append(np.full(len(lab), 0.5, dtype=np.float32))
 
         # Per-sequence AUPRC for false_confirmed (bootstrap input)
         if fc_idx >= 0:
             yt = lab[:, fc_idx]
-            if has_preds and seq_key in preds_dict and fc_idx < preds_dict[seq_key].shape[1]:
-                yp = preds_dict[seq_key][:, fc_idx]
+            if has_preds and seq_key in preds_dict:
+                try:
+                    from salt_r.model import HEAD_NAMES as _HN2
+                    fc_pred_idx = _HN2.index("false_confirmed")
+                    yp = preds_dict[seq_key][:, fc_pred_idx]
+                except Exception:
+                    yp = preds_dict[seq_key][:, fc_idx] if fc_idx < preds_dict[seq_key].shape[1] else np.full(len(yt), yt.mean(), np.float32)
             else:
                 yp = np.full(len(yt), yt.mean(), dtype=np.float32)
             br = float(yt.mean())
