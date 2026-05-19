@@ -16,7 +16,7 @@ import hashlib
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List
+from typing import Any, Dict, List
 
 import numpy as np
 
@@ -197,14 +197,22 @@ def compute_labels(
                 labels[t, 3] = 1
 
     # 4: target_dynamic — high target motion relative to sequence
+    _ABS_MIN_MOTION = 0.05  # normalized px/frame — below this = static sequence
     motion_score = speed_norm + 0.5 * accel_norm + 0.5 * np.abs(scale_delta)
-    threshold_td = np.percentile(motion_score, 75)
-    labels[:, 4] = (motion_score >= threshold_td).astype(np.int8)
+    if motion_score.max() <= _ABS_MIN_MOTION:
+        labels[:, 4] = 0  # static sequence
+    else:
+        threshold_td = np.percentile(motion_score[motion_score > _ABS_MIN_MOTION], 75)
+        labels[:, 4] = (motion_score > threshold_td).astype(np.int8)
 
     # 5: camera_dynamic — high ego-motion relative to sequence
+    _ABS_MIN_CAM = 0.1  # px/frame for camera motion
     cam_score = global_flow_mag + ego_motion_residual
-    threshold_cd = np.percentile(cam_score, 75)
-    labels[:, 5] = (cam_score >= threshold_cd).astype(np.int8)
+    if cam_score.max() <= _ABS_MIN_CAM:
+        labels[:, 5] = 0  # static camera
+    else:
+        threshold_cd = np.percentile(cam_score[cam_score > _ABS_MIN_CAM], 75)
+        labels[:, 5] = (cam_score > threshold_cd).astype(np.int8)
 
     # 6: hard_dynamic_scene — dynamicity combined with tracking ambiguity
     is_dynamic = (labels[:, 4] | labels[:, 5]).astype(bool)
@@ -234,28 +242,31 @@ def compute_labels(
 class SavedDataset:
     """In-memory container for one complete SALT-RD collection run.
 
+    All per-sequence data is keyed by a compound key
+    ``"{dataset_name}/{seq_name}"`` to avoid collisions across datasets.
+
     NPZ keys
     --------
-    features/{seq_name}      float32  (n_frames, n_features)
-    feature_names            object   list[str] as np.array
-    feature_units            object   list[str] as np.array
-    labels/{seq_name}        int8     (n_frames, n_labels)
-    label_names              object   list[str] as np.array
-    iou_trace/{seq_name}     float32  (n_frames,)
-    bbox_pred/{seq_name}     float32  (n_frames, 4)  — (x, y, w, h)
-    bbox_gt/{seq_name}       float32  (n_frames, 4)
-    sequence_name/{seq_name} str      sequence identifier
-    dataset/{seq_name}       str      "uav123" | "visdrone_sot" | "dtb70"
-    split/{seq_name}         str      "train" | "val" | "diagnostic"
-    tracker_version          str      e.g. "sglatrack_ep0297"
-    tracker_config_hash      str      sha256 of config YAML
-    created_at               str      ISO 8601 datetime (UTC)
+    features/{dataset_name}/{seq_name}      float32  (n_frames, n_features)
+    feature_names                           object   list[str] as np.array
+    feature_units                           object   list[str] as np.array
+    labels/{dataset_name}/{seq_name}        int8     (n_frames, n_labels)
+    label_names                             object   list[str] as np.array
+    iou_trace/{dataset_name}/{seq_name}     float32  (n_frames,)
+    bbox_pred/{dataset_name}/{seq_name}     float32  (n_frames, 4)  — (x, y, w, h)
+    bbox_gt/{dataset_name}/{seq_name}       float32  (n_frames, 4)
+    sequence_name/{dataset_name}/{seq_name} str      short seq identifier (no dataset prefix)
+    dataset/{dataset_name}/{seq_name}       str      "uav123" | "visdrone_sot" | "dtb70"
+    split/{dataset_name}/{seq_name}         str      "train" | "val" | "diagnostic"
+    tracker_version                         str      e.g. "sglatrack_ep0297"
+    tracker_config_hash                     str      sha256 of config YAML
+    created_at                              str      ISO 8601 datetime (UTC)
     """
 
     tracker_version: str
     tracker_config_hash: str
 
-    # Per-sequence data (keyed by sequence name)
+    # Per-sequence data (keyed by compound key "dataset_name/seq_name")
     features: Dict[str, np.ndarray] = field(default_factory=dict)
     labels: Dict[str, np.ndarray] = field(default_factory=dict)
     iou_trace: Dict[str, np.ndarray] = field(default_factory=dict)
@@ -263,23 +274,30 @@ class SavedDataset:
     bbox_gt: Dict[str, np.ndarray] = field(default_factory=dict)
     dataset: Dict[str, str] = field(default_factory=dict)
     split: Dict[str, str] = field(default_factory=dict)
+    # Short sequence name without dataset prefix (for display / diagnostics)
+    seq_display_name: Dict[str, str] = field(default_factory=dict)
 
     def add_sequence(
         self,
         seq_name: str,
+        dataset_name: str,
+        split: str,
         features: np.ndarray,
         labels: np.ndarray,
         iou_trace: np.ndarray,
         bbox_pred: np.ndarray,
         bbox_gt: np.ndarray,
-        dataset_name: str,
     ) -> None:
         """Register one sequence into this dataset.
 
         Parameters
         ----------
         seq_name:
-            Unique identifier string, e.g. "person1_s1" or "uav0000164".
+            Short sequence identifier, e.g. "person1_s1" or "uav0000164".
+        dataset_name:
+            One of "uav123", "visdrone_sot", "dtb70".
+        split:
+            One of "train", "val", "diagnostic".
         features:
             float32 array of shape (n_frames, N_FEATURES).
         labels:
@@ -290,34 +308,31 @@ class SavedDataset:
             float32 array of shape (n_frames, 4) — (x, y, w, h).
         bbox_gt:
             float32 array of shape (n_frames, 4) — (x, y, w, h).
-        dataset_name:
-            One of "uav123", "visdrone_sot", "dtb70".
         """
-        assert features.shape == (len(iou_trace), N_FEATURES), (
-            f"{seq_name}: features shape {features.shape} expected ({len(iou_trace)}, {N_FEATURES})"
-        )
-        assert labels.shape == (len(iou_trace), N_LABELS), (
-            f"{seq_name}: labels shape {labels.shape} expected ({len(iou_trace)}, {N_LABELS})"
-        )
         assert dataset_name in {"uav123", "visdrone_sot", "dtb70"}, (
             f"Unknown dataset '{dataset_name}'"
         )
+        assert split in {"train", "val", "diagnostic"}, (
+            f"Unknown split '{split}'"
+        )
+        assert features.shape == (len(iou_trace), N_FEATURES), (
+            f"{dataset_name}/{seq_name}: features shape {features.shape} "
+            f"expected ({len(iou_trace)}, {N_FEATURES})"
+        )
+        assert labels.shape == (len(iou_trace), N_LABELS), (
+            f"{dataset_name}/{seq_name}: labels shape {labels.shape} "
+            f"expected ({len(iou_trace)}, {N_LABELS})"
+        )
 
-        split_name: str
-        if seq_name in DIAGNOSTIC_SEQUENCES:
-            split_name = "diagnostic"
-        else:
-            # Deterministic 80/20 train/val split via name hash
-            h = int(hashlib.md5(seq_name.encode()).hexdigest(), 16)
-            split_name = "train" if (h % 10) < 8 else "val"
-
-        self.features[seq_name] = features.astype(np.float32)
-        self.labels[seq_name] = labels.astype(np.int8)
-        self.iou_trace[seq_name] = iou_trace.astype(np.float32)
-        self.bbox_pred[seq_name] = bbox_pred.astype(np.float32)
-        self.bbox_gt[seq_name] = bbox_gt.astype(np.float32)
-        self.dataset[seq_name] = dataset_name
-        self.split[seq_name] = split_name
+        key = f"{dataset_name}/{seq_name}"
+        self.features[key] = features.astype(np.float32)
+        self.labels[key] = labels.astype(np.int8)
+        self.iou_trace[key] = iou_trace.astype(np.float32)
+        self.bbox_pred[key] = bbox_pred.astype(np.float32)
+        self.bbox_gt[key] = bbox_gt.astype(np.float32)
+        self.dataset[key] = dataset_name
+        self.split[key] = split
+        self.seq_display_name[key] = seq_name
 
     def save(self, output_path: str | Path) -> None:
         """Serialise the dataset to a compressed NPZ file.
@@ -342,15 +357,15 @@ class SavedDataset:
             ),
         }
 
-        for seq_name in self.features:
-            arrays[f"features/{seq_name}"] = self.features[seq_name]
-            arrays[f"labels/{seq_name}"] = self.labels[seq_name]
-            arrays[f"iou_trace/{seq_name}"] = self.iou_trace[seq_name]
-            arrays[f"bbox_pred/{seq_name}"] = self.bbox_pred[seq_name]
-            arrays[f"bbox_gt/{seq_name}"] = self.bbox_gt[seq_name]
-            arrays[f"sequence_name/{seq_name}"] = np.array(seq_name)
-            arrays[f"dataset/{seq_name}"] = np.array(self.dataset[seq_name])
-            arrays[f"split/{seq_name}"] = np.array(self.split[seq_name])
+        for key in self.features:
+            arrays[f"features/{key}"] = self.features[key]
+            arrays[f"labels/{key}"] = self.labels[key]
+            arrays[f"iou_trace/{key}"] = self.iou_trace[key]
+            arrays[f"bbox_pred/{key}"] = self.bbox_pred[key]
+            arrays[f"bbox_gt/{key}"] = self.bbox_gt[key]
+            arrays[f"sequence_name/{key}"] = np.array(self.seq_display_name[key])
+            arrays[f"dataset/{key}"] = np.array(self.dataset[key])
+            arrays[f"split/{key}"] = np.array(self.split[key])
 
         np.savez_compressed(str(output_path), **arrays)
 
@@ -373,20 +388,22 @@ class SavedDataset:
             tracker_config_hash=tracker_config_hash,
         )
 
-        # Recover sequence names from features/ keys
-        seq_names = [
-            k[len("features/") :]
+        # Recover compound keys from features/ entries.
+        # Keys have the form "features/{dataset_name}/{seq_name}".
+        compound_keys = [
+            k[len("features/"):]
             for k in data.files
             if k.startswith("features/")
         ]
-        for seq_name in seq_names:
-            ds.features[seq_name] = data[f"features/{seq_name}"]
-            ds.labels[seq_name] = data[f"labels/{seq_name}"]
-            ds.iou_trace[seq_name] = data[f"iou_trace/{seq_name}"]
-            ds.bbox_pred[seq_name] = data[f"bbox_pred/{seq_name}"]
-            ds.bbox_gt[seq_name] = data[f"bbox_gt/{seq_name}"]
-            ds.dataset[seq_name] = str(data[f"dataset/{seq_name}"])
-            ds.split[seq_name] = str(data[f"split/{seq_name}"])
+        for key in compound_keys:
+            ds.features[key] = data[f"features/{key}"]
+            ds.labels[key] = data[f"labels/{key}"]
+            ds.iou_trace[key] = data[f"iou_trace/{key}"]
+            ds.bbox_pred[key] = data[f"bbox_pred/{key}"]
+            ds.bbox_gt[key] = data[f"bbox_gt/{key}"]
+            ds.dataset[key] = str(data[f"dataset/{key}"])
+            ds.split[key] = str(data[f"split/{key}"])
+            ds.seq_display_name[key] = str(data[f"sequence_name/{key}"])
 
         return ds
 
@@ -395,10 +412,12 @@ class SavedDataset:
         total_frames = sum(v.shape[0] for v in self.features.values())
         by_dataset: Dict[str, int] = {}
         by_split: Dict[str, int] = {}
-        for seq_name, feats in self.features.items():
+        for key, feats in self.features.items():
             n = feats.shape[0]
-            by_dataset[self.dataset[seq_name]] = by_dataset.get(self.dataset[seq_name], 0) + n
-            by_split[self.split[seq_name]] = by_split.get(self.split[seq_name], 0) + n
+            dname = self.dataset[key]
+            sname = self.split[key]
+            by_dataset[dname] = by_dataset.get(dname, 0) + n
+            by_split[sname] = by_split.get(sname, 0) + n
         lines = [
             f"SavedDataset — tracker: {self.tracker_version}",
             f"  sequences  : {len(self.features)}",
@@ -430,7 +449,340 @@ def hash_config_file(config_path: str | Path) -> str:
 
 
 # ---------------------------------------------------------------------------
-# CLI entry point (skeleton — collection loop not yet implemented)
+# Per-sequence feature extraction
+# ---------------------------------------------------------------------------
+
+
+def collect_sequence(
+    runner: "Any",
+    seq: "Any",
+    dataset_name: str,
+    split: str,
+    max_frames: "int | None" = None,
+) -> "tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]":
+    """Run tracker on one sequence; return (features, labels, iou_trace, pred_arr, gt_arr).
+
+    Parameters
+    ----------
+    runner:
+        Frozen SALTRunner instance.
+    seq:
+        Dataset sequence object with .ground_truth, .frames, .name.
+    dataset_name:
+        One of "uav123", "visdrone_sot", "dtb70".
+    split:
+        One of "train", "val", "diagnostic".
+    max_frames:
+        Cap on frames for fast debug runs (None = no cap).
+
+    Returns
+    -------
+    features : float32 (n_frames, N_FEATURES)
+    labels   : int8    (n_frames, N_LABELS)
+    iou_trace: float32 (n_frames,)
+    pred_arr : float32 (n_frames, 4) — x,y,w,h
+    gt_arr   : float32 (n_frames, 4) — x,y,w,h
+    """
+    import cv2
+
+    iou_fn = globals()["iou_fn"]  # injected by collect_dataset
+
+    # ------------------------------------------------------------------
+    # A. Run tracker and collect raw data
+    # ------------------------------------------------------------------
+    gt_bboxes = list(seq.ground_truth)
+    frames_list = list(seq.frames)  # re-reads from disk; needed for optical flow
+    if max_frames:
+        gt_bboxes = gt_bboxes[:max_frames]
+        frames_list = frames_list[:max_frames]
+    n = len(frames_list)
+
+    entries = list(runner.run(seq))
+    if max_frames:
+        entries = entries[:max_frames]
+
+    preds = [e.bbox for e in entries]
+    pred_arr = np.array([[b.x, b.y, b.w, b.h] for b in preds], dtype=np.float64)
+    gt_arr = np.array([[b.x, b.y, b.w, b.h] for b in gt_bboxes], dtype=np.float64)
+    iou_trace = iou_fn(pred_arr, gt_arr).astype(np.float32)
+
+    # ------------------------------------------------------------------
+    # B. Feature extraction (28 features, FEATURE_NAMES order)
+    # ------------------------------------------------------------------
+    feature_matrix = np.zeros((n, N_FEATURES), dtype=np.float32)
+
+    # Features 0-8: score map stats from TelemetryEntry.aux
+    for t, entry in enumerate(entries):
+        sms = entry.aux.get("score_map_stats", {})
+        apce_raw = entry.aux.get("apce_raw", 0.0)
+        feature_matrix[t, 0] = apce_raw
+        feature_matrix[t, 1] = apce_raw / 256.0          # apce_norm
+        feature_matrix[t, 2] = entry.aux.get("psr_raw", 0.0)
+        feature_matrix[t, 3] = entry.aux.get("entropy_raw", 0.0)
+        feature_matrix[t, 4] = sms.get("peak_margin", 0.0)
+        feature_matrix[t, 5] = float(sms.get("peak_width", 0))
+        feature_matrix[t, 6] = float(sms.get("n_secondary", 0))
+        feature_matrix[t, 7] = sms.get("peak_distance", 0.0)
+        feature_matrix[t, 8] = sms.get("heatmap_mass_topk", 0.0)
+
+    # Features 9-14: temporal rolling windows (computed after score map pass)
+    for t in range(n):
+        apce_w5 = feature_matrix[max(0, t - 5):t, 0]
+        apce_w20 = feature_matrix[max(0, t - 20):t, 0]
+        feature_matrix[t, 9] = (
+            feature_matrix[t, 0] / (apce_w5.mean() + 1e-8)
+            if len(apce_w5) > 0 else 1.0
+        )
+        feature_matrix[t, 10] = (
+            feature_matrix[t, 0] / (apce_w20.mean() + 1e-8)
+            if len(apce_w20) > 0 else 1.0
+        )
+        ent_w5 = feature_matrix[max(0, t - 5):t, 3]
+        feature_matrix[t, 11] = feature_matrix[t, 3] - (
+            ent_w5.mean() if len(ent_w5) > 0 else feature_matrix[t, 3]
+        )
+        pm_w5 = feature_matrix[max(0, t - 5):t, 4]
+        feature_matrix[t, 12] = feature_matrix[t, 4] - (
+            pm_w5.mean() if len(pm_w5) > 0 else feature_matrix[t, 4]
+        )
+        # confirmed_streak: consecutive frames with APCE > 100
+        streak = 0
+        for k in range(t, -1, -1):
+            if feature_matrix[k, 0] > 100.0:
+                streak += 1
+            else:
+                break
+        feature_matrix[t, 13] = float(streak)
+        # low_conf_streak: consecutive frames with APCE < 50
+        low_s = 0
+        for k in range(t, -1, -1):
+            if feature_matrix[k, 0] < 50.0:
+                low_s += 1
+            else:
+                break
+        feature_matrix[t, 14] = float(low_s)
+
+    # Features 15-21: target dynamics
+    for t in range(n):
+        if t == 0:
+            feature_matrix[t, 15:22] = [0, 0, 0, 0, 1.0, 0, 0.5]
+            continue
+        cur, prv = preds[t], preds[t - 1]
+        diag = max((cur.w ** 2 + cur.h ** 2) ** 0.5, 1.0)
+        cx_v = ((cur.x + cur.w / 2) - (prv.x + prv.w / 2)) / diag
+        cy_v = ((cur.y + cur.h / 2) - (prv.y + prv.h / 2)) / diag
+        speed = (cx_v ** 2 + cy_v ** 2) ** 0.5
+        if t >= 2:
+            pp = preds[t - 2]
+            cx_v2 = ((prv.x + prv.w / 2) - (pp.x + pp.w / 2)) / diag
+            cy_v2 = ((prv.y + prv.h / 2) - (pp.y + pp.h / 2)) / diag
+            accel = abs(speed - (cx_v2 ** 2 + cy_v2 ** 2) ** 0.5)
+        else:
+            accel = 0.0
+        scale_r = (cur.w * cur.h) / max(prv.w * prv.h, 1.0)
+        asp_d = (cur.w / max(cur.h, 1e-3)) - (prv.w / max(prv.h, 1e-3))
+        h_img, w_img = frames_list[t].shape[:2]
+        cx = cur.x + cur.w / 2
+        cy = cur.y + cur.h / 2
+        search_sz = max(cur.w, cur.h) * 4.0
+        dist_border = min(cx, cy, w_img - cx, h_img - cy) / max(search_sz, 1.0)
+        feature_matrix[t, 15] = cx_v
+        feature_matrix[t, 16] = cy_v
+        feature_matrix[t, 17] = speed
+        feature_matrix[t, 18] = accel
+        feature_matrix[t, 19] = float(scale_r)
+        feature_matrix[t, 20] = float(asp_d)
+        feature_matrix[t, 21] = float(np.clip(dist_border, 0.0, 1.0))
+
+    # Features 22-27: camera/flow from dense optical flow
+    for t in range(n):
+        if t == 0 or frames_list[t] is None or frames_list[t - 1] is None:
+            continue
+        gray_cur = cv2.cvtColor(frames_list[t], cv2.COLOR_BGR2GRAY).astype(np.float32)
+        gray_prev = cv2.cvtColor(frames_list[t - 1], cv2.COLOR_BGR2GRAY).astype(np.float32)
+        flow = cv2.calcOpticalFlowFarneback(
+            gray_prev, gray_cur, None,
+            pyr_scale=0.5, levels=3, winsize=15, iterations=3,
+            poly_n=5, poly_sigma=1.2, flags=0,
+        )
+        mag = np.hypot(flow[..., 0], flow[..., 1])
+        global_flow_mag = float(mag.mean())
+
+        bbox = preds[t]
+        h_img, w_img = frames_list[t].shape[:2]
+        x1, y1 = max(0, int(bbox.x)), max(0, int(bbox.y))
+        x2, y2 = min(w_img, int(bbox.x + bbox.w)), min(h_img, int(bbox.y + bbox.h))
+        if x2 > x1 and y2 > y1:
+            target_mag = float(mag[y1:y2, x1:x2].mean())
+            tflow = flow[y1:y2, x1:x2]
+        else:
+            target_mag, tflow = global_flow_mag, flow
+
+        ego_residual = abs(target_mag - global_flow_mag)
+
+        gf_mean = flow.mean(axis=(0, 1))
+        tf_mean = tflow.mean(axis=(0, 1))
+        denom = np.linalg.norm(gf_mean) * np.linalg.norm(tf_mean) + 1e-8
+        flow_cos = float(np.dot(gf_mean, tf_mean) / denom)
+        flow_iou = float(np.clip((flow_cos + 1) / 2, 0.0, 1.0))
+
+        if t >= 2:
+            prev_gmag = feature_matrix[t - 1, 22]
+            flow_consistency = 1.0 / (1.0 + abs(global_flow_mag - prev_gmag))
+        else:
+            flow_consistency = 0.5
+
+        feature_matrix[t, 22] = global_flow_mag
+        feature_matrix[t, 23] = target_mag
+        feature_matrix[t, 24] = ego_residual
+        feature_matrix[t, 25] = flow_iou
+        feature_matrix[t, 26] = ego_residual       # flow_residual = ego_residual in v0
+        feature_matrix[t, 27] = flow_consistency
+
+    # ------------------------------------------------------------------
+    # C. Compute GT-derived labels
+    # ------------------------------------------------------------------
+    labels = compute_labels(
+        iou_trace=iou_trace,
+        apce_norm=feature_matrix[:, 1],
+        speed_norm=feature_matrix[:, 17],
+        accel_norm=feature_matrix[:, 18],
+        scale_delta=feature_matrix[:, 19] - 1.0,
+        global_flow_mag=feature_matrix[:, 22],
+        ego_motion_residual=feature_matrix[:, 24],
+        peak_margin=feature_matrix[:, 4],
+        flow_consistency=feature_matrix[:, 27],
+    )
+    return feature_matrix, labels, iou_trace, pred_arr.astype(np.float32), gt_arr.astype(np.float32)
+
+
+# ---------------------------------------------------------------------------
+# Dataset loaders and split assignment helpers
+# ---------------------------------------------------------------------------
+
+
+def _get_dataset_loaders(dataset_names: "list[str]") -> "list[tuple[str, Any]]":
+    """Load requested datasets. Reads UAV_DATA_ROOT from environment."""
+    import os
+    data_root = os.environ.get("UAV_DATA_ROOT", "")
+    loaders = []
+    for name in dataset_names:
+        if name == "uav123":
+            from uav_tracker.datasets.uav123 import UAV123Dataset
+            loaders.append(("uav123", UAV123Dataset(root=data_root)))
+        elif name == "visdrone_sot":
+            from uav_tracker.datasets.visdrone_sot import VisDroneSOTDataset
+            loaders.append(("visdrone_sot", VisDroneSOTDataset(root=data_root)))
+        elif name == "dtb70":
+            from uav_tracker.datasets.dtb70 import DTB70Dataset
+            loaders.append(("dtb70", DTB70Dataset(root=data_root)))
+        else:
+            raise ValueError(f"Unknown dataset: {name}")
+    return loaders
+
+
+def _assign_split(seq_name: str, dataset_name: str) -> str:
+    """Assign train/val/diagnostic split by sequence name.
+
+    Diagnostic sequences get "diagnostic" regardless of dataset.
+    All others use a deterministic hash-based 75/25 train/val split so
+    the same sequence always lands in the same split across runs.
+    """
+    if seq_name in DIAGNOSTIC_SEQUENCES:
+        return "diagnostic"
+    h = int(hashlib.md5(f"{dataset_name}/{seq_name}".encode()).hexdigest(), 16)
+    return "train" if (h % 4) != 0 else "val"
+
+
+# ---------------------------------------------------------------------------
+# Full collection loop
+# ---------------------------------------------------------------------------
+
+
+def collect_dataset(
+    config_path: str,
+    dataset_names: "list[str]",
+    output_path: str,
+    max_frames: "int | None" = None,
+    dry_run: bool = False,
+) -> SavedDataset:
+    """Full collection loop: run frozen tracker on all sequences, save NPZ.
+
+    Parameters
+    ----------
+    config_path:
+        Path to the SALT/SGLATrack YAML config (frozen).
+    dataset_names:
+        Subset of ["uav123", "visdrone_sot", "dtb70"] to process.
+    output_path:
+        Destination for the compressed NPZ file.
+    max_frames:
+        Cap per-sequence frame count for fast debug runs (None = no cap).
+    dry_run:
+        If True, iterate sequences and print names without running tracker
+        or writing output.
+
+    Returns
+    -------
+    SavedDataset populated with all collected data (empty dict entries if
+    dry_run=True).
+    """
+    import sys
+    sys.path.insert(0, str(Path(__file__).parents[4] / "src"))
+
+    from uav_tracker.salt_runner import SALTRunner
+    from uav_tracker.metrics.success import iou as iou_fn_inner
+
+    # Make iou_fn available inside collect_sequence via globals()
+    globals()["iou_fn"] = iou_fn_inner
+
+    runner = SALTRunner.from_config(config_path)
+    config_hash = hash_config_file(config_path)
+    tracker_version = "sglatrack_ep0297"  # from FROZEN.md
+
+    ds = SavedDataset(
+        tracker_version=tracker_version,
+        tracker_config_hash=config_hash,
+    )
+
+    dataset_loaders = _get_dataset_loaders(dataset_names)
+
+    for dataset_name, dataset in dataset_loaders:
+        seqs = list(dataset)
+        print(f"[{dataset_name}] {len(seqs)} sequences")
+        for seq in seqs:
+            seq_key = f"{dataset_name}/{seq.name}"
+            split = _assign_split(seq.name, dataset_name)
+            print(f"  {seq_key} split={split}", flush=True)
+            if dry_run:
+                continue
+            try:
+                features, labels, iou_trace, pred_arr, gt_arr = collect_sequence(
+                    runner, seq, dataset_name, split, max_frames=max_frames,
+                )
+                ds.add_sequence(
+                    seq_name=seq.name,
+                    dataset_name=dataset_name,
+                    split=split,
+                    features=features,
+                    labels=labels,
+                    iou_trace=iou_trace,
+                    bbox_pred=pred_arr.astype(np.float32),
+                    bbox_gt=gt_arr.astype(np.float32),
+                )
+            except Exception as exc:
+                print(f"  ERROR {seq_key}: {exc}", file=sys.stderr)
+                continue
+
+    if not dry_run:
+        ds.save(output_path)
+        print(f"Saved {output_path}")
+        print(ds.summary())
+    return ds
+
+
+# ---------------------------------------------------------------------------
+# CLI entry point
 # ---------------------------------------------------------------------------
 
 
@@ -439,7 +791,7 @@ def main() -> None:
 
     Usage::
 
-        python collect_features.py --config /path/to/salt.yaml \\
+        python collect_features.py --config configs/prod/salt.yaml \\
                                    --datasets uav123 visdrone_sot dtb70 \\
                                    --output saltr/data/salt_rd_v0.npz
     """
@@ -450,7 +802,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--config",
-        required=True,
+        default="configs/prod/salt.yaml",
         help="Path to SGLATrack/SALT YAML config (used to derive tracker_config_hash).",
     )
     parser.add_argument(
@@ -472,27 +824,18 @@ def main() -> None:
         help="Cap per-sequence frame count for fast debug runs (None = no cap).",
     )
     parser.add_argument(
-        "--tracker-version",
-        default="sglatrack_ep0297",
-        help="Human-readable tracker version tag embedded in the NPZ.",
+        "--dry-run",
+        action="store_true",
+        help="Print sequences without running tracker or writing output.",
     )
 
     args = parser.parse_args()
-
-    # TODO: implement full collection loop after verifying NPZ schema
-    # Steps:
-    #   1. Load frozen tracker from args.config
-    #   2. For each dataset in args.datasets:
-    #      a. Iterate sequences
-    #      b. Run tracker frame-by-frame
-    #      c. Extract FEATURE_NAMES from tracker internals
-    #      d. Accumulate per-frame features, bboxes, iou vs GT
-    #   3. Call compute_labels() for each sequence
-    #   4. Call SavedDataset.add_sequence() for each sequence
-    #   5. Call SavedDataset.save(args.output)
-    raise NotImplementedError(
-        "Collection loop not implemented yet — implement after verifying NPZ schema "
-        "and confirming feature extraction hooks in SGLATracker telemetry."
+    collect_dataset(
+        config_path=args.config,
+        dataset_names=args.datasets,
+        output_path=args.output,
+        max_frames=args.max_frames,
+        dry_run=args.dry_run,
     )
 
 

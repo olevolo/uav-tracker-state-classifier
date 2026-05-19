@@ -37,12 +37,12 @@ The final reviewed plan is:
 ## Current Repo State
 
 - Active branch: `main`.
-- Worktree is not clean.
-- Current `git status` at review time shows `HANDOFF_NEXT.md` modified and `CURRENT_PHASE.md` untracked.
-- No `saltr/` directory exists yet.
-- No `FROZEN.md` exists yet.
-- The policy freeze has not been performed.
-- The old idea of moving the whole repo into `saltv3/` has been rejected. Do not do that.
+- Phase 0 commit: `ecfcb0f` — all Phase 0 items delivered.
+- `saltr/src/salt_r/` exists with collect_features.py, model/train/eval/policy/integrate stubs.
+- `FROZEN.md` committed, policy freeze active.
+- Config gates wired: `enable_ce` in sglatrack.py, `enable_velocity_drift` in target_state_assessor.py.
+- `TrackState` extended with `score_map_stats` and 4 other telemetry fields.
+- collect_features.py collection loop: implemented in this session (Phase 1a).
 
 ## Current Planning Documents
 

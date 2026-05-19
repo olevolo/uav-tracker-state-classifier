@@ -287,7 +287,15 @@ class SALTRunner:
             confidence=1.0,
             tier=1,
             switched=False,
-            aux={"target_state": "CONFIRMED", "tsa_confidence": 1.0},
+            aux={
+                "target_state": "CONFIRMED",
+                "tsa_confidence": 1.0,
+                # SALT-RD telemetry — empty for init frame
+                "score_map_stats": {},
+                "apce_raw": 0.0,
+                "psr_raw": 0.0,
+                "entropy_raw": 0.0,
+            },
         )
         _state_counts["CONFIRMED"] = _state_counts.get("CONFIRMED", 0) + 1
 
@@ -672,6 +680,11 @@ class SALTRunner:
                                         "target_state": state_name,
                                         "tsa_confidence": tsa_confidence,
                                         "recovered": True,
+                                        # SALT-RD telemetry — empty for init frame
+                                        "score_map_stats": {},
+                                        "apce_raw": 0.0,
+                                        "psr_raw": 0.0,
+                                        "entropy_raw": 0.0,
                                     },
                                 )
                         else:
@@ -742,6 +755,11 @@ class SALTRunner:
                     if lstm_pred else None
                 ),
                 "appearance_drift": round(drift, 4),
+                # SALT-RD telemetry — zero/empty-defaulted, does not change tracker behaviour
+                "score_map_stats": getattr(track_state, "score_map_stats", {}),
+                "apce_raw": getattr(track_state, "apce", 0.0),
+                "psr_raw": getattr(track_state, "psr", 0.0),
+                "entropy_raw": getattr(track_state, "response_entropy", 0.0),
             },
         )
 
