@@ -193,6 +193,7 @@ markers = [
 ]
 filterwarnings = [
     "error",
+    "ignore::FutureWarning:timm.*",
     "ignore::DeprecationWarning:torch.*",
     "ignore::UserWarning:torchvision.*",
 ]

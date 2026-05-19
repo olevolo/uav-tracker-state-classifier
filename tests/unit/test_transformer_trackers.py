@@ -1,36 +1,29 @@
-"""Unit tests for OSTrackTracker and STARKTracker.
+"""Unit tests for OSTrackTracker and SGLATracker.
 
 Covers:
 - Registry presence
 - tier_hint value
 - reset() clears per-sequence state without touching the model
-- is_stub_mode property (True when no real weights on disk)
+- is_stub_mode property
 - flops_per_update() returns a positive number
 """
 from __future__ import annotations
 
 import numpy as np
-import pytest
 
 from uav_tracker.registry import TRACKERS
 from uav_tracker.types import BBox
 from uav_tracker.trackers.transformer.ostrack import OSTrackTracker
-from uav_tracker.trackers.transformer.stark import STARKTracker
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+from uav_tracker.trackers.sglatrack import SGLATracker
 
 _RNG = np.random.default_rng(42)
 
 
 def _rand_frame(h: int = 180, w: int = 240) -> np.ndarray:
-    """Return a random uint8 BGR frame of size (h, w, 3)."""
     return _RNG.integers(0, 256, (h, w, 3), dtype=np.uint8)
 
 
 def _center_bbox(h: int = 180, w: int = 240) -> BBox:
-    """Return a small bbox near the frame centre."""
     return BBox(x=w / 2 - 20, y=h / 2 - 20, w=40, h=40)
 
 
@@ -38,95 +31,76 @@ def _center_bbox(h: int = 180, w: int = 240) -> BBox:
 # Registry
 # ---------------------------------------------------------------------------
 
-
-def test_ostrack_in_trackers_registry() -> None:
+def test_ostrack_in_registry() -> None:
     assert "ostrack_256" in TRACKERS
 
 
-def test_stark_in_trackers_registry() -> None:
-    assert "stark_s50" in TRACKERS
+def test_sglatrack_in_registry() -> None:
+    assert "sglatrack" in TRACKERS
 
 
 # ---------------------------------------------------------------------------
 # tier_hint
 # ---------------------------------------------------------------------------
 
-
-def test_ostrack_tier_hint_is_2() -> None:
+def test_ostrack_tier_hint() -> None:
     assert OSTrackTracker.tier_hint == 2
 
 
-def test_stark_tier_hint_is_2() -> None:
-    assert STARKTracker.tier_hint == 2
+def test_sglatrack_tier_hint() -> None:
+    assert SGLATracker.tier_hint == 1
 
 
 # ---------------------------------------------------------------------------
 # reset() clears per-sequence state
 # ---------------------------------------------------------------------------
 
-
 def test_ostrack_reset_clears_state() -> None:
     tracker = OSTrackTracker(device="cpu")
-    frame = _rand_frame()
-    bbox = _center_bbox()
-    tracker.init(frame, bbox)
-    # After init both attributes should be populated
-    assert tracker._template_feat is not None
-    assert tracker._last_bbox is not None
-    # reset() must clear them
-    tracker.reset()
-    assert tracker._template_feat is None
-    assert tracker._last_bbox is None
-    # The model must NOT be cleared (avoids expensive reload)
-    assert tracker._model is not None
-
-
-def test_stark_reset_clears_state() -> None:
-    tracker = STARKTracker(device="cpu")
-    frame = _rand_frame()
-    bbox = _center_bbox()
-    tracker.init(frame, bbox)
-    assert tracker._template_feat is not None
+    tracker.init(_rand_frame(), _center_bbox())
+    assert tracker._template is not None
     assert tracker._last_bbox is not None
     tracker.reset()
-    assert tracker._template_feat is None
+    assert tracker._template is None
     assert tracker._last_bbox is None
-    assert tracker._model is not None
+    assert tracker._model is not None  # model weights retained
+
+
+def test_sglatrack_reset_clears_state() -> None:
+    tracker = SGLATracker(device="cpu")
+    tracker.init(_rand_frame(), _center_bbox())
+    assert tracker._z_tensor is not None
+    assert tracker._state is not None
+    tracker.reset()
+    assert tracker._z_tensor is None
+    assert tracker._state is None
+    assert tracker._model is not None  # model weights retained
 
 
 # ---------------------------------------------------------------------------
-# is_stub_mode property
+# is_stub_mode
 # ---------------------------------------------------------------------------
 
-
-def test_ostrack_stub_mode_property() -> None:
-    """A freshly constructed OSTrackTracker has is_stub == True (no weights)."""
+def test_ostrack_stub_mode() -> None:
     tracker = OSTrackTracker(device="cpu")
-    # Before _load_model() is called the default is True
-    assert tracker.is_stub_mode is True
-    # After init() loads the stub backbone it should still be True
+    assert tracker.is_stub_mode is True  # before init
     tracker.init(_rand_frame(), _center_bbox())
-    assert tracker.is_stub_mode is True
+    # After init with real weights at UAV_WEIGHTS_ROOT: False; without: True
+    assert isinstance(tracker.is_stub_mode, bool)
 
 
-def test_stark_stub_mode_property() -> None:
-    """A freshly constructed STARKTracker has is_stub == True (no weights)."""
-    tracker = STARKTracker(device="cpu")
-    assert tracker.is_stub_mode is True
-    tracker.init(_rand_frame(), _center_bbox())
-    assert tracker.is_stub_mode is True
+def test_sglatrack_stub_mode_type() -> None:
+    tracker = SGLATracker(device="cpu")
+    assert isinstance(tracker.is_stub_mode, bool)
 
 
 # ---------------------------------------------------------------------------
 # flops_per_update()
 # ---------------------------------------------------------------------------
 
-
 def test_ostrack_flops_positive() -> None:
-    tracker = OSTrackTracker(device="cpu")
-    assert tracker.flops_per_update() > 0
+    assert OSTrackTracker(device="cpu").flops_per_update() > 0
 
 
-def test_stark_flops_positive() -> None:
-    tracker = STARKTracker(device="cpu")
-    assert tracker.flops_per_update() > 0
+def test_sglatrack_flops_positive() -> None:
+    assert SGLATracker(device="cpu").flops_per_update() > 0

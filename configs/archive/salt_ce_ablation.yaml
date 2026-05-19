@@ -1,0 +1,54 @@
+# CE token pruning ablation — test different keep_ratios to find
+# the threshold where APCE stays reliably above TSA decision boundaries.
+#
+# Problem: CE prunes tokens → APCE drops → TSA fires OCCLUDED/LOST more
+# → recovery pipeline degrades. Need to find keep_ratio where APCE
+# distribution doesn't shift enough to cross the TSA decision boundaries.
+#
+# Suggested test progression: 0.85 → 0.75 → 0.65 → 0.50
+# Run: PYTHONPATH=src .venv/bin/python scripts/fast_bench.py \
+#        --mode salt --dataset uav123 --pruning ce
+# then edit ce_keep_ratio below and re-run.
+
+tracker:
+  name: sglatrack
+  device: auto
+  ce_loc: [3, 6, 9]
+  ce_keep_ratio_by_state:
+    CONFIRMED:       [0.85, 0.85, 0.85]  # conservative start — tune downward
+    LOW_RES:         [1.0, 1.0, 1.0]
+    DYNAMIC:         [1.0, 1.0, 1.0]
+    OCCLUDED:        [1.0, 1.0, 1.0]
+    DISTRACTOR_RISK: [1.0, 1.0, 1.0]
+    LOST:            null
+
+tsa:
+  device: auto
+  adapt_interval: 20
+  adapt_enabled: false
+  buffer_size: 100
+  motion_residual_threshold: 0.5
+  drift_threshold: 0.35
+  weights_path: weights/tsa_head_uav123.pth
+
+detector:
+  name: yolo26m_visdrone
+  conf_threshold: 0.25
+
+appearance_memory:
+  name: cosine_memory
+  enabled: true
+  max_templates: 20
+  forgetting_factor: 0.95
+  store_interval: 10
+  min_confidence: 0.60
+  drift_threshold: 0.35
+
+motion_predictor:
+  name: lstm_online
+  enabled: false
+  hidden_size: 32
+  seq_len: 10
+
+dataset: uav123
+seed: 42

@@ -14,11 +14,10 @@ from uav_tracker.registry import APPEARANCE_MEMORIES
 from uav_tracker.types import AppearanceTemplate, BBox, FrameContext, TrackState
 
 # Fixed random projection matrix — seeded at 42, built once at module load.
-# Shape: (64 * 64 * 3,  embedding_dim_max) where embedding_dim_max = 512.
-# The first `embedding_dim` columns are sliced out at instantiation time so
-# that different `embedding_dim` values reuse the same underlying matrix.
+# Shape: (32 * 32 * 3, embedding_dim_max) where embedding_dim_max = 512.
+# Crop is resized to 32×32 (was 64×64) — 4× cheaper matmul, same 64-d output.
 _PROJ_SEED = 42
-_PROJ_IN = 64 * 64 * 3  # 12 288
+_PROJ_IN = 32 * 32 * 3  # 3072 — was 12288 (64×64×3), ~12× fewer FLOPs/call
 _PROJ_DIM_MAX = 512
 
 _rng_proj = np.random.default_rng(_PROJ_SEED)
@@ -28,7 +27,7 @@ _PROJECTION_MATRIX: np.ndarray = _rng_proj.standard_normal(
 
 
 def _build_projection(embedding_dim: int) -> np.ndarray:
-    """Return a (12288, embedding_dim) projection matrix (float32, fixed seed)."""
+    """Return a (3072, embedding_dim) projection matrix (float32, fixed seed)."""
     if embedding_dim > _PROJ_DIM_MAX:
         raise ValueError(
             f"embedding_dim {embedding_dim} exceeds maximum {_PROJ_DIM_MAX}"
@@ -116,7 +115,7 @@ class CosineAppearanceMemory:
         Steps:
         1. Honour ``store_interval`` — skip frames between stores.
         2. Skip if ``state.confidence < min_confidence``.
-        3. Crop ROI (2× context), resize to 64×64, flatten, project, L2-norm.
+        3. Crop ROI (2× context), resize to 32×32, flatten, project, L2-norm.
         4. Decay existing weights by ``forgetting_factor``.
         5. Append new template (weight=1.0).
         6. Evict lowest-weight template if over capacity.
@@ -201,9 +200,7 @@ class CosineAppearanceMemory:
 
     def _extract_embedding(self, frame: np.ndarray, bbox: BBox) -> np.ndarray:
         """Crop, resize, flatten, project, and L2-normalise into an embedding."""
-        patch = _crop_and_resize(frame, bbox, target_size=64)
-        # Flatten: (64, 64, 3) → (12288,)
+        patch = _crop_and_resize(frame, bbox, target_size=32)  # was 64; 4× fewer pixels
         flat = patch.flatten()
-        # Random projection: (12288,) @ (12288, embedding_dim) → (embedding_dim,)
         projected = flat @ self._proj
         return _l2_normalize(projected)

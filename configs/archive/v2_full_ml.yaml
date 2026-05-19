@@ -1,11 +1,9 @@
-# V2 Full ML pipeline experiment
+# Full ML pipeline experiment
 # Wires: ostrack_256 (tier-2) + ml_scene scheduler + scene classifier + appearance memory + motion predictor
 
 trackers:
   0:
     name: kcf_henriques
-  1:
-    name: mobiletrack
   2:
     name: ostrack_256
 
@@ -28,11 +26,11 @@ scheduler:
   risk_prearm_frames: 3
   scene_to_tier:
     0: 0  # CLEAR -> tier 0 (KCF)
-    1: 1  # MODERATE -> tier 1 (MobileTrack)
+    1: 0  # MODERATE -> tier 0 (KCF, tier 1 reserved)
     2: 2  # CHALLENGING -> tier 2 (OSTrack)
     3: 2  # RISK_LOSS -> tier 2
     4: 3  # RECOVERY -> tier 3 (YOLO)
-    5: 1  # LOW_RES -> tier 1
+    5: 0  # LOW_RES -> tier 0 (KCF, tier 1 reserved)
 
 scene_classifier:
   name: mobilenetv3_tiny

@@ -1,0 +1,51 @@
+# SALT — Scene-Adaptive Learning Tracker (CTEM variant)
+# Identical to salt.yaml but uses UTPTrack-style CTEM token pruning
+# instead of the default CE (attention-based) pruning.
+#
+# CTEM (Cosine Template-similarity Elimination Module):
+#   Each search token's importance = cosine similarity with the mean template embedding.
+#   No learned scoring head required — uses token representations directly.
+#   Reference: UTPTrack (arXiv 2602.23734), simplified to cosine-similarity form.
+
+tracker:
+  name: sglatrack
+  device: auto
+  pruning_mode: ctem          # UTPTrack-style CTEM (vs "ce" default)
+  # Keep ratios are the same as salt.yaml — CTEM uses the same schedule
+  ce_loc: [3, 6, 9]
+  ce_keep_ratio_by_state:
+    CONFIRMED:       [0.5, 0.5, 0.5]   # ~128/256 tokens at each pruning layer
+    LOW_RES:         [1.0, 1.0, 1.0]   # all tokens, full depth
+    DYNAMIC:         [1.0, 1.0, 1.0]   # all tokens, full depth
+    OCCLUDED:        [1.0, 1.0, 1.0]   # all tokens, full depth
+    DISTRACTOR_RISK: [1.0, 1.0, 1.0]   # all tokens + appearance check
+    LOST:            null               # detector takes over
+
+tsa:
+  device: auto
+  adapt_interval: 20
+  adapt_enabled: false
+  buffer_size: 100
+  motion_residual_threshold: 0.5
+  drift_threshold: 0.35
+  weights_path: weights/tsa_head_uav123.pth
+
+detector:
+  name: yolo26m_visdrone
+  conf_threshold: 0.25
+
+appearance_memory:
+  name: cosine_memory
+  enabled: true
+  max_templates: 20
+  forgetting_factor: 0.95
+  store_interval: 10
+  min_confidence: 0.60
+  drift_threshold: 0.35
+
+motion_predictor:
+  name: lstm_online
+  enabled: false
+
+dataset: uav123
+seed: 42

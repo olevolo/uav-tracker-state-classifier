@@ -1,6 +1,6 @@
 # Engineer-owned package namespace.
 """Detector plugins (Phase 6+). Architect owns ``base.py``."""
 
-# Import yolo module so the @DETECTORS.register("yolov8n") decorator fires.
-# Ultralytics is NOT imported at this level — only at first detect() call.
-from . import yolo  # noqa: F401
+# yolo (yolov8n) import commented out — replaced by yolo26m_visdrone in SALT v3.
+# Uncomment to re-enable "yolov8n" registration for legacy config compatibility.
+# from . import yolo  # noqa: F401  # registers "yolov8n"

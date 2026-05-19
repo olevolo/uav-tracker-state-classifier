@@ -1,0 +1,77 @@
+# SALT detector ablation — RT-DETRv2-S (COCO pre-trained)
+# Minimal delta from salt.yaml; only the detector section differs.
+#
+# Key difference from yolo26m baseline:
+#   - COCO-trained: detects all 80 COCO classes (person, car, motorcycle, truck, ...)
+#   - NO VisDrone fine-tuning → worse on tiny/distant UAV-view targets
+#   - Transformer architecture (ResNet-18vd backbone) → stronger on contextual detection
+#   - Sorting by proximity to hint_bbox is implemented in RTDETRv2Detector.detect()
+#
+# Weights required:
+#   $UAV_WEIGHTS_ROOT/rtdetr/rtdetrv2_r18vd_120e_coco_rerun_48.1.pth
+#   (currently at ~/projects/rtdetrv2_r18vd_120e_coco_rerun_48.1.pth — needs symlinking)
+#
+# RT-DETR source repo required at:
+#   ~/projects/RT-DETR/rtdetrv2_pytorch/  (already cloned)
+
+_meta:
+  ablation: detector
+  variant: rtdetrv2_s
+  notes: >
+    RT-DETRv2-S (ResNet-18vd, 48.1% mAP COCO). End-to-end transformer detector.
+    Sorts detections by proximity to hint_bbox — good spatial priming.
+    COCO classes: use target_classes filter to limit to UAV-relevant IDs
+    (person=0, car=2, motorcycle=3, airplane=4, truck=7, bird=14) or
+    leave null for all classes (rely on Guard 3 cosine filter).
+    Higher conf_threshold=0.30 vs 0.25 baseline to compensate for COCO → VisDrone gap.
+
+tracker:
+  name: sglatrack
+  device: auto
+  ce_loc: [3, 6, 9]
+  ce_keep_ratio_by_state:
+    CONFIRMED:       [0.5, 0.5, 0.5]
+    LOW_RES:         [1.0, 1.0, 1.0]
+    DYNAMIC:         [1.0, 1.0, 1.0]
+    OCCLUDED:        [1.0, 1.0, 1.0]
+    DISTRACTOR_RISK: [1.0, 1.0, 1.0]
+    LOST:            null
+
+tsa:
+  name: mobilenetv3_tiny
+  classify_interval: 5
+  confidence_threshold: 0.60
+  device: auto
+  adapt_interval: 20
+  adapt_steps: 3
+  adapt_enabled: false
+  buffer_size: 100
+  iou_threshold_confirmed: 0.7
+  iou_threshold_occluded: 0.3
+  motion_residual_threshold: 0.5
+  weights_path: weights/tsa_head_uav123.pth
+
+detector:
+  name: rtdetrv2_s                # RT-DETRv2-S, COCO pre-trained
+  conf_threshold: 0.30            # slightly higher than YOLO26m: COCO scores well-calibrated
+  # target_classes: null          # uncomment and list COCO IDs to restrict class set
+  # e.g.: target_classes: [0, 2, 3, 4, 7, 14]  # person, car, motorcycle, airplane, truck, bird
+
+appearance_memory:
+  name: cosine_memory
+  enabled: true
+  max_templates: 20
+  forgetting_factor: 0.95
+  store_interval: 10
+  min_confidence: 0.60
+  drift_threshold: 0.35
+
+motion_predictor:
+  name: lstm_online
+  enabled: false
+
+head_adaptor:
+  enabled: false
+
+dataset: uav123
+seed: 42

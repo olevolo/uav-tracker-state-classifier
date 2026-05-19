@@ -63,31 +63,46 @@ _log = logging.getLogger(__name__)
 # Submodule paths whose import side-effect registers a plugin.
 # Each entry is documented with WHY it exists (what it registers).
 _PLUGIN_MODULES: tuple[str, ...] = (
-    # Registers "kcf_kalman" in TRACKERS (fast KCF+Kalman tier-1 tracker).
-    "uav_tracker.trackers.kcf_kalman",
-    # Registers "kcf_henriques" in TRACKERS (Henriques 2015 pure-NumPy KCF port).
-    "uav_tracker.trackers.kcf_henriques",
-    # Registers "uav123" in the (optional) dataset registry.
+    # -------------------------------------------------------------------------
+    # ACTIVE — used by SALT v3 pipeline
+    # -------------------------------------------------------------------------
+
+    # Primary tracker
+    "uav_tracker.trackers.sglatrack",              # registers "sglatrack"
+
+    # Comparison baselines (fast_bench --mode sglatrack/kcf, paper tables)
+    "uav_tracker.trackers.kcf_henriques",          # registers "kcf_henriques"
+    "uav_tracker.trackers.transformer.ostrack",    # registers "ostrack_256"
+
+    # Datasets
     "uav_tracker.datasets.uav123",
-    # Registers "synthetic" in DATASETS (procedural eval dataset).
     "uav_tracker.datasets.synthetic",
-    # Fallback signals (used by multi_tier scheduler for confidence checks).
-    "uav_tracker.signals.motion_entropy",         # registers "motion_entropy"
-    "uav_tracker.signals.tracker_confidence",     # registers "tracker_confidence"
-    # ML-scene-driven scheduler + detector.
-    "uav_tracker.schedulers.multi_tier",          # registers "multi_tier" in SCHEDULERS
-    "uav_tracker.detectors.yolo",                 # registers "yolov8n" in DETECTORS
-    # Heavy transformer trackers (tier-2).
-    "uav_tracker.trackers.transformer.ostrack",   # registers "ostrack_256" in TRACKERS
-    "uav_tracker.trackers.transformer.stark",     # registers "stark_s50" in TRACKERS
-    # ML infrastructure.
-    "uav_tracker.ml.warmer.model_warmer",         # registers "default" in ML_WARMERS
-    "uav_tracker.schedulers.ml_scene_scheduler",  # registers "ml_scene" in SCHEDULERS
-    "uav_tracker.ml.scene_classifier.cnn_classifier",  # registers "mobilenetv3_tiny" in SCENE_CLASSIFIERS
-    "uav_tracker.ml.difficulty_predictor.regression_predictor",  # registers "mlp_regressor" in DIFFICULTY_PREDICTORS
-    # Self-learning modules.
-    "uav_tracker.ml.appearance_memory.cosine_memory",  # registers "cosine_memory" in APPEARANCE_MEMORIES
-    "uav_tracker.ml.motion_predictor.lstm_predictor",  # registers "lstm_online" in MOTION_PREDICTORS
+    "uav_tracker.datasets.dtb70",
+    "uav_tracker.datasets.visdrone_sot",
+
+    # Recovery detectors (YOLO26m = active; RT-DETR/LEAF = ablation)
+    "uav_tracker.detectors.visdrone_yolo26m",      # registers "yolo26m_visdrone" — active
+    "uav_tracker.detectors.rtdetr",                # registers "rtdetrv2_s" — ablation
+    "uav_tracker.detectors.leaf_yolo",             # registers "leaf_yolo", "leaf_yolo_n" — ablation
+
+    # SALT self-learning modules
+    "uav_tracker.ml.appearance_memory.cosine_memory",    # registers "cosine_memory" — active
+    "uav_tracker.ml.motion_predictor.lstm_predictor",    # registers "lstm_online" — disabled in salt.yaml, code kept
+
+    # -------------------------------------------------------------------------
+    # INACTIVE — V2 pipeline (archived configs/archive/v2_full_ml.yaml).
+    # Registrations kept so `DETECTORS.build("yolov8n")` etc. still work
+    # if someone loads an old config, but these modules are NOT called by
+    # any active pipeline or experiment config.
+    # -------------------------------------------------------------------------
+
+    # "uav_tracker.detectors.yolo",                  # registers "yolov8n" — replaced by yolo26m_visdrone
+    # "uav_tracker.schedulers.ml_scene_scheduler",   # registers "ml_scene" — V2 scene routing
+    # "uav_tracker.schedulers.multi_tier",           # registers "multi_tier" — V2 tier fallback
+    # "uav_tracker.signals.motion_entropy",          # registers "motion_entropy" — V2 signal
+    # "uav_tracker.signals.tracker_confidence",      # registers "tracker_confidence" — V2 signal
+    # "uav_tracker.ml.scene_classifier.cnn_classifier",  # registers "mobilenetv3_tiny" — V2 CNN classifier
+    # "uav_tracker.ml.warmer.model_warmer",          # registers "default" — V2 model warmer
 )
 
 

@@ -44,12 +44,24 @@ class TrackState:
     into this range. ``status`` is a coarse trichotomy used by schedulers and
     downstream consumers. ``aux`` is a free-form bag for response maps, raw
     feature activations, or backend-specific diagnostics.
+
+    Score-map quality metrics (populated by SGLATracker, zero-defaulted for
+    other backends):
+    - ``apce`` — Average Peak-to-Correlation Energy; high values indicate a
+      sharp, dominant peak in the response map.
+    - ``psr`` — Peak-to-Sidelobe Ratio; compares the peak against the
+      surrounding response region.
+    - ``response_entropy`` — Shannon entropy of softmax(score_map.flatten());
+      high entropy indicates multiple candidate locations (distractor risk).
     """
 
     bbox: BBox
     confidence: float
     status: Literal["locked", "uncertain", "lost"]
     aux: dict[str, Any] = field(default_factory=dict)
+    apce: float = 0.0
+    psr: float = 0.0
+    response_entropy: float = 0.0
 
 
 # --------------------------------------------------------------------------- #

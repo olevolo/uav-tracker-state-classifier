@@ -85,6 +85,13 @@ weights/
 results/
 notebooks/.ipynb_checkpoints/
 
+# ---- LaTeX build artefacts ----
+*.aux
+*.log
+*.out
+texput.log
+missfont.log
+
 # ---- Node (for any frontend we might accrete later) ----
 node_modules/
 
