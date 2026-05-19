@@ -1,8 +1,8 @@
 # HANDOFF — SALT-RD: Reliability + Neural Scene Dynamicity for UAV SOT
 
 **Дата:** 2026-05-19  
-**Оновлено:** 2026-05-19 (Phase 1a complete)  
-**Статус:** Phase 1a DONE — наступна сесія запускає збірку NPZ, потім Phase 1b (модель)  
+**Оновлено:** 2026-05-20 (Phases 0–2 complete, dry-run ✅, collection running)  
+**Статус:** Phases 0→1a→1b→1c→2 DONE — наступна сесія: верифікація NPZ → train → eval GO/NO-GO  
 **Читай також:** `THOUGHTS.md`, `ANALYSIS.md`, `papers/README.md`, `FROZEN.md`
 
 ---
@@ -477,49 +477,67 @@ Priority rule:
 
 ---
 
+## ✅ Реалізовано — Phases 1a→1b→1c→2 (commits 64f307b…fe60482)
+
+| Phase | Завдання | Commit |
+|---|---|---|
+| **1a** | `collect_features.py` — collection loop, NPZ schema, 28 features, GT labels | `64f307b`, `e8d5630` |
+| **1a fixes** | `_TruncatedSequence`, GT-derived dynamic labels, `root=None` autodetect | `e8d5630` |
+| **1a tests** | 3 regression tests in `tests/unit/test_saltr_collect_features.py` | `e8d5630` |
+| **1b** | `model.py` — SALTRD GRU ~43k params, 7 heads | `39beee0` |
+| **1b** | `train.py` — focal BCE, empirical pos_weight, early stopping | `39beee0` |
+| **1b** | `eval.py` — AUROC/AUPRC/ECE/NT2F/bootstrap CI/GO-NO-GO | `39beee0` |
+| **1c** | `policy.py` — TrackerAction, RiskThresholds, apply_policy, replay_policy | `fe60482` |
+| **2** | `integrate.py` — SALTRDRunner, FeatureBuffer, RiskEntry, run_with_risk | `fe60482` |
+
+**Dry-run verified:** `--dry-run` passes for all 3 datasets (123+35+70 = 228 sequences).
+
+---
+
 ## Стартовий промпт для наступної coding сесії
 
-> Phase 0 DONE. Наступна сесія = Phase 1a: реальна збірка NPZ датасету.
+> Phases 0→1a→1b→1c→2 реалізовані. Наступна сесія = NPZ збірка → train → eval GO/NO-GO.
 
 ```text
-Прочитай HANDOFF_NEXT.md (секцію "Реалізовано — Phase 0"), THOUGHTS.md, FROZEN.md.
+Прочитай HANDOFF_NEXT.md (секцію "Реалізовано") та FROZEN.md.
 
-СТАН: Phase 0 done (commit ecfcb0f). saltr/src/salt_r/collect_features.py — скелет
-з NPZ schema, FEATURE_NAMES (28), compute_labels() і SavedDataset. Треба реалізувати
-collection loop.
+СТАН: Всі модулі saltr/ реалізовані. NPZ ще не зібрано.
 
-ЗАДАЧА: Phase 1a — реалізуй collection loop в collect_features.py
+ЗАДАЧА 1 — Зібрати NPZ (якщо не існує saltr/data/salt_rd_v0.npz):
+  PYTHONPATH=src python saltr/src/salt_r/collect_features.py \
+    --output saltr/data/salt_rd_v0.npz \
+    --datasets uav123 visdrone_sot dtb70
 
-1. Підключи SALTRunner (frozen) через configs/prod/salt.yaml:
-   - runner = SALTRunner.from_config("configs/prod/salt.yaml")
-   - Запустити на UAV123 + VisDrone-SOT + DTB70 послідовностях
+  Після збірки перевір base rates (виводяться в summary).
+  false_confirmed base rate: очікується 1-3%.
+  Якщо > 10% або < 0.5% → ЗУПИНИСЬ і перевір label logic у compute_labels().
 
-2. Для кожного кадру збери features в FEATURE_NAMES порядку:
-   Score map: track_state.score_map_stats (top1, top2, peak_margin, peak_width,
-     n_secondary, peak_distance, heatmap_mass_topk) + track_state.apce, psr,
-     response_entropy
-   Temporal: rolling windows (5/20 кадрів) для apce_ratio, entropy_delta,
-     confirmed_streak, low_conf_streak
-   Target dynamics: bbox velocity/accel/scale/aspect від frame до frame
-   Camera/flow: optical flow (cv2.calcOpticalFlowFarneback між кадрами)
-     global_flow_mag, target_flow_mag, ego_motion_residual
+ЗАДАЧА 2 — Тренування (після NPZ):
+  PYTHONPATH=src:saltr/src python saltr/src/salt_r/train.py \
+    --npz saltr/data/salt_rd_v0.npz \
+    --output saltr/checkpoints/
 
-3. Рахуй GT IoU (iou_trace) з GT bbox — iou(track_state.bbox, gt_bbox)
+  Спостерігай за val AUPRC(false_confirmed) — це primary metric.
+  Якщо не росте за 8 epochs → early stopping.
 
-4. Після послідовності виклик compute_labels(iou_trace, ...) → labels int8
+ЗАДАЧА 3 — Eval GO/NO-GO:
+  PYTHONPATH=src:saltr/src python saltr/src/salt_r/eval.py \
+    --npz saltr/data/salt_rd_v0.npz \
+    --checkpoint saltr/checkpoints/saltrd_best.pt \
+    --split val
 
-5. SavedDataset.add_sequence() → save NPZ
+  GO gate (з HANDOFF_NEXT.md):
+    AUPRC(false_confirmed) > 0.30
+    AUROC(failure_in_5) > 0.75
+    AUROC(hard_dynamic_scene) > 0.75
+
+  STOP якщо AUPRC(false_confirmed) < 0.15 → analyse features, consider LoRAT.
 
 КРИТИЧНО:
-- Split by sequence (не frame): UAV123 train/val 80/43, VisDrone 25/10, DTB70 50/20
-- DIAGNOSTIC_SEQUENCES окремо, не в train/val
-- Labels тільки GT/teacher-derived: НІЯКИХ _decide_state(), TargetState, APCE rules
-- Зберегти tracker_config_hash (sha256 configs/prod/salt.yaml)
-
-ПІСЛЯ collection:
-- Надрукуй base rates для кожного label: false_confirmed base ≈ 1-3%
-- Якщо false_confirmed > 10% або < 0.5% — ЗУПИНИСЬ і перевір label logic
-- Не тренуй модель доки NPZ і base rates не верифіковані
+- Verify diagnostic sequences are excluded from train/val (bike2, Gull2, etc.)
+- Report LODO: train UAV123+VisDrone → test DTB70 окремо
+- Bootstrap CI must be by sequence (не frame)
+- DO NOT tune thresholds to make numbers look better — negative result policy stands
 ```
 
 ---

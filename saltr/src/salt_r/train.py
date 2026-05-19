@@ -265,73 +265,25 @@ def focal_bce_loss(
 
 
 # ---------------------------------------------------------------------------
-# SALTRD model (defined here because model.py is still a stub)
+# ---------------------------------------------------------------------------
+# SALTRD model — thin tensor-output wrapper over model.py's dict-output model
 # ---------------------------------------------------------------------------
 
+from salt_r.model import SALTRD as _SALTRDBase, HEAD_NAMES as _HEAD_NAMES
 
-class SALTRD(nn.Module):
-    """SALT-RD: multi-head GRU temporal reliability/dynamicity controller.
 
-    Input:  (B, T, n_features) scalar telemetry window
-    Output: (B, n_heads) sigmoid probabilities
+class SALTRD(_SALTRDBase):
+    """SALTRD with tensor output (B, n_heads) for training convenience.
 
-    Architecture: GRU(hidden=64, layers=2) shared trunk -> 7 binary heads.
-    ~7 k parameters.
+    model.py's base class returns dict[head_name → (B,)] probabilities.
+    This subclass stacks them into a (B, n_heads) tensor so the training
+    loop can use standard tensor indexing without per-head boilerplate.
+    Head order matches HEAD_NAMES (excluding "correct").
     """
 
-    def __init__(
-        self,
-        n_features: int = 28,
-        n_heads: int = 7,
-        hidden_size: int = 64,
-        num_layers: int = 2,
-        dropout: float = 0.1,
-    ) -> None:
-        super().__init__()
-        self.n_features = n_features
-        self.n_heads = n_heads
-        self.hidden_size = hidden_size
-
-        # Input layer norm for feature whitening (instead of offline normalisation)
-        self.input_ln = nn.LayerNorm(n_features)
-
-        self.gru = nn.GRU(
-            input_size=n_features,
-            hidden_size=hidden_size,
-            num_layers=num_layers,
-            batch_first=True,
-            dropout=dropout if num_layers > 1 else 0.0,
-        )
-
-        # One binary classification head per label
-        self.heads = nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(hidden_size, 32),
-                nn.ReLU(),
-                nn.Dropout(dropout),
-                nn.Linear(32, 1),
-            )
-            for _ in range(n_heads)
-        ])
-
-    def forward(self, x: Tensor) -> Tensor:
-        """
-        Parameters
-        ----------
-        x: (B, T, n_features)
-
-        Returns
-        -------
-        probs: (B, n_heads) probabilities in [0, 1]
-        """
-        x = self.input_ln(x)
-        out, _ = self.gru(x)                 # (B, T, hidden_size)
-        last = out[:, -1, :]                 # (B, hidden_size) — last time step
-        logits = torch.stack(
-            [head(last).squeeze(-1) for head in self.heads],
-            dim=1,
-        )                                    # (B, n_heads)
-        return torch.sigmoid(logits)
+    def forward(self, x: "Tensor") -> "Tensor":  # type: ignore[override]
+        probs_dict = super().forward(x)
+        return torch.stack([probs_dict[h] for h in _HEAD_NAMES], dim=1)  # (B, n_heads)
 
 
 # ---------------------------------------------------------------------------
@@ -502,9 +454,9 @@ def train(
     # 2. Model
     # ------------------------------------------------------------------
     n_features = len(FEATURE_NAMES)   # 28
-    n_heads = len(train_ds.head_names)
+    n_heads = len(_HEAD_NAMES)         # 7, from model.HEAD_NAMES
 
-    model = SALTRD(n_features=n_features, n_heads=n_heads).to(dev)
+    model = SALTRD(n_features=n_features).to(dev)
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"[train] SALTRD  params={total_params:,}", flush=True)
 
