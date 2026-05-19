@@ -453,6 +453,54 @@ def hash_config_file(config_path: str | Path) -> str:
 # ---------------------------------------------------------------------------
 
 
+@dataclass
+class _TruncatedSequence:
+    """Minimal sequence wrapper that caps frame count before runner.run()."""
+    name: str
+    frames: list
+    ground_truth: list
+
+    @property
+    def init_bbox(self) -> "Any":
+        return self.ground_truth[0]
+
+
+def _compute_bbox_motion_arrays(
+    bboxes: list,
+) -> "tuple[np.ndarray, np.ndarray, np.ndarray]":
+    """Compute speed/accel/scale_delta from GT bounding boxes.
+
+    Used exclusively for label derivation — labels must be GT-derived,
+    NOT prediction-derived, to avoid label leakage from tracker drift/jitter.
+
+    Returns:
+        speed:       (n_frames,) float32 — normalized centroid speed
+        accel:       (n_frames,) float32 — normalized acceleration
+        scale_delta: (n_frames,) float32 — fractional scale change (cur/prev - 1)
+    """
+    import numpy as np  # noqa: PLC0415
+    n = len(bboxes)
+    speed = np.zeros(n, dtype=np.float32)
+    accel = np.zeros(n, dtype=np.float32)
+    scale_delta = np.zeros(n, dtype=np.float32)
+
+    prev_speed = 0.0
+    for t in range(1, n):
+        cur, prv = bboxes[t], bboxes[t - 1]
+        diag = max((cur.w ** 2 + cur.h ** 2) ** 0.5, 1.0)
+        cx_v = ((cur.x + cur.w / 2) - (prv.x + prv.w / 2)) / diag
+        cy_v = ((cur.y + cur.h / 2) - (prv.y + prv.h / 2)) / diag
+        speed[t] = (cx_v ** 2 + cy_v ** 2) ** 0.5
+        accel[t] = abs(speed[t] - prev_speed)
+        prev_speed = float(speed[t])
+
+        cur_scale = (cur.w * cur.h) ** 0.5
+        prv_scale = max((prv.w * prv.h) ** 0.5, 1.0)
+        scale_delta[t] = cur_scale / prv_scale - 1.0
+
+    return speed, accel, scale_delta
+
+
 def collect_sequence(
     runner: "Any",
     seq: "Any",
@@ -497,9 +545,13 @@ def collect_sequence(
         frames_list = frames_list[:max_frames]
     n = len(frames_list)
 
-    entries = list(runner.run(seq))
-    if max_frames:
-        entries = entries[:max_frames]
+    # Wrap in _TruncatedSequence so runner.run() never processes extra frames.
+    seq_for_run = _TruncatedSequence(
+        name=seq.name,
+        frames=frames_list,
+        ground_truth=gt_bboxes,
+    )
+    entries = list(runner.run(seq_for_run))
 
     preds = [e.bbox for e in entries]
     pred_arr = np.array([[b.x, b.y, b.w, b.h] for b in preds], dtype=np.float64)
@@ -642,12 +694,17 @@ def collect_sequence(
     # ------------------------------------------------------------------
     # C. Compute GT-derived labels
     # ------------------------------------------------------------------
+    # Labels use GT motion, not predicted-box motion.
+    # Predicted-box motion (feature_matrix[:, 17-19]) is fine as an input feature
+    # but must NOT be the label source — tracker drift/jitter would leak into labels.
+    gt_speed, gt_accel, gt_scale_delta = _compute_bbox_motion_arrays(gt_bboxes)
+
     labels = compute_labels(
         iou_trace=iou_trace,
         apce_norm=feature_matrix[:, 1],
-        speed_norm=feature_matrix[:, 17],
-        accel_norm=feature_matrix[:, 18],
-        scale_delta=feature_matrix[:, 19] - 1.0,
+        speed_norm=gt_speed,
+        accel_norm=gt_accel,
+        scale_delta=gt_scale_delta,
         global_flow_mag=feature_matrix[:, 22],
         ego_motion_residual=feature_matrix[:, 24],
         peak_margin=feature_matrix[:, 4],
@@ -662,20 +719,23 @@ def collect_sequence(
 
 
 def _get_dataset_loaders(dataset_names: "list[str]") -> "list[tuple[str, Any]]":
-    """Load requested datasets. Reads UAV_DATA_ROOT from environment."""
-    import os
-    data_root = os.environ.get("UAV_DATA_ROOT", "")
+    """Load requested datasets using each loader's own root autodetection.
+
+    Passing root=None lets each dataset class read UAV_DATA_ROOT / $HOME
+    paths it knows about, rather than forwarding a raw root string that may
+    not match the expected sub-directory layout.
+    """
     loaders = []
     for name in dataset_names:
         if name == "uav123":
             from uav_tracker.datasets.uav123 import UAV123Dataset
-            loaders.append(("uav123", UAV123Dataset(root=data_root)))
+            loaders.append(("uav123", UAV123Dataset(root=None)))
         elif name == "visdrone_sot":
             from uav_tracker.datasets.visdrone_sot import VisDroneSOTDataset
-            loaders.append(("visdrone_sot", VisDroneSOTDataset(root=data_root)))
+            loaders.append(("visdrone_sot", VisDroneSOTDataset(root=None)))
         elif name == "dtb70":
             from uav_tracker.datasets.dtb70 import DTB70Dataset
-            loaders.append(("dtb70", DTB70Dataset(root=data_root)))
+            loaders.append(("dtb70", DTB70Dataset(root=None)))
         else:
             raise ValueError(f"Unknown dataset: {name}")
     return loaders

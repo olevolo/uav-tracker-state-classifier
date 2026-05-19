@@ -77,26 +77,30 @@ Last verified in this session:
 
 ## Current SALT-RD Status
 
-SALT-RD is **Phase 0 complete** (commit ecfcb0f, 2026-05-19).
+SALT-RD is in **Phase 1a data-collection implementation** (2026-05-19).
 
-Phase 0 artifacts present:
+### Completed
 
-- `saltr/src/salt_r/collect_features.py` — EXISTS (collection loop not yet implemented; NPZ not populated)
-- `saltr/src/salt_r/model.py` — EXISTS
-- `saltr/src/salt_r/train.py` — EXISTS
-- `saltr/src/salt_r/eval.py` — EXISTS
-- `saltr/src/salt_r/policy.py` — EXISTS
-- `saltr/src/salt_r/integrate.py` — EXISTS
-- `FROZEN.md` — EXISTS (committed)
-- Config gates wired: `enable_ce` read in `sglatrack.py`; `enable_velocity_drift` read in `target_state_assessor.py`; `enable_dynamic` wired into `motion_predictor` enable check in `salt_runner.py`
-- `TrackState` HAS `score_map_stats` field
+- Phase 0 freeze/config/telemetry scaffold (commit `ecfcb0f`)
+- `collect_features.py` collection loop implemented (commit `64f307b`)
+- flat-sequence dynamicity label bug fixed (ABS_MIN_MOTION floor + strict `>`)
+- sequence-key collision fixed (compound keys `dataset/seq_name`)
+- `_TruncatedSequence` added — `max_frames` now caps runner work before execution
+- GT-derived dynamic labels — `_compute_bbox_motion_arrays` uses GT bboxes, not predicted boxes
+- dataset root autodetection — `_get_dataset_loaders` passes `root=None`
+- Papers competitive analysis written to `papers/README.md`
+- `model.py` / `train.py` / `eval.py` / `policy.py` / `integrate.py` — implemented (Phase 1b)
 
-Remaining Phase 1a work:
+### Still blocking before real NPZ collection
 
-- `collect_features.py` collection loop not implemented yet (NPZ not populated)
-- `saltr/data/salt_rd_features.npz` — NOT YET PRODUCED
-- trained SALT-RD checkpoint — NOT YET PRODUCED
-- SALT-RD eval report with AUROC/AUPRC/ECE/Brier/NT2F/dynamicity/policy metrics — NOT YET PRODUCED
+- Verify `--dry-run` succeeds on all 3 datasets with autodetect roots
+- Confirm label base rates after first NPZ: `false_confirmed` expected 1-3%
+
+### Not produced yet
+
+- `saltr/data/salt_rd_features.npz` — collection loop not yet executed
+- trained SALT-RD checkpoint
+- SALT-RD eval report with AUROC/AUPRC/ECE/Brier/NT2F/dynamicity/policy metrics
 
 Existing legacy training code still reflects the old rule/scene-label path:
 

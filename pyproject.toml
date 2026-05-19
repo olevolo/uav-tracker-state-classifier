@@ -174,7 +174,7 @@ ignore_missing_imports = true
 [tool.pytest.ini_options]
 minversion = "7.0"
 testpaths = ["tests"]
-pythonpath = ["src"]
+pythonpath = ["src", "saltr/src"]
 addopts = [
     "-ra",
     "--strict-markers",
