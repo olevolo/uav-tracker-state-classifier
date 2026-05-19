@@ -1,4 +1,4 @@
-/b# FROZEN — src/uav_tracker/ is the baseline
+# FROZEN — src/uav_tracker/ is the baseline
 
 **Date frozen:** 2026-05-19  
 **Frozen by:** SALT-RD migration (HANDOFF_NEXT.md)

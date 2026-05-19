@@ -72,7 +72,6 @@ uav-tracker = "uav_tracker.cli:app"
 [project.urls]
 Homepage = "https://github.com/voleksiuk/uav-entropy-tracker"
 Issues = "https://github.com/voleksiuk/uav-entropy-tracker/issues"
-Changelog = "https://github.com/voleksiuk/uav-entropy-tracker/blob/master/CHANGELOG.md"
 
 # --- Hatch packaging metadata ---------------------------------------------
 [tool.hatch.build.targets.wheel]
@@ -84,7 +83,6 @@ include = [
     "configs",
     "README.md",
     "LICENSE",
-    "CHANGELOG.md",
     "pyproject.toml",
 ]
 

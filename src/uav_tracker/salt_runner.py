@@ -213,7 +213,8 @@ class SALTRunner:
             memory = None
 
         mp_cfg = cfg.get("motion_predictor", {})
-        if mp_cfg.get("enabled", True):
+        mp_enabled = mp_cfg.get("enabled", True) and cfg.get("enable_dynamic", True)
+        if mp_enabled:
             motion_pred = OnlineLSTMMotionPredictor(
                 hidden_size=mp_cfg.get("hidden_size", 32),
                 seq_len=mp_cfg.get("seq_len", 10),

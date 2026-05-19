@@ -17,7 +17,7 @@ Review focus:
 
 ## Current Phase
 
-The project is in **final-plan / pre-implementation SALT-RD migration phase**.
+The project is in **Phase 1a implementation (data collection) SALT-RD migration phase**.
 
 The intended research direction is:
 
@@ -77,19 +77,26 @@ Last verified in this session:
 
 ## Current SALT-RD Status
 
-SALT-RD is **not implemented yet**.
+SALT-RD is **Phase 0 complete** (commit ecfcb0f, 2026-05-19).
 
-Missing expected Phase 1 artifacts:
+Phase 0 artifacts present:
 
-- `saltr/src/salt_r/model.py`
-- `saltr/src/salt_r/collect_features.py`
-- `saltr/src/salt_r/train.py`
-- `saltr/src/salt_r/eval.py`
-- `saltr/src/salt_r/policy.py`
-- `saltr/src/salt_r/integrate.py`
-- `saltr/data/salt_rd_features.npz`
-- trained SALT-RD checkpoint
-- SALT-RD eval report with AUROC/AUPRC/ECE/Brier/NT2F/dynamicity/policy metrics
+- `saltr/src/salt_r/collect_features.py` — EXISTS (collection loop not yet implemented; NPZ not populated)
+- `saltr/src/salt_r/model.py` — EXISTS
+- `saltr/src/salt_r/train.py` — EXISTS
+- `saltr/src/salt_r/eval.py` — EXISTS
+- `saltr/src/salt_r/policy.py` — EXISTS
+- `saltr/src/salt_r/integrate.py` — EXISTS
+- `FROZEN.md` — EXISTS (committed)
+- Config gates wired: `enable_ce` read in `sglatrack.py`; `enable_velocity_drift` read in `target_state_assessor.py`; `enable_dynamic` wired into `motion_predictor` enable check in `salt_runner.py`
+- `TrackState` HAS `score_map_stats` field
+
+Remaining Phase 1a work:
+
+- `collect_features.py` collection loop not implemented yet (NPZ not populated)
+- `saltr/data/salt_rd_features.npz` — NOT YET PRODUCED
+- trained SALT-RD checkpoint — NOT YET PRODUCED
+- SALT-RD eval report with AUROC/AUPRC/ECE/Brier/NT2F/dynamicity/policy metrics — NOT YET PRODUCED
 
 Existing legacy training code still reflects the old rule/scene-label path:
 
