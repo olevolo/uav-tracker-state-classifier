@@ -6,6 +6,113 @@
 
 ---
 
+## Поточне рішення — SALT-RD
+
+Станом на 2026-05-19 центральна ідея проекту змінена з "SALT-R як reliability head" на **SALT-RD: proactive tracking-risk dynamicity + false-confirmed + recovery**.
+
+Це важлива зміна. Якщо залишити тільки `P(false_confirmed)`, робота виглядатиме як вузький failure detector. Якщо поставити в центр **нейромережевий визначник динамічності сцени як проактивний tracking-risk модуль**, робота стає ширшою і deployment-релевантною: модель не просто каже "трекер може помилятися", а наперед оцінює tracking-risk, false-confirmed drift, recovery readiness, скільки compute витрачати, чи можна оновлювати template, і чи варто взагалі довіряти bbox.
+
+**Правильна назва задачі:** proactive tracking-risk dynamicity, not generic scene classification.
+
+Тобто label `dynamic` не має походити з ручного класу сцени або старого LSTM branch. Він має походити з:
+
+- GT target velocity/acceleration/scale change;
+- camera ego-motion або global flow magnitude;
+- residual target motion after ego-motion compensation;
+- score-map ambiguity under motion;
+- future IoU degradation;
+- oracle comparison між full compute і cheap/pruned compute режимами.
+
+**Два речення статті:**
+> We introduce SALT-RD, a lightweight proactive tracking-risk dynamicity controller for real-time UAV single-object tracking that predicts false-confirmed drift, near-future failure, recovery readiness, and the need for full computation from tracker-internal telemetry. Unlike adaptive-depth or token-pruning trackers that optimize average computation, SALT-RD is trained with GT/teacher-derived tracking-risk labels and controls template updates, re-acquisition, and compute allocation under calibrated deployment metrics.
+
+---
+
+## Детальний план робіт — що реально робити
+
+### Фаза 0 — заморозити стару систему і відкрити telemetry
+
+Мета: не дати старому entropy/v2/SALT v3 змішатися з новою наукою.
+
+1. `src/uav_tracker/` вважати frozen baseline.
+2. Дозволені зміни у frozen code тільки для:
+   - config gates;
+   - `TrackState` telemetry;
+   - score-map/motion/flow/appearance stats.
+3. CE, DYNAMIC і VelocityDrift не видаляти, а config-gate-ити для ablations.
+4. Створити `saltr/src/salt_r/` як єдине місце для нової моделі.
+
+### Фаза 1 — dataset без leakage
+
+Найважливіший deliverable — не модель, а правильний NPZ.
+
+Labels:
+
+- `correct`: IoU >= 0.5;
+- `false_confirmed`: IoU < 0.2 and tracker confidence high;
+- `failure_in_5`: tracker currently correct, but near-future IoU collapses;
+- `recoverable`: lost now, can become correct again soon;
+- `target_dynamic`: high target velocity/acceleration/scale change;
+- `camera_dynamic`: high ego-motion/global flow;
+- `hard_dynamic_scene`: dynamicity plus ambiguity/future tracking risk;
+- `needs_full_compute`: oracle label from full-vs-cheap tracker replay.
+
+Головне правило: labels не можуть бути похідними від `_decide_state()`, `TargetState`, `scene_class`, APCE thresholds як teacher, або старої LSTM dynamic гілки.
+
+### Фаза 2 — SALT-RD v0 model
+
+Почати з малого temporal model:
+
+- input: 24-32 scalar features;
+- model: GRU або TCN, hidden 64, 2 layers;
+- heads: false-confirmed, failure-in-5, recoverable, target-dynamic, camera-dynamic, hard-dynamic-scene, needs-full-compute;
+- losses: weighted/focal BCE, sequence-balanced sampler;
+- metrics: AUROC/AUPRC/ECE/Brier + bootstrap CI.
+
+Не починати з CNN score-map encoder або Mamba head. Це можна додати тільки якщо scalar telemetry дає signal, але не вистачає capacity.
+
+### Фаза 3 — offline policy replay
+
+Перед runtime інтеграцією policy має бути перевірена offline:
+
+- чи зменшує wrong re-init;
+- чи блокує template corruption;
+- чи покращує risk-coverage;
+- чи дає AUC-vs-GFLOPs Pareto;
+- чи не шкодить DTB70 hard cases.
+
+Runtime інтеграція без replay — це ризик повторити SALT v3: локально красиво, на повному dataset майже нуль або regression.
+
+### Фаза 4 — teacher features
+
+Якщо Phase 1-3 дають GO:
+
+- CoTracker3/PTDT-style point consistency для dynamic/recoverability labels;
+- DINO/SAM appearance/foreground teachers offline;
+- candidate-level SALT-Match dataset для recovery accept/reject;
+- LoRAT/domain adaptation тільки як fallback або паралельна backbone improvement робота.
+
+---
+
+## Нові конкурентні статті для SALT-RD positioning
+
+Ці роботи важливо згадати, бо вони закривають частину простору "dynamic compute" і "dynamic scenes". Вони не вбивають SALT-RD, але змушують дуже чітко формулювати novelty.
+
+| Paper | Що важливо | Висновок для нас |
+|---|---|---|
+| **UTPTrack, CVPR 2026** | Joint token pruning для search region, static template, dynamic template; 65%+ pruning with near-baseline accuracy | Не продавати CE/token pruning як внесок. SALT-RD може бути policy, що вирішує коли pruning безпечний |
+| **ABTrack, Pattern Recognition 2025 / arXiv 2024** | Bypass Decision Module для adaptive ViT block bypass | "Dynamic compute" вже є. Наша dynamicity має бути tracking-risk supervised, не просто block-skip controller |
+| **BDTrack, ESWA 2025** | UAV motion blur + dynamic early exiting | Прямий конкурент до фрази "dynamic UAV scenes"; треба показати, що SALT-RD ловить false-confirmed/recovery risk, а не тільки blur/easy-vs-hard |
+| **UncL-STARK, arXiv 2026** | Heatmap uncertainty керує encoder/decoder depth, 12% GFLOPs reduction при ~0.2% accuracy loss | Сильний baseline для uncertainty-guided compute. Наша різниця: identity-level false-confirmed і recovery safety |
+| **LGTrack, arXiv 2026** | Dynamic layer selection + occlusion robustness for UAV tracking | Конкурент як lightweight UAV tracker; ми маємо порівнювати як wrapper/controller або брати як майбутній backbone |
+| **SMTrack, arXiv 2026** | State-aware Mamba for temporal modeling in dynamic scenarios | Конкурент до temporal modeling. SALT-RD не має claim "ми перші моделюємо temporal dynamics"; claim — calibrated control policy |
+| **TrackingMiM, arXiv 2025** | Mamba-in-Mamba UAV tracking, high speed/precision claims | Конкурент до backbone/FPS. Не змагатися напряму без відтворення; використовувати як related work |
+| **AVTrack / Aba-ViTrack** | Dynamic layer activation / background-aware token termination | Related work для adaptive compute in tracking | Позиціонувати SALT-RD як risk-aware controller over tracker actions, not only internal layer skipping |
+
+**Staff verdict:** якщо стаття звучить як "ми зробили dynamic neural scene classifier", вона слабка. Якщо вона звучить як "ми вчимо tracking-risk dynamicity labels і показуємо calibrated control of compute/recovery/template safety", вона має шанс.
+
+---
+
 ## Ключові статті (papers/)
 
 ### MSTFT 2026 — Mamba-Based Spatio-Temporal Fusion for Small Object Tracking in UAV Videos
@@ -15,10 +122,10 @@
 
 **Три внески:**
 1. **Bidirectional Spatio-Temporal Mamba (BS-Mamba)** — горизонтальне + вертикальне двонаправлене сканування для малих цілей
-2. **Dynamic Template Fusion з Adaptive Attention** — **threefold safety verification: response peak + temporal consistency + motion stability** → це прямо наш feature set для SALT-R
+2. **Dynamic Template Fusion з Adaptive Attention** — **threefold safety verification: response peak + temporal consistency + motion stability** → це прямо наш feature set для SALT-RD
 3. **Small-Target-Aware Context Prediction Head** — Gaussian-weighted prior для локалізації малих цілей
 
-**Що взяти для SALT-R:**
+**Що взяти для SALT-RD:**
 - Triple verification mechanism = підтверджує наш feature set (response_peak, temporal_consistency, motion_stability)
 - Dynamic template fusion strategy = reference для SALT-Match (що оновлювати, коли)
 - UAV123 AUC=79.4% — це нова SOTA для порівняння (SGLATrack=73.7%)
@@ -46,16 +153,16 @@
 **2. Explainable VOT — PMF confidence score**
 > MixFormerV2 дає PMF для bbox координат → AUC під піком = confidence
 - Це аналог нашого APCE але на рівні bbox (не score map)
-- "Check measure validity" = MATA вирішує ту ж задачу що й SALT-R: P(tracker_reliable)
-- **Ключова різниця:** MATA валідує перед EKF (не для recovery), SALT-R — для recovery і template update
+- "Check measure validity" = MATA вирішує споріднену задачу до SALT-RD: P(tracker_reliable)
+- **Ключова різниця:** MATA валідує перед EKF; SALT-RD вчить dynamicity/reliability policy для recovery, template update і compute allocation
 
 **3. EOP (Embedded-Oriented Protocol)**
 > Hardware-independent evaluation з асинхронними модулями → Jetson AGX Orin
 - 6.4× менша розбіжність між PC і embedded для success rate vs LTP protocol
 - NT2F: 4.7× менша розбіжність
 
-**Що взяти для SALT-R:**
-- **NT2F metric** — реалізувати у `eval_salt_r.py` поруч з AUROC/ECE
+**Що взяти для SALT-RD:**
+- **NT2F metric** — реалізувати у `saltr/src/salt_r/eval.py` поруч з AUROC/ECE
 - **Ego-motion residual** (Block B) = наш `ego_motion_residual` feature (Farneback вже є)
 - **"Check measure validity"** = архітектурний прецедент для нашого P(correct) head
 - **PMF confidence** = краще ніж APCE для деяких архітектур — reference для майбутнього
@@ -137,14 +244,14 @@ NT2F = (1/N) * Σ_i (t_failure_i - t_init_i) / sequence_length_i
 ## Коментар 3 — Архітектурна стратегія: "Не тренуємо новий трекер"
 
 **Базова ідея:**
-> SGLATrack лишається основним трекером. Ми збираємо з нього внутрішні сигнали: APCE, score map, peak sharpness, bbox motion, scale, cosine до template, optical-flow consistency. Offline, де є GT, рахуємо справжній IoU. Тренуємо мережу передбачати **P(correct), P(false_confirmed), P(recoverable), P(accept_candidate)**.
+> SGLATrack лишається основним трекером. Ми збираємо з нього внутрішні сигнали: APCE, score map, peak sharpness, bbox motion, scale, cosine до template, optical-flow consistency. Offline, де є GT/teacher labels, рахуємо справжній IoU, target/camera dynamicity і full-vs-cheap oracle regret. Тренуємо мережу передбачати **P(false_confirmed), P(failure_in_5), P(recoverable), P(target_dynamic), P(camera_dynamic), P(hard_dynamic_scene), P(needs_full_compute)**.
 
 **Стекова архітектура:**
 
 | Роль | Модель | Режим |
 |------|--------|-------|
 | Main tracker | SGLATrack-DeiT (frozen) | real-time |
-| Reliability head | SALT-R (наш GRU/TCN) | real-time, <1мс |
+| Dynamicity/reliability head | SALT-RD (наш GRU/TCN) | real-time, <1мс |
 | Appearance teacher | DINOv3 | offline training only |
 | Video/mask teacher | SAM2 / MobileSAM | offline pseudo-labels |
 | Point consistency teacher | CoTracker3 | offline flow labels |
@@ -153,8 +260,8 @@ NT2F = (1/N) * Σ_i (t_failure_i - t_init_i) / sequence_length_i
 **Teacher-моделі (DINO/SAM2/CoTracker3) не в real-time pipeline** — тільки для генерації labels під час тренування → distillation у легку голову.
 
 **MVP порядок:**
-1. SALT-R v0: scalar telemetry тільки, frozen SGLATrack
-2. SALT-R v1: + score-map CNN features
+1. SALT-RD v0: scalar telemetry тільки, frozen SGLATrack
+2. SALT-RD v1: + score-map CNN features
 3. SALT-Match v1: candidate accept/reject для recovery
 4. SALT-Distill: + DINOv3/SAM2/CoTracker3 як offline teachers
 
@@ -206,13 +313,13 @@ NT2F = (1/N) * Σ_i (t_failure_i - t_init_i) / sequence_length_i
 
 ## Коментар 5 — Staff Review: Критичні ризики перед ML
 
-> Repo зараз у перехідному стані між трьома системами: старий entropy/v2 scene-router, поточний SALT v3, і запланований SALT-R. Перед серйозним ML треба стабілізувати межі системи.
+> Repo зараз у перехідному стані між трьома системами: старий entropy/v2 scene-router, поточний SALT v3, і запланований SALT-RD. Перед серйозним ML треба стабілізувати межі системи.
 
 **6 критичних ризиків:**
 
 **1. Label leakage / self-teaching (СМЕРТЕЛЬНИЙ):**
 > Старий train_tsa_classifier.py: scene labels → TargetState → APCE rules → circular. Для статті це смертельно: модель "гарно валідована" на власних правилах.
-Рішення: окремий collect_salt_r_features.py, тільки GT IoU labels.
+Рішення: окремий `saltr/src/salt_r/collect_features.py`, тільки GT/teacher-derived labels.
 
 **2. False-confirmed рідкісний клас (1-3%):**
 > З наївним BCELoss модель буде казати "0" завжди: 97% accuracy при AUROC=0.50.
@@ -259,7 +366,7 @@ NT2F = (1/N) * Σ_i (t_failure_i - t_init_i) / sequence_length_i
 Output: `x_t, y_t, V_t ∈ [0,1] (visibility), C_t ∈ [0,1] (confidence)` per tracked point.  
 Два режими: **online** (sliding window, real-time) та **offline** (full video, точніший).
 
-**Для SALT-R (Phase 4 — offline teacher):**
+**Для SALT-RD (Phase 4 — offline teacher):**
 ```python
 # 9 query points on frame 0 inside bbox
 tracks, vis, conf = cotracker3_offline(video, query_points)
@@ -281,7 +388,7 @@ Confidence C_t = чи точка в межах GT → **це і є наш recove
 
 **Рішення:** decoupled embeddings (shared absolute + independent type) + MLP head.
 
-**Для SALT-R Phase 6:**
+**Для SALT-RD Phase 6:**
 - LoRAT = правильний спосіб domain-adapt SGLATrack на UAV/aerial
 - Inference latency = 0 (LoRA weights merged)
 - Можна тренувати на MPS без data-center GPU
@@ -301,7 +408,7 @@ should_update = (score > σ) AND (pos_t in bbox) AND (point_tracker_success)
 Mask-guided token pruning через NanoSAM (lightweight, init-only, one-time).  
 70% token retention на шарах 3, 6, 9.
 
-**Для SALT-R:**
+**Для SALT-RD:**
 - 3-condition gate = архітектурний blueprint SALT-Match v1
 - points_inside_ratio + fwd_bwd_error = PTDT-inspired features (Phase 4)
 - Token pruning з foreground mask = reference для майбутнього CE refinement
@@ -320,11 +427,11 @@ L_loc = (x_g - x_e)² / 2σ² + ½ log(σ²)  # self-calibrating
 
 **Ключова різниця від нас:**
 - OOTU: `σ²` = uncertainty про ТО ДЕ bbox (localization)
-- SALT-R: `P(false_confirmed)` = uncertainty про ТЕ ЧИЙ це об'єкт (identity)
+- SALT-RD: `P(false_confirmed)` = uncertainty про ТЕ ЧИЙ це об'єкт (identity), плюс `P(hard_dynamic_scene)` і `P(needs_full_compute)`
 
 **OOTU σ може бути МАЛИМ при false_confirmed** (трекер локалізує дистрактора точно!) — це наш головний scientific argument проти OOTU як вирішення нашої проблеми.
 
-**Для статті:** показати що σ_OOTU і P(false_confirmed)_SALT-R некорельовані на uav0000164 → різні failure modes, різні metrics.
+**Для статті:** показати що σ_OOTU і P(false_confirmed)_SALT-RD некорельовані на uav0000164 → різні failure modes, різні metrics.
 
 ---
 
