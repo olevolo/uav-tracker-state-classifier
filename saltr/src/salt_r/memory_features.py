@@ -156,6 +156,7 @@ def collect_memory_sidecar(
     npz_v2_path: str,
     preds_json_path: Optional[str],
     output_path: str,
+    oracle_fallback_allowed: bool = False,
 ) -> None:
     """Process v2 NPZ and write memory sidecar NPZ.
 
@@ -175,6 +176,10 @@ def collect_memory_sidecar(
         labels are used as gate signals.
     output_path:
         Destination path for the memory sidecar NPZ.
+    oracle_fallback_allowed:
+        When False (default), raise ValueError if any sequence in the NPZ
+        has no predictions in preds_json_path. Set to True only for analysis
+        sidecars where oracle fallback is acceptable.
     """
     import json as _json
 
@@ -217,12 +222,25 @@ def collect_memory_sidecar(
     out: dict[str, object] = {}
     print(f"Processing {len(compound_keys)} sequences...")
 
+    n_predicted = 0
+    n_oracle_fallback = 0
+
     for seq_key in compound_keys:
         features = data[f"features/{seq_key}"].astype(np.float32)
         labels = data[f"labels/{seq_key}"].astype(np.float32)
         iou_trace = data[f"iou_trace/{seq_key}"].astype(np.float32)
 
         preds = preds_by_seq.get(seq_key, None)
+        if preds is None and preds_json_path is not None and not oracle_fallback_allowed:
+            raise ValueError(
+                f"Sequence '{seq_key}' has no predictions in {preds_json_path} "
+                "and oracle_fallback_allowed=False. "
+                "Generate predictions for all splits first, or pass oracle_fallback_allowed=True."
+            )
+        if preds is not None:
+            n_predicted += 1
+        else:
+            n_oracle_fallback += 1
 
         mem_feats = compute_memory_features_for_sequence(
             features=features,
@@ -239,7 +257,10 @@ def collect_memory_sidecar(
     out["memory_feature_names"] = np.array(MEMORY_FEATURE_NAMES, dtype=object)
     out["created_at"] = np.array(datetime.now(tz=timezone.utc).isoformat())
     out["source_npz_md5"] = np.array(_md5_file(npz_v2_path))
-    out["uses_oracle_labels"] = np.array(preds_json_path is None)
+    out["uses_oracle_labels"] = np.array(preds_json_path is None or n_oracle_fallback > 0)
+    out["n_predicted_sequences"] = np.array(n_predicted)
+    out["n_oracle_fallback_sequences"] = np.array(n_oracle_fallback)
+    out["oracle_fallback_allowed"] = np.array(oracle_fallback_allowed)
     out["distractor_source"] = np.array(
         "fc_proxy_t0.4" if preds_json_path is not None else "oracle_fc_label"
     )
@@ -269,6 +290,16 @@ def _parse_args() -> "argparse.Namespace":
                         "When omitted, oracle labels are used as gate signals.")
     p.add_argument("--output", required=True,
                    help="Output path for memory sidecar NPZ, e.g. saltr/data/salt_rd_memory_sidecar.npz")
+    p.add_argument(
+        "--oracle-fallback",
+        action="store_true",
+        default=False,
+        help=(
+            "Allow oracle label fallback for sequences without predictions. "
+            "UNSAFE for training split — use only when generating analysis sidecars. "
+            "Default: fail-fast if any sequence is missing from preds."
+        ),
+    )
     return p.parse_args()
 
 
@@ -277,10 +308,12 @@ def main() -> None:
     print(f"[memory_features] NPZ:    {args.npz}", flush=True)
     print(f"[memory_features] Preds:  {args.preds or '(oracle labels)'}", flush=True)
     print(f"[memory_features] Output: {args.output}", flush=True)
+    print(f"[memory_features] Oracle fallback: {'allowed' if args.oracle_fallback else 'DISABLED (fail-fast)'}", flush=True)
     collect_memory_sidecar(
         npz_v2_path=args.npz,
         preds_json_path=args.preds,
         output_path=args.output,
+        oracle_fallback_allowed=args.oracle_fallback,
     )
     print("[memory_features] Done.", flush=True)
 

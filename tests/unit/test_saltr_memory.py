@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
+from pathlib import Path
 
 
 # ---------------------------------------------------------------------------
@@ -743,3 +744,52 @@ class TestMemoryFeatureNames:
         assert not np.allclose(result_oracle[-1], result_preds[-1], atol=1e-5), (
             "Oracle labels vs all-zero preds should produce different memory features"
         )
+
+
+# ---------------------------------------------------------------------------
+# 7. collect_memory_sidecar: fail-fast on missing predictions
+# ---------------------------------------------------------------------------
+
+class TestCollectMemorySidecarFailFast:
+
+    def test_collect_memory_sidecar_fails_on_missing_preds(self, tmp_path):
+        """Raises ValueError when a sequence has no predictions and oracle_fallback_allowed=False."""
+        import json
+        from salt_r.memory_features import collect_memory_sidecar
+        from salt_r.collect_features import LABEL_NAMES_V2, FEATURE_NAMES
+
+        T = 10
+        rng = np.random.default_rng(42)
+
+        # Build a minimal 2-sequence NPZ
+        npz_data = {}
+        for seq in ("seq_A", "seq_B"):
+            features = rng.standard_normal((T, len(FEATURE_NAMES))).astype(np.float32)
+            labels = np.zeros((T, len(LABEL_NAMES_V2)), dtype=np.float32)
+            iou_trace = np.ones(T, dtype=np.float32) * 0.8
+            npz_data[f"features/{seq}"] = features
+            npz_data[f"labels/{seq}"] = labels
+            npz_data[f"iou_trace/{seq}"] = iou_trace
+
+        npz_data["label_names"] = np.array(list(LABEL_NAMES_V2), dtype=object)
+        npz_data["feature_names"] = np.array(list(FEATURE_NAMES), dtype=object)
+
+        npz_path = str(tmp_path / "test_v2.npz")
+        np.savez_compressed(npz_path, **npz_data)
+
+        # Preds JSON with only seq_A — seq_B is intentionally missing
+        preds = {
+            "seq_A": [{"false_confirmed": 0.05, "imminent_failure_dynamic": 0.10}] * T,
+        }
+        preds_path = str(tmp_path / "preds_partial.json")
+        Path(preds_path).write_text(json.dumps(preds))
+
+        output_path = str(tmp_path / "sidecar.npz")
+
+        with pytest.raises(ValueError, match="oracle_fallback_allowed=False"):
+            collect_memory_sidecar(
+                npz_v2_path=npz_path,
+                preds_json_path=preds_path,
+                output_path=output_path,
+                oracle_fallback_allowed=False,
+            )

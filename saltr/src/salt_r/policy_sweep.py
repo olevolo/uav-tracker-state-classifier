@@ -606,16 +606,34 @@ def main() -> None:
     n = summary.get("n_configs", 0)
     configs = summary.get("configs", [])
     if configs:
-        # Print the single best config by template_corruption_rate
-        best = min(configs, key=lambda r: r.get("template_corruption_rate", 1.0))
+        def _is_safe(r: dict) -> bool:
+            """Constrained config: wrir=0, msu < 0.70, recall > 0.50."""
+            return (
+                r.get("wrong_reinit_rate", 1.0) == 0.0
+                and r.get("missed_safe_update_rate", 1.0) < 0.70
+                and r.get("failure_event_recall", 0.0) > 0.50
+            )
+
+        safe_configs = [r for r in configs if _is_safe(r)]
+        if safe_configs:
+            best = min(safe_configs, key=lambda r: r.get("template_corruption_rate", 1.0))
+            label = "constrained (wrir=0, msu<0.70, recall>0.50)"
+        else:
+            # Fallback: unconstrained best
+            best = min(configs, key=lambda r: r.get("template_corruption_rate", 1.0))
+            label = "unconstrained (no safe configs found)"
+
+        macro = best.get("macro_tcr", float("nan"))
+        macro_str = f"{macro:.4f}" if not _math.isnan(macro) else "n/a"
         print(f"\n[policy_sweep] {n} configs evaluated.", flush=True)
-        print(f"[policy_sweep] Best template_corruption_rate: "
-              f"{best['template_corruption_rate']:.4f} "
-              f"(fc_t={best['fc_threshold']}, reinit_t={best['reinit_threshold']}, "
-              f"ep_a={best['eprocess_alpha']}, mem_t={best['mem_margin_threshold']})",
-              flush=True)
-        print(f"[policy_sweep] Best wrong_reinit_rate: {best['wrong_reinit_rate']:.4f}",
-              flush=True)
+        print(f"[policy_sweep] Best config [{label}]:", flush=True)
+        print(f"  template_corruption_rate (micro): {best['template_corruption_rate']:.4f}", flush=True)
+        print(f"  template_corruption_rate (macro): {macro_str}", flush=True)
+        print(f"  wrong_reinit_rate:                {best['wrong_reinit_rate']:.4f}", flush=True)
+        print(f"  missed_safe_update_rate:          {best['missed_safe_update_rate']:.4f}", flush=True)
+        print(f"  failure_event_recall:             {best['failure_event_recall']:.4f}", flush=True)
+        print(f"  config: fc={best['fc_threshold']} reinit={best['reinit_threshold']} "
+              f"ep_a={best['eprocess_alpha']} mem_t={best['mem_margin_threshold']}", flush=True)
     print(f"[policy_sweep] Results written to {args.output}", flush=True)
 
 
