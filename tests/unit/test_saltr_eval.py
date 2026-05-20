@@ -330,3 +330,189 @@ def test_temperature_calibration_reduces_ece():
     assert ece_after < ece_before, \
         f"Temperature calibration must reduce ECE: before={ece_before:.4f}, after={ece_after:.4f}"
     assert 0.05 < T < 20.0, f"T={T} out of sane range"
+
+
+# ---------------------------------------------------------------------------
+# Test: recompute_labels_v2 raises on v0 input
+# ---------------------------------------------------------------------------
+
+def test_recompute_labels_v2_raises_on_v0_npz(tmp_path):
+    """recompute_labels_v2() must raise ValueError when given a v0 NPZ (wrong schema)."""
+    from salt_r.collect_features import recompute_labels_v2, LABEL_NAMES
+
+    # Build a minimal v0 NPZ (8 labels, not 10)
+    v0_npz = str(tmp_path / "v0_labels.npz")
+    n_frames = 10
+    seq_key = "uav123/test"
+    np.savez_compressed(
+        v0_npz,
+        **{
+            f"features/{seq_key}": np.zeros((n_frames, 28), dtype=np.float32),
+            f"labels/{seq_key}": np.zeros((n_frames, 8), dtype=np.int8),
+            f"iou_trace/{seq_key}": np.ones(n_frames, dtype=np.float32),
+            f"split/{seq_key}": np.array("val"),
+            "label_names": np.array(LABEL_NAMES, dtype=object),  # v0 = 8 labels
+        },
+    )
+
+    out_npz = str(tmp_path / "v2_labels.npz")
+    with pytest.raises(ValueError, match="v1 schema"):
+        recompute_labels_v2(v0_npz, out_npz)
+
+
+# ---------------------------------------------------------------------------
+# Test: ifd10/ifd20 positive frames have current IoU >= 0.5
+# ---------------------------------------------------------------------------
+
+def test_ifd10_ifd20_positives_have_good_current_iou(tmp_path):
+    """ifd10 and ifd20 positive labels must only occur when current IoU >= 0.5."""
+    from salt_r.collect_features import (
+        LABEL_NAMES_V2, recompute_labels_v2, LABEL_NAMES_V1, N_LABELS_V1,
+    )
+
+    # Build a v1 NPZ so recompute_labels_v2 can work
+    n_frames = 60
+    seq_key = "uav123/ifd_test"
+
+    # IoU trace: good for 40 frames, then fails
+    iou_trace = np.concatenate([
+        np.full(40, 0.9, dtype=np.float32),  # good
+        np.full(20, 0.1, dtype=np.float32),  # failure
+    ])
+
+    # Minimal v1 labels (10 columns)
+    labels_v1 = np.zeros((n_frames, N_LABELS_V1), dtype=np.int8)
+    # col 0: correct (IoU>=0.5)
+    labels_v1[:40, 0] = 1
+
+    v1_npz = str(tmp_path / "v1.npz")
+    np.savez_compressed(
+        v1_npz,
+        **{
+            f"features/{seq_key}": np.zeros((n_frames, 28), dtype=np.float32),
+            f"labels/{seq_key}": labels_v1,
+            f"iou_trace/{seq_key}": iou_trace,
+            f"split/{seq_key}": np.array("val"),
+            "label_names": np.array(LABEL_NAMES_V1, dtype=object),
+        },
+    )
+
+    v2_npz = str(tmp_path / "v2.npz")
+    recompute_labels_v2(v1_npz, v2_npz)
+
+    data = np.load(v2_npz, allow_pickle=True)
+    labels_v2 = data[f"labels/{seq_key}"]
+    iou_back = data[f"iou_trace/{seq_key}"]
+    label_names = list(data["label_names"])
+
+    ifd10_idx = label_names.index("imminent_failure_dynamic_10")
+    ifd20_idx = label_names.index("imminent_failure_dynamic_20")
+
+    for col_idx, col_name in [(ifd10_idx, "ifd10"), (ifd20_idx, "ifd20")]:
+        positives = np.where(labels_v2[:, col_idx] == 1)[0]
+        for t in positives:
+            assert float(iou_back[t]) >= 0.5, (
+                f"{col_name}: positive at t={t} but IoU={iou_back[t]:.3f} < 0.5"
+            )
+
+
+# ---------------------------------------------------------------------------
+# Test: event-level compute_failure_lead_time
+# ---------------------------------------------------------------------------
+
+def test_event_level_failure_lead_time():
+    """compute_failure_lead_time detects events and computes lead times correctly."""
+    from salt_r.eval import compute_failure_lead_time
+
+    n = 100
+    # One failure event at frame 70 (IoU drops from 1→0.1)
+    iou = np.ones(n, dtype=np.float32)
+    iou[70:] = 0.1
+
+    label_names = ["imminent_failure_dynamic"]
+    head_names  = ["imminent_failure_dynamic"]
+
+    # Labels: ifd=1 at frames 65-69 (just before failure)
+    labels = np.zeros((n, 1), dtype=np.int8)
+    labels[65:70, 0] = 1
+
+    # Model: predicts >0.5 at frames 62-69 (8-frame early warning)
+    preds = np.zeros((n, 1), dtype=np.float32)
+    preds[62:70, 0] = 0.9
+
+    result = compute_failure_lead_time(
+        iou_dict={"seq1": iou},
+        preds_dict={"seq1": preds},
+        labels_dict={"seq1": labels},
+        label_names=label_names,
+        head_names=head_names,
+        threshold=0.50,
+        iou_failure_threshold=0.30,
+        label_name="imminent_failure_dynamic",
+        horizon=5,
+    )
+
+    assert result["n_failure_events"] == 1, f"Expected 1 failure event, got {result['n_failure_events']}"
+    assert result["n_detected_events"] == 1, f"Expected detected=1, got {result['n_detected_events']}"
+    assert result["event_recall"] == pytest.approx(1.0)
+    # First alert at 62, event at 70 → lead time = 8
+    assert result["per_event_lead_times"] == [8]
+    assert result["median_lead_time"] == pytest.approx(8.0)
+
+
+def test_event_level_no_detection():
+    """compute_failure_lead_time: no alert before failure → recall=0."""
+    from salt_r.eval import compute_failure_lead_time
+
+    n = 50
+    iou = np.ones(n, dtype=np.float32)
+    iou[30:] = 0.1  # failure at frame 30
+
+    preds = np.zeros((n, 1), dtype=np.float32)  # model never alerts
+    labels = np.zeros((n, 1), dtype=np.int8)
+
+    result = compute_failure_lead_time(
+        iou_dict={"seq1": iou},
+        preds_dict={"seq1": preds},
+        labels_dict={"seq1": labels},
+        label_names=["imminent_failure_dynamic"],
+        head_names=["imminent_failure_dynamic"],
+        threshold=0.50,
+        iou_failure_threshold=0.30,
+        label_name="imminent_failure_dynamic",
+        horizon=5,
+    )
+    assert result["n_failure_events"] == 1
+    assert result["n_detected_events"] == 0
+    assert result["event_recall"] == pytest.approx(0.0)
+    assert result["per_event_lead_times"] == []
+
+
+def test_run_lead_time_analysis_three_horizons():
+    """run_lead_time_analysis returns entries for ifd5, ifd10, ifd20."""
+    from salt_r.eval import run_lead_time_analysis
+
+    label_names = [
+        "imminent_failure_dynamic",
+        "imminent_failure_dynamic_10",
+        "imminent_failure_dynamic_20",
+    ]
+    head_names = label_names
+
+    n = 50
+    iou = np.ones(n, dtype=np.float32)
+    iou[30:] = 0.1
+    preds = np.zeros((n, 3), dtype=np.float32)
+    labels = np.zeros((n, 3), dtype=np.int8)
+
+    result = run_lead_time_analysis(
+        iou_dict={"s": iou},
+        preds_dict={"s": preds},
+        labels_dict={"s": labels},
+        label_names=label_names,
+        head_names=head_names,
+    )
+    assert set(result.keys()) == {"ifd5", "ifd10", "ifd20"}
+    for key in ("ifd5", "ifd10", "ifd20"):
+        assert "n_failure_events" in result[key] or "note" in result[key]
+

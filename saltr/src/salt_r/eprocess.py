@@ -49,17 +49,36 @@ _DEFAULT_DECAYS   = (0.95, 0.98, 1.00)
 # Risk score
 # ---------------------------------------------------------------------------
 
-def compute_risk_score(frame_probs: dict[str, float]) -> float:
+def compute_risk_score(frame_probs: dict[str, float], mode: str = "all_risk") -> float:
     """Composite risk score from calibrated head probabilities.
 
-    Weights follow HANDOFF_NEXT.md Phase 2A spec; ifd20 replaces entropy_z_rank
-    (unavailable as model output) at 5 % weight.
+    Parameters
+    ----------
+    frame_probs:
+        Per-head probability dict from the SALT-RD model.
+    mode:
+        One of "all_risk" (default), "ifd5", "ifd10", "ifd20", "fc_ifd20".
+        - "all_risk"  — weighted combination of all risk heads (legacy default).
+        - "ifd5"      — P(imminent_failure_dynamic) only.
+        - "ifd10"     — P(imminent_failure_dynamic_10) only.
+        - "ifd20"     — P(imminent_failure_dynamic_20) only.
+        - "fc_ifd20"  — 0.60 * P(false_confirmed) + 0.40 * P(ifd20).
     """
-    p_fc   = frame_probs.get("false_confirmed", 0.0)
-    p_ifd  = frame_probs.get("imminent_failure_dynamic", 0.0)
-    p_fi5  = frame_probs.get("failure_in_5", 0.0)
-    p_ifd20 = frame_probs.get("imminent_failure_dynamic_20", 0.0)
-    return 0.45 * p_fc + 0.35 * p_ifd + 0.15 * p_fi5 + 0.05 * p_ifd20
+    if mode == "ifd5":
+        return frame_probs.get("imminent_failure_dynamic", 0.0)
+    elif mode == "ifd10":
+        return frame_probs.get("imminent_failure_dynamic_10", 0.0)
+    elif mode == "ifd20":
+        return frame_probs.get("imminent_failure_dynamic_20", 0.0)
+    elif mode == "fc_ifd20":
+        return (0.60 * frame_probs.get("false_confirmed", 0.0)
+              + 0.40 * frame_probs.get("imminent_failure_dynamic_20", 0.0))
+    else:  # "all_risk" (default)
+        p_fc    = frame_probs.get("false_confirmed", 0.0)
+        p_ifd   = frame_probs.get("imminent_failure_dynamic", 0.0)
+        p_fi5   = frame_probs.get("failure_in_5", 0.0)
+        p_ifd20 = frame_probs.get("imminent_failure_dynamic_20", 0.0)
+        return 0.45 * p_fc + 0.35 * p_ifd + 0.15 * p_fi5 + 0.05 * p_ifd20
 
 
 # ---------------------------------------------------------------------------
@@ -169,6 +188,87 @@ def run_eprocess_sequence(
             E[t] = e_curr
             if e_curr >= threshold:
                 alerts.append(t)
+
+    return E, alerts
+
+
+# ---------------------------------------------------------------------------
+# aGRAPAbetting — paper Eq. 12 (no calibration set required)
+# ---------------------------------------------------------------------------
+
+def compute_quality_score(frame_probs: dict[str, float], risk_mode: str = "all_risk") -> float:
+    """Quality score = 1 - risk_score.  High value means low failure risk."""
+    return 1.0 - compute_risk_score(frame_probs, mode=risk_mode)
+
+
+def run_eprocess_agrapa(
+    quality_scores: np.ndarray,
+    epsilon: float = 0.50,
+    alpha: float = 0.10,
+    window: int = 20,
+) -> tuple[np.ndarray, list[int]]:
+    """aGRAPAbetting e-process (Eq. 12 from WACV2026 paper).
+
+    Estimates the betting rate λ_t *online* from a rolling window of recent
+    quality scores — no calibration set is needed.
+
+    Accumulation rule::
+
+        λ_t = clip((ε - μ_w) / (σ²_w + (ε - μ_w)²), 0, 1/(2ε))
+        X_t = X_{t-1} * (1 + λ_t * (ε - M_t))
+
+    where M_t = quality_scores[t] ∈ [0, 1] (high = good),
+    and μ_w / σ²_w are the mean/variance of the last ``window`` scores.
+
+    Formal mode: at most one alert (once running maximum ≥ 1/alpha).
+
+    Parameters
+    ----------
+    quality_scores:
+        Per-frame quality, ``1 - risk_score``.  High → tracker healthy.
+    epsilon:
+        Tolerance threshold.  Alerts fire when quality is consistently below ε.
+    alpha:
+        Significance level; alert threshold = 1/alpha.
+    window:
+        Recency window w_E for online λ estimation (paper default: 20).
+
+    Returns
+    -------
+    (E_trace, alert_frames)
+    """
+    n = len(quality_scores)
+    E = np.ones(n, dtype=np.float64)
+    alerts: list[int] = []
+    X_prev = 1.0
+    X_max = 1.0
+    threshold = 1.0 / alpha
+    alerted = False
+
+    lam_max = 1.0 / (2.0 * epsilon) if epsilon > 0 else 1.0
+
+    for t in range(n):
+        # Rolling window of recent quality scores
+        start = max(0, t - window)
+        win = quality_scores[start:t + 1]
+        mu = float(np.mean(win))
+        var = float(np.var(win)) + 1e-8
+
+        # Adaptive betting rate (Eq. 12)
+        num = epsilon - mu
+        lam = num / (var + num ** 2)
+        lam = float(np.clip(lam, 0.0, lam_max))
+
+        M_t = float(quality_scores[t])
+        X_curr = X_prev * (1.0 + lam * (epsilon - M_t))
+        X_curr = max(X_curr, 0.0)  # martingale is non-negative
+        X_prev = X_curr
+        X_max = max(X_max, X_curr)
+        E[t] = X_curr
+
+        if not alerted and X_max >= threshold:
+            alerts.append(t)
+            alerted = True
 
     return E, alerts
 
@@ -284,11 +384,21 @@ def evaluate(
     mode: str = "formal",
     cal_fraction: float = _CAL_FRACTION,
     iou_failure_threshold: float = 0.30,
+    risk_mode: str = "all_risk",
 ) -> dict[str, Any]:
     """Evaluate e-process alerts on all non-diagnostic val sequences.
 
     Splits sequences lexicographically: first ``cal_fraction`` → calibration,
     rest → alert evaluation.  Diagnostic sequences are excluded from both.
+
+    Parameters
+    ----------
+    risk_mode:
+        Risk score aggregation mode passed to ``compute_risk_score()``.
+        One of "all_risk", "ifd5", "ifd10", "ifd20", "fc_ifd20".
+    mode:
+        E-process accumulation mode.  "formal" | "engineering" | "agrapa".
+        "agrapa" uses online aGRAPAbetting (no calibration set needed).
     """
     all_seqs = sorted(
         s for s in preds if s not in _DIAGNOSTIC_SEQS and s in labels and s in iou_traces
@@ -297,9 +407,13 @@ def evaluate(
     cal_seqs = all_seqs[:n_cal]
     eval_seqs = all_seqs[n_cal:]
 
-    null_scores = build_null_distribution(preds, labels, iou_traces, label_names, cal_seqs)
-    if len(null_scores) == 0:
-        return {"error": "null distribution is empty — check calibration sequences"}
+    # aGRAPAmode does not need a calibration distribution
+    if mode == "agrapa":
+        null_scores = np.array([], dtype=np.float32)
+    else:
+        null_scores = build_null_distribution(preds, labels, iou_traces, label_names, cal_seqs)
+        if len(null_scores) == 0:
+            return {"error": "null distribution is empty — check calibration sequences"}
 
     total_alerts = 0
     total_false_alerts = 0
@@ -309,12 +423,17 @@ def evaluate(
     all_lead_times: list[int] = []
     event_recalls: list[float] = []
 
-    # Baseline: raw P(ifd) > 0.5 threshold
-    baseline_alerts_total = 0
-    baseline_tp_total = 0
-    baseline_false_total = 0
-
-    ifd_key = "imminent_failure_dynamic"
+    # Baselines: raw P(head) > 0.5 for four probe heads
+    _baseline_heads = [
+        ("ifd5",  "imminent_failure_dynamic"),
+        ("ifd10", "imminent_failure_dynamic_10"),
+        ("ifd20", "imminent_failure_dynamic_20"),
+        ("fc",    "false_confirmed"),
+    ]
+    baseline_totals: dict[str, dict[str, int]] = {
+        name: {"alerts": 0, "tp": 0, "false": 0}
+        for name, _ in _baseline_heads
+    }
 
     per_seq: dict[str, dict] = {}
     for seq in eval_seqs:
@@ -323,12 +442,18 @@ def evaluate(
         n = min(len(frames), len(iou))
 
         risk_scores = np.array(
-            [compute_risk_score(frames[t]) for t in range(n)], dtype=np.float32
+            [compute_risk_score(frames[t], mode=risk_mode) for t in range(n)], dtype=np.float32
         )
 
-        E_trace, alerts = run_eprocess_sequence(
-            risk_scores, null_scores, alpha=alpha, epsilon=epsilon, decay=decay, mode=mode
-        )
+        if mode == "agrapa":
+            quality_scores = 1.0 - risk_scores
+            E_trace, alerts = run_eprocess_agrapa(
+                quality_scores, epsilon=epsilon, alpha=alpha
+            )
+        else:
+            E_trace, alerts = run_eprocess_sequence(
+                risk_scores, null_scores, alpha=alpha, epsilon=epsilon, decay=decay, mode=mode
+            )
 
         m = compute_alert_metrics(alerts, iou[:n], n, iou_failure_threshold)
         total_alerts += m["n_alerts"]
@@ -340,12 +465,13 @@ def evaluate(
         if m["n_failure_events"] > 0:
             event_recalls.append(m["failure_event_recall"])
 
-        # Baseline: P(ifd) > 0.5
-        bl_alerts = [t for t in range(n) if frames[t].get(ifd_key, 0.0) > 0.5]
-        bl_m = compute_alert_metrics(bl_alerts, iou[:n], n, iou_failure_threshold)
-        baseline_alerts_total += bl_m["n_alerts"]
-        baseline_tp_total += bl_m["tp_alerts"]
-        baseline_false_total += bl_m["false_alerts"]
+        # Baselines: P(head) > 0.5
+        for bl_name, head_key in _baseline_heads:
+            bl_alerts = [t for t in range(n) if frames[t].get(head_key, 0.0) > 0.5]
+            bl_m = compute_alert_metrics(bl_alerts, iou[:n], n, iou_failure_threshold)
+            baseline_totals[bl_name]["alerts"] += bl_m["n_alerts"]
+            baseline_totals[bl_name]["tp"]     += bl_m["tp_alerts"]
+            baseline_totals[bl_name]["false"]  += bl_m["false_alerts"]
 
         per_seq[seq] = {
             "n_frames": n,
@@ -357,7 +483,19 @@ def evaluate(
         }
 
     fa_per_1000 = 1000.0 * total_false_alerts / max(total_frames, 1)
-    bl_fa_per_1000 = 1000.0 * baseline_false_total / max(total_frames, 1)
+
+    # Build baseline result entries
+    baselines: dict[str, dict] = {}
+    for bl_name, _ in _baseline_heads:
+        bt = baseline_totals[bl_name]
+        bl_fa = 1000.0 * bt["false"] / max(total_frames, 1)
+        baselines[f"baseline_raw_{bl_name}_0.5"] = {
+            "total_alerts": bt["alerts"],
+            "total_tp_alerts": bt["tp"],
+            "total_false_alerts": bt["false"],
+            "false_alerts_per_1000_frames": round(bl_fa, 3),
+            "failure_event_recall": round(bt["tp"] / max(total_failure_events, 1), 4),
+        }
 
     return {
         "config": {
@@ -365,6 +503,7 @@ def evaluate(
             "epsilon": epsilon,
             "decay": decay,
             "mode": mode,
+            "risk_mode": risk_mode,
             "n_cal_seqs": len(cal_seqs),
             "n_eval_seqs": len(eval_seqs),
             "n_null_frames": int(len(null_scores)),
@@ -387,13 +526,7 @@ def evaluate(
                 4,
             ),
         },
-        "baseline_raw_ifd_0.5": {
-            "total_alerts": baseline_alerts_total,
-            "total_tp_alerts": baseline_tp_total,
-            "total_false_alerts": baseline_false_total,
-            "false_alerts_per_1000_frames": round(bl_fa_per_1000, 3),
-            "failure_event_recall": round(baseline_tp_total / max(total_failure_events, 1), 4),
-        },
+        **baselines,
         "per_sequence": per_seq,
     }
 
@@ -401,6 +534,9 @@ def evaluate(
 # ---------------------------------------------------------------------------
 # Threshold sweep
 # ---------------------------------------------------------------------------
+
+_DEFAULT_RISK_MODES = ("ifd5", "ifd10", "ifd20", "fc_ifd20", "all_risk")
+
 
 def sweep(
     preds: dict[str, list[dict[str, float]]],
@@ -410,16 +546,19 @@ def sweep(
     epsilons: tuple[float, ...] = _DEFAULT_EPSILONS,
     alphas: tuple[float, ...] = _DEFAULT_ALPHAS,
     decays: tuple[float, ...] = _DEFAULT_DECAYS,
+    risk_modes: tuple[str, ...] = _DEFAULT_RISK_MODES,
 ) -> list[dict[str, Any]]:
-    """Run evaluate() over all combinations of (epsilon, alpha, decay, mode)."""
+    """Run evaluate() over all combinations of (epsilon, alpha, decay, mode, risk_mode)."""
     rows: list[dict[str, Any]] = []
-    combos = list(product(epsilons, alphas, decays, ("formal", "engineering")))
-    for i, (eps, alp, dec, mode) in enumerate(combos):
+    combos = list(product(epsilons, alphas, decays, ("formal", "engineering", "agrapa"), risk_modes))
+    for eps, alp, dec, mode, rmode in combos:
         if dec != 1.00 and mode == "formal":
             continue  # decay != 1 only meaningful in engineering mode
+        if dec != 1.00 and mode == "agrapa":
+            continue  # agrapa doesn't use decay
         result = evaluate(
             preds, labels, iou_traces, label_names,
-            alpha=alp, epsilon=eps, decay=dec, mode=mode,
+            alpha=alp, epsilon=eps, decay=dec, mode=mode, risk_mode=rmode,
         )
         s = result.get("summary", {})
         row = {
@@ -427,6 +566,7 @@ def sweep(
             "alpha": alp,
             "decay": dec,
             "mode": mode,
+            "risk_mode": rmode,
             "median_lead_time": s.get("median_lead_time"),
             "failure_event_recall": s.get("failure_event_recall"),
             "false_alerts_per_1000": s.get("false_alerts_per_1000_frames"),
@@ -435,7 +575,7 @@ def sweep(
         }
         rows.append(row)
         print(
-            f"  eps={eps} alpha={alp} decay={dec} mode={mode:<12} "
+            f"  eps={eps} alpha={alp} decay={dec} mode={mode:<12} risk={rmode:<12} "
             f"lead={row['median_lead_time']:.1f}f "
             f"recall={row['failure_event_recall']:.3f} "
             f"fa/1k={row['false_alerts_per_1000']:.1f}",
@@ -482,7 +622,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--alpha",   type=float, default=0.10)
     p.add_argument("--epsilon", type=float, default=0.50)
     p.add_argument("--decay",   type=float, default=1.00)
-    p.add_argument("--mode",    default="formal", choices=["formal", "engineering"])
+    p.add_argument("--mode",    default="formal", choices=["formal", "engineering", "agrapa"])
     p.add_argument("--sweep",   action="store_true", help="Run full parameter sweep")
     return p.parse_args()
 

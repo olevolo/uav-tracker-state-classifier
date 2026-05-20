@@ -407,8 +407,50 @@ def compute_nt2f(
 
 
 # ---------------------------------------------------------------------------
-# Failure lead-time metric for imminent_failure_dynamic
+# Event-level failure lead-time metric
 # ---------------------------------------------------------------------------
+
+
+def _find_failure_events(
+    iou: np.ndarray,
+    threshold: float = 0.30,
+) -> list[tuple[int, int]]:
+    """Find contiguous failure episodes (IoU < threshold) after first being above.
+
+    Parameters
+    ----------
+    iou:
+        Per-frame IoU array.
+    threshold:
+        IoU below which a frame is in failure.
+
+    Returns
+    -------
+    List of (start_frame, end_frame) pairs, one per episode.
+    ``start_frame`` is the first frame with IoU < threshold (after being >= threshold).
+    ``end_frame`` is the last consecutive frame below threshold.
+    The tracker must have had at least one above-threshold frame before each event.
+    """
+    events: list[tuple[int, int]] = []
+    above = False
+    in_failure = False
+    start = 0
+    n = len(iou)
+    for t in range(n):
+        v = float(iou[t])
+        if not above:
+            if v >= threshold:
+                above = True
+        else:
+            if v < threshold and not in_failure:
+                start = t
+                in_failure = True
+            elif v >= threshold and in_failure:
+                events.append((start, t - 1))
+                in_failure = False
+    if in_failure:
+        events.append((start, n - 1))
+    return events
 
 
 def compute_failure_lead_time(
@@ -422,83 +464,140 @@ def compute_failure_lead_time(
     label_name: str = "imminent_failure_dynamic",
     horizon: int = 5,
 ) -> dict[str, Any]:
-    """Measure how many frames before IoU degradation the model raises an alarm.
+    """Event-level failure lead-time metric.
 
-    For each frame t where ``imminent_failure_dynamic=1`` (label) and
-    ``P(imminent_failure_dynamic) > threshold`` (model), compute the lead
-    time as the number of frames until the nearest future IoU drop below
-    ``iou_failure_threshold`` in the window [t+1, t+6].
+    For each failure event (first IoU-drop episode), find the FIRST alert frame
+    in the window [event_start - horizon - 5, event_start).  Lead time =
+    event_start - first_alert_frame.
 
-    Returns a dict with:
-      - ``lead_times``: list of per-TP lead time values (frames, 1–5)
-      - ``median_lead_time``: median over all TP frames (frames)
-      - ``mean_lead_time``: mean over all TP frames
-      - ``n_true_positives``: TP count at given threshold
-      - ``n_false_alarms``: FP count at given threshold
-      - ``recall_at_threshold``: TP / (TP + FN) at given threshold
-      - ``false_alarm_rate``: FP / (FP + TN) at given threshold
+    Parameters
+    ----------
+    iou_dict:
+        Per-sequence IoU arrays.
+    preds_dict:
+        Per-sequence prediction arrays, shape (n_frames, n_heads).
+    labels_dict:
+        Per-sequence label arrays, shape (n_frames, n_labels).
+    label_names:
+        Ordered list of label column names in labels_dict arrays.
+    head_names:
+        Ordered list of head column names in preds_dict arrays.
+    threshold:
+        Probability threshold for calling an alert.
+    iou_failure_threshold:
+        IoU below which a frame counts as a tracking failure.
+    label_name:
+        Which prediction head to use for alerts.
+    horizon:
+        Look-back horizon in frames (the window is [event - horizon - 5, event)).
+
+    Returns
+    -------
+    dict with keys:
+      n_failure_events, n_detected_events, event_recall,
+      per_event_lead_times, median_lead_time, mean_lead_time, p25_lead_time, p75_lead_time.
     """
     if label_name not in label_names:
         return {"note": f"{label_name} not in label schema — skipping lead-time"}
     if label_name not in head_names:
         return {"note": f"{label_name} not in model heads — skipping lead-time"}
 
-    lbl_idx = label_names.index(label_name)
     pred_idx = head_names.index(label_name)
 
-    lead_times: list[int] = []
-    tp = fp = tn = fn = 0
+    n_failure_events = 0
+    n_detected_events = 0
+    per_event_lead_times: list[int] = []
 
     for seq_key in labels_dict:
-        lab = labels_dict[seq_key].astype(int)
         iou = iou_dict.get(seq_key)
         pred_arr = preds_dict.get(seq_key)
 
         if iou is None or pred_arr is None:
             continue
-        if lbl_idx >= lab.shape[1] or pred_idx >= pred_arr.shape[1]:
+        if pred_idx >= pred_arr.shape[1]:
             continue
 
-        y_true = lab[:, lbl_idx]
+        iou_arr = np.asarray(iou, dtype=float)
         y_pred = pred_arr[:, pred_idx]
-        n = len(iou)
+        n = len(iou_arr)
 
-        for t in range(n):
-            predicted_high = y_pred[t] > threshold
-            actually_positive = y_true[t] == 1
+        events = _find_failure_events(iou_arr, threshold=iou_failure_threshold)
+        for event_start, _event_end in events:
+            n_failure_events += 1
+            # Look-back window: [event_start - horizon - 5, event_start)
+            window_start = max(0, event_start - horizon - 5)
+            prior_alerts = [
+                t for t in range(window_start, event_start)
+                if t < n and float(y_pred[t]) > threshold
+            ]
+            if prior_alerts:
+                n_detected_events += 1
+                lead_time = event_start - min(prior_alerts)
+                per_event_lead_times.append(lead_time)
 
-            if predicted_high and actually_positive:
-                tp += 1
-                # Lead time = first future frame where IoU drops below threshold
-                lead = 0
-                for k in range(1, horizon + 2):
-                    if t + k < n and iou[t + k] < iou_failure_threshold:
-                        lead = k
-                        break
-                lead_times.append(lead)
-            elif predicted_high and not actually_positive:
-                fp += 1
-            elif not predicted_high and actually_positive:
-                fn += 1
-            else:
-                tn += 1
+    event_recall = n_detected_events / max(n_failure_events, 1)
 
-    n_pos = tp + fn
-    n_neg = fp + tn
+    if per_event_lead_times:
+        median_lt = float(np.median(per_event_lead_times))
+        mean_lt   = float(np.mean(per_event_lead_times))
+        p25_lt    = float(np.percentile(per_event_lead_times, 25))
+        p75_lt    = float(np.percentile(per_event_lead_times, 75))
+    else:
+        median_lt = mean_lt = p25_lt = p75_lt = float("nan")
+
     return {
+        "label_name": label_name,
+        "horizon": horizon,
         "threshold": threshold,
-        "median_lead_time": float(np.median(lead_times)) if lead_times else float("nan"),
-        "mean_lead_time": float(np.mean(lead_times)) if lead_times else float("nan"),
-        "n_true_positives": tp,
-        "n_false_alarms": fp,
-        "recall_at_threshold": tp / max(n_pos, 1),
-        "false_alarm_rate": fp / max(n_neg, 1),
-        "lead_time_dist": {
-            "p25": float(np.percentile(lead_times, 25)) if lead_times else float("nan"),
-            "p50": float(np.percentile(lead_times, 50)) if lead_times else float("nan"),
-            "p75": float(np.percentile(lead_times, 75)) if lead_times else float("nan"),
-        },
+        "n_failure_events": n_failure_events,
+        "n_detected_events": n_detected_events,
+        "event_recall": round(event_recall, 4),
+        "per_event_lead_times": per_event_lead_times,
+        "median_lead_time": median_lt,
+        "mean_lead_time": mean_lt,
+        "p25_lead_time": p25_lt,
+        "p75_lead_time": p75_lt,
     }
+
+
+def run_lead_time_analysis(
+    iou_dict: dict[str, np.ndarray],
+    preds_dict: dict[str, np.ndarray],
+    labels_dict: dict[str, np.ndarray],
+    label_names: list[str],
+    head_names: list[str],
+    threshold: float = 0.50,
+    iou_failure_threshold: float = 0.30,
+) -> dict[str, Any]:
+    """Run event-level lead-time analysis for all three IFD horizons.
+
+    Calls :func:`compute_failure_lead_time` for ifd5 (horizon=5),
+    ifd10 (horizon=10), and ifd20 (horizon=20).
+
+    Returns
+    -------
+    dict with keys "ifd5", "ifd10", "ifd20", each containing the result
+    from :func:`compute_failure_lead_time`.
+    """
+    configs = [
+        ("ifd5",  "imminent_failure_dynamic",    5),
+        ("ifd10", "imminent_failure_dynamic_10", 10),
+        ("ifd20", "imminent_failure_dynamic_20", 20),
+    ]
+    results: dict[str, Any] = {}
+    for key, lname, h in configs:
+        results[key] = compute_failure_lead_time(
+            iou_dict=iou_dict,
+            preds_dict=preds_dict,
+            labels_dict=labels_dict,
+            label_names=label_names,
+            head_names=head_names,
+            threshold=threshold,
+            iou_failure_threshold=iou_failure_threshold,
+            label_name=lname,
+            horizon=h,
+        )
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -1128,24 +1227,27 @@ def evaluate(
             print(f"  {head:<25}  ECE: {ece_before:.4f} → {ece_after:.4f}  (Δ={ece_after-ece_before:+.4f})")
         results["calibration"] = cal_summary
 
-    # Lead-time metric for imminent_failure_dynamic (v1 schema only; skipped silently for v0)
+    # Lead-time analysis for all three IFD horizons (v1/v2 schema only; skipped silently for v0)
     if preds_dict:
-        lead_time_result = compute_failure_lead_time(
+        lead_time_result = run_lead_time_analysis(
             iou_dict=iou_dict,
             preds_dict=preds_dict,
             labels_dict=labels_dict,
             label_names=label_names,
             head_names=_model_head_names,
         )
-        if "note" not in lead_time_result:
+        # Only include and print if at least one horizon was actually computed
+        non_skip = {k: v for k, v in lead_time_result.items() if "note" not in v}
+        if non_skip:
             results["failure_lead_time"] = lead_time_result
-            print(
-                f"\nFailure lead-time (P(ifd)>0.50):  "
-                f"median={lead_time_result['median_lead_time']:.1f}f  "
-                f"recall={lead_time_result['recall_at_threshold']:.3f}  "
-                f"FAR={lead_time_result['false_alarm_rate']:.3f}  "
-                f"n_TP={lead_time_result['n_true_positives']}"
-            )
+            for hz_key, hz_res in non_skip.items():
+                print(
+                    f"\nFailure lead-time ({hz_key}):  "
+                    f"events={hz_res['n_failure_events']}  "
+                    f"detected={hz_res['n_detected_events']}  "
+                    f"recall={hz_res['event_recall']:.3f}  "
+                    f"median_lead={hz_res['median_lead_time']:.1f}f"
+                )
 
     # Determine GO/NO-GO
     verdict = check_go_nogo(results)

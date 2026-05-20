@@ -7,11 +7,13 @@ from salt_r.eprocess import (
     _failure_events,
     build_null_distribution,
     compute_alert_metrics,
+    compute_quality_score,
     compute_risk_score,
     conformal_pvalue,
     evaluate,
     power_evalue,
     reset_at_boundary,
+    run_eprocess_agrapa,
     run_eprocess_sequence,
 )
 
@@ -372,3 +374,180 @@ class TestEvaluateIntegration:
         # Just verify both return valid summaries
         assert "summary" in r_formal
         assert "summary" in r_eng
+
+
+# ---------------------------------------------------------------------------
+# compute_risk_score with modes
+# ---------------------------------------------------------------------------
+
+class TestComputeRiskScoreModes:
+    def _probs(self):
+        return {
+            "false_confirmed": 0.6,
+            "imminent_failure_dynamic": 0.8,
+            "imminent_failure_dynamic_10": 0.5,
+            "imminent_failure_dynamic_20": 0.4,
+            "failure_in_5": 0.3,
+        }
+
+    def test_ifd5_mode(self):
+        p = self._probs()
+        assert compute_risk_score(p, mode="ifd5") == pytest.approx(p["imminent_failure_dynamic"])
+
+    def test_ifd10_mode(self):
+        p = self._probs()
+        assert compute_risk_score(p, mode="ifd10") == pytest.approx(p["imminent_failure_dynamic_10"])
+
+    def test_ifd20_mode(self):
+        p = self._probs()
+        assert compute_risk_score(p, mode="ifd20") == pytest.approx(p["imminent_failure_dynamic_20"])
+
+    def test_fc_ifd20_mode(self):
+        p = self._probs()
+        expected = 0.60 * p["false_confirmed"] + 0.40 * p["imminent_failure_dynamic_20"]
+        assert compute_risk_score(p, mode="fc_ifd20") == pytest.approx(expected)
+
+    def test_all_risk_mode_default(self):
+        p = self._probs()
+        # default positional arg is "all_risk"
+        assert compute_risk_score(p) == pytest.approx(compute_risk_score(p, mode="all_risk"))
+
+    def test_quality_score_is_complement(self):
+        p = self._probs()
+        for mode in ("ifd5", "ifd10", "ifd20", "fc_ifd20", "all_risk"):
+            r = compute_risk_score(p, mode=mode)
+            q = compute_quality_score(p, risk_mode=mode)
+            assert q == pytest.approx(1.0 - r), f"Quality != 1-risk for mode={mode}"
+
+
+# ---------------------------------------------------------------------------
+# run_eprocess_agrapa
+# ---------------------------------------------------------------------------
+
+class TestRunEprocessAgrapa:
+    def test_runs_without_error(self):
+        """aGRAPAshould return arrays of correct shape with no exception."""
+        rng = np.random.RandomState(0)
+        quality = rng.uniform(0.3, 0.8, 50).astype(np.float32)
+        E, alerts = run_eprocess_agrapa(quality, epsilon=0.5, alpha=0.10, window=20)
+        assert len(E) == 50
+        assert isinstance(alerts, list)
+
+    def test_no_calibration_set_needed(self):
+        """aGRAPAshould work without any null/calibration distribution.
+
+        The function signature does NOT accept null_scores — calling it
+        with only quality scores must succeed (not require a calibration set).
+        """
+        quality = np.full(30, 0.6, dtype=np.float32)
+        # This must NOT raise TypeError even though no null_scores is supplied
+        E, alerts = run_eprocess_agrapa(quality, epsilon=0.5, alpha=0.10)
+        assert len(E) == 30
+
+    def test_constant_low_quality_eventually_alerts(self):
+        """A sustained low-quality stream (quality << epsilon) must trigger alert."""
+        # quality=0.05 << epsilon=0.5  → large positive (ε - M_t) every frame
+        # → e-process should exceed 1/alpha=10.0 well within 200 frames
+        quality = np.full(200, 0.05, dtype=np.float32)
+        E, alerts = run_eprocess_agrapa(quality, epsilon=0.5, alpha=0.10, window=20)
+        assert len(alerts) >= 1, (
+            f"Expected at least one alert on constant low-quality sequence; "
+            f"max E={E.max():.2f}, threshold={1.0/0.10:.2f}"
+        )
+
+    def test_formal_mode_at_most_one_alert(self):
+        """aGRAPAoperates in formal mode — at most one alert per sequence."""
+        quality = np.full(100, 0.05, dtype=np.float32)
+        E, alerts = run_eprocess_agrapa(quality, epsilon=0.5, alpha=0.10)
+        assert len(alerts) <= 1
+
+    def test_high_quality_no_alert(self):
+        """High quality (quality >= epsilon) stream should NOT alert."""
+        # quality=0.9 >> epsilon=0.5  → (ε - M_t) < 0  → multiplicative factor < 1
+        quality = np.full(100, 0.9, dtype=np.float32)
+        E, alerts = run_eprocess_agrapa(quality, epsilon=0.5, alpha=0.10)
+        assert len(alerts) == 0, (
+            f"High quality stream must not alert; max E={E.max():.2f}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# evaluate with mode="agrapa"
+# ---------------------------------------------------------------------------
+
+class TestEvaluateAgrapa:
+    def _make_fixtures(self, n_seqs=8, n_frames=100):
+        """Synthetic val set with 1 failure event per sequence (same as integration test)."""
+        rng = np.random.RandomState(0)
+        label_names = [
+            "correct", "false_confirmed", "failure_in_5", "recoverable",
+            "target_dynamic", "camera_dynamic", "hard_dynamic_scene",
+            "needs_full_compute", "hard_dynamic_scene_v2",
+            "imminent_failure_dynamic", "failure_in_10", "failure_in_20",
+            "imminent_failure_dynamic_10", "imminent_failure_dynamic_20",
+        ]
+        preds: dict = {}
+        labels: dict = {}
+        ious: dict = {}
+        ifd_idx = label_names.index("imminent_failure_dynamic")
+
+        for i in range(n_seqs):
+            seq = f"uav123/seq{i:02d}"
+            lab = np.zeros((n_frames, 14), dtype=np.int8)
+            iou = np.ones(n_frames, dtype=np.float32)
+            iou[70:] = 0.1
+            lab[60:70, ifd_idx] = 1
+            frame_probs = []
+            for t in range(n_frames):
+                p_ifd = 0.8 if 60 <= t < 70 else 0.1
+                p_fc = 0.1 if iou[t] >= 0.5 else 0.7
+                frame_probs.append({
+                    "false_confirmed": float(p_fc),
+                    "imminent_failure_dynamic": float(p_ifd),
+                    "failure_in_5": 0.05,
+                    "imminent_failure_dynamic_20": 0.05,
+                })
+            preds[seq] = frame_probs
+            labels[seq] = lab
+            ious[seq] = iou
+
+        return preds, labels, ious, label_names
+
+    def test_agrapa_mode_runs_without_error(self):
+        preds, labels, ious, label_names = self._make_fixtures()
+        result = evaluate(
+            preds, labels, ious, label_names,
+            alpha=0.10, epsilon=0.5, mode="agrapa",
+        )
+        assert "summary" in result
+        assert "config" in result
+
+    def test_agrapa_config_has_zero_null_frames(self):
+        """aGRAPAmode skips calibration — n_null_frames must be 0."""
+        preds, labels, ious, label_names = self._make_fixtures()
+        result = evaluate(
+            preds, labels, ious, label_names,
+            alpha=0.10, epsilon=0.5, mode="agrapa",
+        )
+        assert result["config"]["n_null_frames"] == 0
+
+    def test_evaluate_risk_mode_ifd5(self):
+        preds, labels, ious, label_names = self._make_fixtures()
+        result = evaluate(
+            preds, labels, ious, label_names,
+            alpha=0.10, epsilon=0.5, mode="formal", risk_mode="ifd5",
+        )
+        assert result["config"]["risk_mode"] == "ifd5"
+        assert "summary" in result
+
+    def test_evaluate_baselines_have_four_heads(self):
+        """Result must include baseline entries for ifd5, ifd10, ifd20, fc."""
+        preds, labels, ious, label_names = self._make_fixtures()
+        result = evaluate(
+            preds, labels, ious, label_names,
+            alpha=0.10, epsilon=0.5, mode="formal",
+        )
+        for key in ("baseline_raw_ifd5_0.5", "baseline_raw_ifd10_0.5",
+                    "baseline_raw_ifd20_0.5", "baseline_raw_fc_0.5"):
+            assert key in result, f"Missing baseline key: {key}"
+

@@ -24,6 +24,7 @@ MAX_FRAMES="${MAX_FRAMES:-}"
 EPOCHS="${EPOCHS:-50}"
 LABEL_SCHEMA="${LABEL_SCHEMA:-v0}"   # v0 (7 heads) or v1 (9 heads with split dynamic labels)
 CALIBRATE="${CALIBRATE:-}"           # set to "1" to enable --calibrate-heads for reliability heads
+FORCE_RECOMPUTE_LABELS=""            # set via --force-recompute-labels to regenerate even if NPZ exists
 
 # Parse args
 while [[ $# -gt 0 ]]; do
@@ -41,6 +42,7 @@ while [[ $# -gt 0 ]]; do
         --npz) NPZ="$2"; shift 2 ;;
         --label-schema) LABEL_SCHEMA="$2"; shift 2 ;;
         --calibrate) CALIBRATE="1"; shift ;;
+        --force-recompute-labels) FORCE_RECOMPUTE_LABELS="1"; shift ;;
         *) echo "Unknown arg: $1"; exit 1 ;;
     esac
 done
@@ -71,6 +73,10 @@ SCHEMA_TAG="${LABEL_SCHEMA}"
 if [[ "${LABEL_SCHEMA}" == "v2" ]]; then
     V1_NPZ="${PROJECT_ROOT}/saltr/data/salt_rd_v1_labels.npz"
     V0_NPZ="${PROJECT_ROOT}/saltr/data/salt_rd_v0.npz"
+    if [[ -n "${FORCE_RECOMPUTE_LABELS}" && -f "${NPZ}" ]]; then
+        echo "=== Step 1: --force-recompute-labels: removing ${NPZ} ==="
+        rm "${NPZ}"
+    fi
     if [[ -f "${NPZ}" ]]; then
         echo "=== Step 1: Skipping (${NPZ} exists) ==="
     elif [[ -f "${V1_NPZ}" ]]; then
@@ -93,6 +99,10 @@ recompute_labels_v2('${V1_NPZ}', '${NPZ}')
     fi
 elif [[ "${LABEL_SCHEMA}" == "v1" ]]; then
     V0_NPZ="${PROJECT_ROOT}/saltr/data/salt_rd_v0.npz"
+    if [[ -n "${FORCE_RECOMPUTE_LABELS}" && -f "${NPZ}" ]]; then
+        echo "=== Step 1: --force-recompute-labels: removing ${NPZ} ==="
+        rm "${NPZ}"
+    fi
     if [[ -f "${NPZ}" ]]; then
         echo "=== Step 1: Skipping (${NPZ} exists) ==="
     elif [[ -f "${V0_NPZ}" ]]; then
@@ -107,6 +117,10 @@ recompute_labels_v1('${V0_NPZ}', '${NPZ}')
         exit 1
     fi
 else
+    if [[ -n "${FORCE_RECOMPUTE_LABELS}" && -f "${NPZ}" ]]; then
+        echo "=== Step 1: --force-recompute-labels: removing ${NPZ} ==="
+        rm "${NPZ}"
+    fi
     if [[ ! -f "${NPZ}" ]]; then
         echo "=== Step 1: Collect features ==="
         FRAME_CAP_ARG=""
