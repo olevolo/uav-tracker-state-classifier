@@ -191,6 +191,7 @@ class SALTRDDataset(Dataset):
 
         # Store per-sequence arrays; index only sequences matching the split
         self._sequences: list[tuple[np.ndarray, np.ndarray]] = []  # (features, labels)
+        self._sequence_keys: list[str] = []  # parallel list of NPZ sequence keys
         self._index: list[tuple[int, int]] = []  # (seq_idx, frame_idx)
 
         for key, seq_split in ds.split.items():
@@ -201,6 +202,7 @@ class SALTRDDataset(Dataset):
             n_frames = feats.shape[0]
             seq_idx = len(self._sequences)
             self._sequences.append((feats, labs))
+            self._sequence_keys.append(key)
             # Only frames where a full window exists (frame_idx >= window_size - 1)
             for t in range(window_size - 1, n_frames):
                 self._index.append((seq_idx, t))
@@ -476,34 +478,29 @@ def train(
     # ------------------------------------------------------------------
     if memory_features:
         def _apply_memory(ds: SALTRDDataset, tag: str) -> None:
-            """In-place: replace (feats, labs) tuples adding memory cols."""
-            # We need to know which sequence key each entry corresponds to.
-            # SALTRDDataset stores sequences in insertion order matching the NPZ
-            # split iteration; rebuild the key mapping from the same NPZ source.
-            from salt_r.collect_features import SavedDataset as _SD
-            src = _SD.load(npz_path)
-            split_name = tag  # "train" or "val"
-            seq_keys = [k for k, s in src.split.items() if s == split_name]
+            """In-place: replace (feats, labs) tuples adding memory columns by exact key."""
             patched = 0
-            for i, seq_key in enumerate(seq_keys):
-                if i >= len(ds._sequences):
-                    break
-                if seq_key in memory_features:
-                    feats, labs = ds._sequences[i]
-                    mem = memory_features[seq_key]
-                    T = min(feats.shape[0], mem.shape[0])
-                    if T < feats.shape[0]:
-                        # Pad memory with zeros for frames beyond sidecar length
-                        pad = np.zeros((feats.shape[0] - T, mem.shape[1]), dtype=np.float32)
-                        mem_padded = np.concatenate([mem[:T], pad], axis=0)
-                    else:
-                        mem_padded = mem[:feats.shape[0]]
-                    ds._sequences[i] = (
-                        np.concatenate([feats, mem_padded], axis=1),
-                        labs,
-                    )
-                    patched += 1
-            print(f"[train] {split_name}: memory-augmented {patched}/{len(seq_keys)} sequences", flush=True)
+            for i, seq_key in enumerate(ds._sequence_keys):
+                if seq_key not in memory_features:
+                    continue
+                feats, labs = ds._sequences[i]
+                mem = memory_features[seq_key]
+                T_feats = feats.shape[0]
+                T_mem = mem.shape[0]
+                if T_mem >= T_feats:
+                    mem_aligned = mem[:T_feats]
+                else:
+                    # Pad with zeros for frames beyond sidecar length
+                    pad = np.zeros((T_feats - T_mem, mem.shape[1]), dtype=np.float32)
+                    mem_aligned = np.concatenate([mem, pad], axis=0)
+                ds._sequences[i] = (np.concatenate([feats, mem_aligned], axis=1), labs)
+                patched += 1
+            n_total = len(ds._sequence_keys)
+            assert patched > 0 or n_total == 0, (
+                f"[train] {tag}: 0/{n_total} sequences memory-augmented — "
+                "check that sidecar keys match NPZ sequence keys exactly"
+            )
+            print(f"[train] {tag}: memory-augmented {patched}/{n_total} sequences", flush=True)
 
         _apply_memory(train_ds, "train")
         _apply_memory(val_ds, "val")
@@ -720,11 +717,12 @@ def main() -> None:
     )
     parser.add_argument(
         "--memory-sidecar",
-        default="saltr/data/salt_rd_memory_sidecar.npz",
+        default=None,
         help=(
-            "Path to optional memory sidecar NPZ with keys memory_features/{seq} "
-            "(float32, T×9).  If the file does not exist, training uses 28-dim input only. "
-            "(default: saltr/data/salt_rd_memory_sidecar.npz)"
+            "Path to memory sidecar NPZ with keys memory_features/{seq} (9 extra features). "
+            "When provided, model uses 37-dim input (28 telemetry + 9 memory). "
+            "When omitted (default), model uses 28-dim baseline input. "
+            "Example: --memory-sidecar saltr/data/salt_rd_memory_sidecar.npz"
         ),
     )
     args = parser.parse_args()

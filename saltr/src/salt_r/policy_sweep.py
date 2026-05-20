@@ -223,6 +223,9 @@ def simulate_policy_step(
     alert_tier = "none"
 
     # Compute KF residual if bboxes provided
+    # NOTE: this uses a simple displacement approximation, NOT the SimpleBboxKalmanFilter.
+    # Wire SimpleBboxKalmanFilter into _evaluate_config (pass kf instance per sequence)
+    # before reporting KF residual results in papers.
     kf_residual = 0.0
     if prev_bbox is not None and curr_bbox is not None:
         # Simple displacement-based residual approximation
@@ -460,7 +463,7 @@ def _evaluate_config(
                 eprocess_value=ep_val,
                 memory_margin=mem_val,
                 config=config,
-            )
+            )  # kf_residual from simple displacement; SimpleBboxKalmanFilter not yet wired here
             prev_bbox = curr_bbox
 
             frame_iou = float(iou[t])

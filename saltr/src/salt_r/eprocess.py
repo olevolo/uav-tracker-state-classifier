@@ -647,6 +647,12 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--risk-mode", default="all_risk",
                    choices=["all_risk", "ifd5", "ifd10", "ifd20", "fc_ifd20"])
     p.add_argument("--sweep",   action="store_true", help="Run full parameter sweep")
+    p.add_argument(
+        "--fail-on-nogo",
+        action="store_true",
+        default=False,
+        help="Exit with code 1 when GO verdict fails. Default: exit 0 always (NO-GO is an analysis result).",
+    )
     return p.parse_args()
 
 
@@ -703,7 +709,7 @@ def main() -> None:
         and s["false_alerts_per_1000_frames"] <= 100
     )
     print(f"\n[eprocess] GO verdict: {'✅ GO' if go else '❌ NO-GO'}")
-    if not go:
+    if not go and args.fail_on_nogo:
         sys.exit(1)
 
 
