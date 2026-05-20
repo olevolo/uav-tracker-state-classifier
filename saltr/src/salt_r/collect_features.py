@@ -790,15 +790,15 @@ def collect_dataset(
     import sys
     sys.path.insert(0, str(Path(__file__).parents[4] / "src"))
 
-    from uav_tracker.salt_runner import SALTRunner
-    from uav_tracker.metrics.success import iou as iou_fn_inner
-
-    # Make iou_fn available inside collect_sequence via globals()
-    globals()["iou_fn"] = iou_fn_inner
-
-    runner = SALTRunner.from_config(config_path)
+    runner = None
     config_hash = hash_config_file(config_path)
     tracker_version = "sglatrack_ep0297"  # from FROZEN.md
+
+    if not dry_run:
+        from uav_tracker.salt_runner import SALTRunner
+        from uav_tracker.metrics.success import iou as iou_fn_inner
+        globals()["iou_fn"] = iou_fn_inner
+        runner = SALTRunner.from_config(config_path)
 
     ds = SavedDataset(
         tracker_version=tracker_version,

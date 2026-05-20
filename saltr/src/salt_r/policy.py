@@ -244,7 +244,9 @@ def main() -> None:
     if args.npz:
         npz = np.load(args.npz, allow_pickle=True)
         for key in npz.files:
-            iou_data[key] = npz[key]
+            if key.startswith("iou_trace/"):
+                seq_key = key[len("iou_trace/"):]
+                iou_data[seq_key] = npz[key]
         print(f"Loaded IoU traces for {len(iou_data)} sequences from {args.npz}")
 
     aggregate: dict[str, list[float]] = {
@@ -256,11 +258,10 @@ def main() -> None:
     }
 
     for seq_name, probs_seq in all_probs.items():
-        if seq_name in iou_data:
-            iou_trace = iou_data[seq_name]
-        else:
-            # Fallback: assume perfect tracking when no GT available
-            iou_trace = np.ones(len(probs_seq), dtype=float)
+        if seq_name not in iou_data:
+            print(f"WARNING: missing IoU trace for {seq_name}; skipping")
+            continue
+        iou_trace = iou_data[seq_name]
 
         metrics = replay_policy(probs_seq, iou_trace, thresholds)
         for k in aggregate:

@@ -18,9 +18,16 @@ from __future__ import annotations
 import argparse
 import json
 import warnings
+from pathlib import Path
 from typing import Any
 
 import numpy as np
+
+# Module-level head names (imported lazily to avoid hard dependency at import time)
+try:
+    from salt_r.model import HEAD_NAMES as _HEAD_NAMES
+except Exception:
+    _HEAD_NAMES: list[str] = []
 
 
 # ---------------------------------------------------------------------------
@@ -541,21 +548,15 @@ def _run_inference(
             )  # (n, window_size, F)
 
             out = model(x_batch)  # dict[str, Tensor(n,)] or Tensor(n, heads)
+            from salt_r.model import HEAD_NAMES
             if isinstance(out, dict):
-                # dict head-name → (n,) tensor
-                n_heads = len(out)
-                prob_matrix = np.zeros((n, n_heads), dtype=np.float32)
-                head_order = list(out.keys())
-                for hi, hname in enumerate(head_order):
-                    prob_matrix[:, hi] = (
-                        out[hname].sigmoid().cpu().numpy()
-                        if out[hname].requires_grad
-                        or out[hname].dtype == torch.float32
-                        else out[hname].cpu().numpy()
-                    )
+                prob_matrix = np.stack(
+                    [out[h].detach().cpu().numpy() for h in HEAD_NAMES],
+                    axis=1,
+                ).astype(np.float32)
             else:
-                # Tensor (n, n_heads)
-                prob_matrix = torch.sigmoid(out).cpu().numpy()
+                prob_matrix = out.detach().cpu().numpy().astype(np.float32)
+            prob_matrix = np.clip(prob_matrix, 0.0, 1.0)
 
             preds[seq_key] = prob_matrix
 
@@ -606,6 +607,28 @@ def _print_summary_table(
 
 
 # ---------------------------------------------------------------------------
+# Predictions export helper
+# ---------------------------------------------------------------------------
+
+
+def _save_predictions_json(
+    preds_dict: dict[str, np.ndarray],
+    predictions_output: str,
+) -> None:
+    """Save per-sequence per-frame probabilities as JSON for policy.py --probs-json."""
+    from salt_r.model import HEAD_NAMES
+    serializable: dict[str, list[dict[str, float]]] = {}
+    for seq_key, pred in preds_dict.items():
+        serializable[seq_key] = [
+            {h: float(pred[t, i]) for i, h in enumerate(HEAD_NAMES)}
+            for t in range(pred.shape[0])
+        ]
+    Path(predictions_output).parent.mkdir(parents=True, exist_ok=True)
+    Path(predictions_output).write_text(json.dumps(serializable, indent=2))
+    print(f"Predictions written to: {predictions_output}")
+
+
+# ---------------------------------------------------------------------------
 # Full evaluation entry point
 # ---------------------------------------------------------------------------
 
@@ -617,6 +640,7 @@ def evaluate(
     window_size: int = 20,
     device: str = "cpu",
     output_path: str | None = None,
+    predictions_output: str | None = None,
 ) -> dict[str, Any]:
     """Run full evaluation and return results dict.
 
@@ -638,6 +662,9 @@ def evaluate(
         Torch device, e.g. "cpu" or "cuda".
     output_path:
         If provided, write the full results dict as JSON to this path.
+    predictions_output:
+        If provided, write per-frame per-head probabilities as JSON for
+        policy.py offline replay (format: {seq_key: [{head: prob}, ...]}).
 
     Returns
     -------
@@ -683,6 +710,9 @@ def evaluate(
     model = _load_model(checkpoint_path, n_features, n_labels, device)
     preds_dict = _run_inference(model, features_dict, window_size, device)
     has_preds = bool(preds_dict)
+
+    if predictions_output and preds_dict:
+        _save_predictions_json(preds_dict, predictions_output)
 
     # ------------------------------------------------------------------
     # 3. Aggregate labels and predictions across sequences
@@ -872,6 +902,11 @@ def main() -> None:
         help="Optional output path for JSON results.",
     )
     parser.add_argument(
+        "--predictions-output",
+        default=None,
+        help="Path to save per-frame predictions JSON for policy.py --probs-json.",
+    )
+    parser.add_argument(
         "--device",
         default="cpu",
         help="Torch device string (default: cpu).",
@@ -891,6 +926,7 @@ def main() -> None:
         window_size=args.window_size,
         device=args.device,
         output_path=args.output,
+        predictions_output=args.predictions_output,
     )
     verdict = check_go_nogo(results)
     print(f"\nGO/NO-GO: {verdict}")
