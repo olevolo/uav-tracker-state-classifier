@@ -1,11 +1,103 @@
-# HANDOFF_NEXT — SALT-RD: DAM Memory Features → SALT-RD v2.1 Training
+# HANDOFF_NEXT — SALT-RD: Phase 4B v2.1 Training Ready
 
 **Дата:** 2026-05-20  
-**Оновлено:** 2026-05-20 — Session complete. Phases 0-6 infrastructure done. Labels corrected, model retrained, 141 tests green.  
+**Оновлено:** 2026-05-20 (session 2) — Plumbing fixed, Phase 6 honest ablation done, Phase 4B model extension implemented, 174 tests green.  
 **Owner:** Staff CV/AI/ML review track  
-**Поточний стан:** v2_corrected model trained (fc AUROC=0.885, ifd10=0.765). e-process=analysis tool. Memory sidecar collected. All infrastructure in place.  
-**Новий пріоритет:** **Phase 4B — train SALT-RD v2.1 with memory features → diagnostic fc AUROC 0.548→0.70+**  
-**Мета:** DAM memory features attack false_confirmed directly. Once fc signal improves, e-process recall will follow.
+**Поточний стан:** All plumbing fixed. Canonical artifacts regenerated. model/train/eval ready for 37-dim input. Phase 4B training is the concrete next step.  
+**Новий пріоритет:** **Run Phase 4B training** (`--memory-sidecar saltr/data/salt_rd_memory_sidecar.npz`) → measure diagnostic fc AUROC vs 0.548 baseline. If proxy memory is weak, move to real crop embeddings.
+
+---
+
+## Session Summary 2026-05-20 (Session 2 — Plumbing + Phase 4B)
+
+### What changed
+
+| Area | Status | Key result |
+|---|---|---|
+| e-process plumbing | ✅ fixed | risk_mode in null calibration; CLI --risk-mode; diagnostic keys from NPZ |
+| interventions.py | ✅ fixed | RecoveryAction.NONE default; RUN only when p_rec>=threshold AND p_fc<0.40 |
+| Phase 6 plumbing | ✅ fixed | memory_margin/{seq} in sidecar; e_trace in per_seq JSON; bbox_pred for KF |
+| CoTracker provenance | ✅ fixed | allow_synthetic=False default; teacher_model/{seq} persisted |
+| bbox utils | ✅ added | xywh_to_xyxy / xyxy_to_xywh in collect_features.py |
+| CLIs | ✅ added | python -m salt_r.memory_features, python -m salt_r.policy_sweep |
+| Canonical artifacts | ✅ regenerated | memory sidecar (228 seqs, +memory_margin), eprocess JSON (+e_trace), policy sweep |
+| Phase 6 honest ablation | ✅ done | tcr -28% at fc=0.60/reinit=0.70; proxy memory NO-GO |
+| Phase 4B model | ✅ done | model/train/eval accept memory_dim=0/9, --memory-sidecar arg |
+| Tests | ✅ 174 green | +33 new tests (eprocess/memory/model/policy/bbox) |
+
+### Phase 6 Honest Ablation (key numbers)
+
+| Policy | tcr | wrir | msu | dens/1kf | recall |
+|---|---:|---:|---:|---:|---:|
+| HANDOFF v2 baseline | 0.0330 | 0.2090 | — | — | — |
+| fc=0.60 reinit=0.70 no-mem | **0.0239** | **0.000** | 0.624 | 684 | 0.977 |
+| fc=0.60 reinit=0.80 mem_t=+0.10 | 0.0239 | 0.000 | 0.624 | 684 | 0.977 |
+| fc=0.60 reinit=0.80 mem_t=0.00 | 0.0338 | 0.000 | 0.435 | 301 | 0.812 |
+| Best tcr (fc=0.4, reinit=0.8) | **0.0225** | **0.000** | 0.555 | 532 | 0.953 |
+
+**Key reads:**
+- tcr −28% at practical point (fc=0.60, reinit=0.70) vs HANDOFF baseline
+- wrir=0.0 at reinit≥0.70: `recoverable` head fires on already-failed frames; safe threshold is ≥0.70
+- Proxy memory HURTS: mem_t=0.00 makes tcr 0.0239→0.0338 and recall 0.977→0.812
+- e-process: lead=10f with FAR≈0.2/1kf — good lead time, recall=3.1% — analysis tool only
+
+### Phase 6 GO/NO-GO
+
+| Hypothesis | Verdict |
+|---|---|
+| fc signal reduces template corruption | ✅ GO: −28% |
+| reinit gating reduces wrong_reinit | ✅ GO: wrir=0 at reinit≥0.70 |
+| proxy memory improves policy | ❌ NO-GO: makes tcr worse |
+| e-process runtime gating | ❌ NO-GO: recall=3% |
+| e-process lead-time analysis | ✅ 10f lead, near-zero FAR |
+
+---
+
+## Concrete Next Task: Run Phase 4B Training
+
+Infrastructure is ready. Command:
+
+```bash
+PYTHONPATH=src:saltr/src .venv/bin/python -m salt_r.train \
+  --npz saltr/data/salt_rd_v2_labels.npz \
+  --output saltr/checkpoints/v2_1_memory \
+  --epochs 50 \
+  --label-schema v2 \
+  --patience 8 \
+  --memory-sidecar saltr/data/salt_rd_memory_sidecar.npz
+```
+
+Then eval (both val and diagnostic):
+```bash
+PYTHONPATH=src:saltr/src .venv/bin/python -m salt_r.eval \
+  --npz saltr/data/salt_rd_v2_labels.npz \
+  --checkpoint saltr/checkpoints/v2_1_memory/saltrd_best.pt \
+  --output saltr/results/eval_val_v2_1_memory.json \
+  --predictions-output saltr/results/preds_val_v2_1_memory.json \
+  --memory-sidecar saltr/data/salt_rd_memory_sidecar.npz
+
+PYTHONPATH=src:saltr/src .venv/bin/python -m salt_r.eval \
+  --npz saltr/data/salt_rd_v2_labels.npz \
+  --checkpoint saltr/checkpoints/v2_1_memory/saltrd_best.pt \
+  --split diagnostic \
+  --output saltr/results/eval_diagnostic_v2_1_memory.json \
+  --memory-sidecar saltr/data/salt_rd_memory_sidecar.npz
+```
+
+**GO gate:** diagnostic fc AUROC 0.548 → > 0.65 (minimum), ideally > 0.70  
+**STOP:** if val improves but diagnostic does NOT → overfit, proxy insufficient  
+**Fallback:** if proxy weak → SGLATrack/DINO crop embeddings (real Phase 4B)
+
+---
+
+## Artifacts State After Session 2
+
+| Artifact | Path | Status |
+|---|---|---|
+| memory sidecar (with memory_margin) | `saltr/data/salt_rd_memory_sidecar.npz` | ✅ regenerated |
+| eprocess JSON (with e_trace) | `saltr/results/eprocess_val_v2_retrained.json` | ✅ regenerated |
+| policy sweep (all signals) | `saltr/results/policy_sweep_v2_retrained.json` | ✅ new |
+| v2_1 checkpoint | `saltr/checkpoints/v2_1_memory/` | ⏳ not yet trained |
 
 ---
 
