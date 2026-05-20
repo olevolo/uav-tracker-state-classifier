@@ -39,23 +39,10 @@ def _ensure_salt_r_on_path() -> None:
 _ensure_salt_r_on_path()
 
 from salt_r.collect_features import SavedDataset, FEATURE_NAMES, LABEL_NAMES  # noqa: E402
+from salt_r.model import SALTRD as _SALTRDBase, HEAD_NAMES as _HEAD_NAMES  # noqa: E402
 
-# ---------------------------------------------------------------------------
-# Head names — the 7 predictive heads (excludes "correct" which is label 0)
-# ---------------------------------------------------------------------------
-
-HEAD_NAMES: List[str] = [
-    "false_confirmed",
-    "failure_in_5",
-    "recoverable",
-    "target_dynamic",
-    "camera_dynamic",
-    "hard_dynamic_scene",
-    "needs_full_compute",
-]
-
-# Indices of HEAD_NAMES within LABEL_NAMES (label 0 = "correct" is excluded)
-_HEAD_LABEL_INDICES: List[int] = [LABEL_NAMES.index(h) for h in HEAD_NAMES]
+# Indices of _HEAD_NAMES within LABEL_NAMES (label 0 = "correct" is excluded)
+_HEAD_LABEL_INDICES: List[int] = [LABEL_NAMES.index(h) for h in _HEAD_NAMES]
 
 # Per-head loss weight multiplier (higher = more emphasis)
 _HEAD_IMPORTANCE: dict[str, float] = {
@@ -175,7 +162,7 @@ class SALTRDDataset(Dataset):
         assert split in {"train", "val", "diagnostic"}, f"Unknown split: {split!r}"
         self.split = split
         self.window_size = window_size
-        self.head_names: List[str] = head_names if head_names is not None else list(HEAD_NAMES)
+        self.head_names: List[str] = head_names if head_names is not None else list(_HEAD_NAMES)
         self.head_label_indices: List[int] = [LABEL_NAMES.index(h) for h in self.head_names]
 
         # Load NPZ
@@ -265,11 +252,8 @@ def focal_bce_loss(
 
 
 # ---------------------------------------------------------------------------
-# ---------------------------------------------------------------------------
 # SALTRD model — thin tensor-output wrapper over model.py's dict-output model
 # ---------------------------------------------------------------------------
-
-from salt_r.model import SALTRD as _SALTRDBase, HEAD_NAMES as _HEAD_NAMES
 
 
 class SALTRD(_SALTRDBase):

@@ -71,6 +71,28 @@ PYTHONPATH="${PYTHONPATH}" "${PYTHON}" saltr/src/salt_r/eval.py \
     --output "${CHECKPOINT_DIR}/eval_val.json"
 
 echo ""
+echo "=== Step 3b: Re-eval with predictions export ==="
+PYTHONPATH="${PYTHONPATH}" "${PYTHON}" saltr/src/salt_r/eval.py \
+    --npz "${NPZ}" \
+    --checkpoint "${CHECKPOINT}" \
+    --split val \
+    --output "${CHECKPOINT_DIR}/eval_val.json" \
+    --predictions-output "${CHECKPOINT_DIR}/preds_val.json"
+
+# Step 4: Policy offline replay
+PREDS_JSON="${CHECKPOINT_DIR}/preds_val.json"
+echo ""
+echo "=== Step 4: Policy offline replay ==="
+if [[ -f "${PREDS_JSON}" ]]; then
+    PYTHONPATH="${PYTHONPATH}" "${PYTHON}" -m salt_r.policy \
+        --probs-json "${PREDS_JSON}" \
+        --npz "${NPZ}" \
+        --output "${CHECKPOINT_DIR}/policy_val.json"
+else
+    echo "No predictions JSON found; skipping policy replay."
+fi
+
+echo ""
 echo "=== Step 3b: Eval (diagnostic split) ==="
 PYTHONPATH="${PYTHONPATH}" "${PYTHON}" saltr/src/salt_r/eval.py \
     --npz "${NPZ}" \
