@@ -1,89 +1,238 @@
-# HANDOFF_NEXT — SALT-RD Phase 2B: DAM-Style Distractor Memory
+# HANDOFF_NEXT — SALT-RD: DAM Memory Features → SALT-RD v2.1 Training
 
 **Дата:** 2026-05-20  
-**Оновлено:** 2026-05-20 — Phase 2A done: e-process implemented + 6 P1-P3 bugs fixed + 62 tests green.  
+**Оновлено:** 2026-05-20 — Session complete. Phases 0-6 infrastructure done. Labels corrected, model retrained, 141 tests green.  
 **Owner:** Staff CV/AI/ML review track  
-**Поточний стан:** Phase 2A complete. e-process formal mode: 11.5f lead time, 44% precision, 6.25% recall. Bottleneck: risk score quality, not algorithm. Need DAM memory features.  
-**Новий пріоритет:** **Phase 2B: DAM4SAM-style distractor memory → boost false_confirmed signal → improve e-process recall**.  
-**Мета:** отримати реальне deployment-покращення: менше false-confirmed drift, менше wrong recovery/template corruption, кращий proactive alert lead-time. Compute/FPS — тільки після oracle replay.
+**Поточний стан:** v2_corrected model trained (fc AUROC=0.885, ifd10=0.765). e-process=analysis tool. Memory sidecar collected. All infrastructure in place.  
+**Новий пріоритет:** **Phase 4B — train SALT-RD v2.1 with memory features → diagnostic fc AUROC 0.548→0.70+**  
+**Мета:** DAM memory features attack false_confirmed directly. Once fc signal improves, e-process recall will follow.
 
 ---
 
-## Phase 2 Results — Completed 2026-05-20
+## Session Summary 2026-05-20 (Current Session)
 
-### Semantic label fix confirmed
+### What changed
 
-| Label | Old base rate | New base rate | Comment |
-|---|---:|---:|---|
-| ifd10 | 7.2% | **0.31%** | Old: mostly already-failed. New: truly proactive |
-| ifd20 | 7.7% | **0.55%** | Same |
+| Phase | Status | Key result |
+|---|---|---|
+| Phase 0 — label semantic fix | ✅ done | ifd10/20 base rate 7% → 0.3%; stale NPZ renamed |
+| Phase 1 — foundation bugs | ✅ done | 6 bugs fixed, eprocess aGRAPAmode, event-level lead-time |
+| Phase 2 — retrain on corrected labels | ✅ done | fc=0.885 unchanged, ifd10=0.765, template_corruption=0.033 (−69%) |
+| Phase 3 — e-process sweep | ✅ done | formal 10f lead, 6.2% recall → analysis tool verdict |
+| Phase 4 — DAM memory infra | ✅ done | memory.py + sidecar; train v2.1 is NEXT |
+| Phase 5 — CoTracker3 infra | ✅ done | teachers/ + 13 point features; offline only |
+| Phase 6 — v2-aware policy | ✅ done | interventions.py + policy_sweep.py + KF filter |
 
-### Retrained model (v2_corrected checkpoint, 13 heads)
+### Current test count: 141 passed
 
-| Head | AUROC | AUPRC | ECE | Comment |
+### Repo state after this session
+
+| Artifact | Path | Status |
+|---|---|---|
+| v2_corrected checkpoint | `saltr/checkpoints/v2_corrected/saltrd_best.pt` | ✅ 13 heads, corrected labels |
+| v2 corrected labels | `saltr/data/salt_rd_v2_labels.npz` | ✅ regenerated (ifd10/20 semantic fix) |
+| stale v2 labels | `saltr/data/salt_rd_v2_labels_STALE_semantic_bug.npz` | ⚠️ keep for reference only |
+| memory sidecar | `saltr/data/salt_rd_memory_sidecar.npz` | ✅ 228 seqs, proxy embeddings |
+| val predictions (corrected) | `saltr/results/preds_val_v2_corrected.json` | ✅ old checkpoint, corrected labels |
+| val predictions (retrained) | `saltr/results/preds_val_v2_retrained.json` | ✅ v2_corrected checkpoint |
+| val eval (retrained) | `saltr/results/eval_val_v2_retrained.json` | ✅ canonical |
+| policy replay (retrained) | `saltr/results/policy_val_v2_retrained.json` | ✅ canonical |
+| e-process val (retrained) | `saltr/results/eprocess_val_v2_retrained.json` | ✅ formal α=0.10 |
+| diagnostic eval (corrected) | `saltr/results/eval_diagnostic_v2_corrected.json` | ✅ hard seqs |
+| e-process sweep (corrected) | `saltr/results/eprocess_sweep_v2_corrected.csv` | ✅ all modes |
+
+### Canonical model results (v2_corrected checkpoint, corrected labels)
+
+| Head | AUROC | AUPRC | ECE | Policy impact |
 |---|---:|---:|---:|---|
-| false_confirmed | 0.885 | 0.338 | 0.348 | Core signal robust |
-| ifd5 | 0.898 | 0.317 | 0.308 | Unchanged |
-| ifd10 | 0.765 | 0.012 | **0.046** | Calibration improved |
-| ifd20 | 0.744 | 0.018 | **0.109** | Calibration improved |
-| failure_in_10 | 0.826 | **0.057** | 0.298 | +3x AUPRC |
+| false_confirmed | 0.885 | 0.338 | 0.348 | template block; recovery abstain |
+| ifd5 | 0.898 | 0.317 | 0.308 | short-horizon risk |
+| ifd10 | **0.765** | 0.012 | **0.046** | 10-frame early warning (calibration ✅) |
+| ifd20 | **0.744** | 0.018 | **0.109** | 20-frame early warning |
+| failure_in_10 | 0.826 | **0.057** | 0.298 | improved AUPRC (+3x) |
+| recoverable | 0.894 | 0.046 | 0.311 | recovery gating |
 
-Policy (v0 → v2stale → v2retrained):
-  template_corruption: 0.108 → 0.060 → **0.033** (−69% vs v0)
-  wrong_reinit: 0.273 → 0.183 → 0.209
+**Policy (v0 → v2stale → v2_corrected retrain):**
+```
+template_corruption:  0.108 → 0.060 → 0.033   (−69% vs v0)
+wrong_reinit_rate:    0.273 → 0.183 → 0.209   (mixed — needs memory features)
+abstention_gain:      0.307 → 0.304 → 0.295
+```
+
+**e-process (formal α=0.10, ε=0.5, retrained preds):**
+```
+median lead time:  10 frames  ✅ (target ≥ 3)
+event recall:       6.2%      ❌ (target ≥ 60%) — analysis tool
+FA per 1000f:       0.2       ✅ (target ≤ 100)
+```
+
+**Diagnostic split (hard sequences — goal not yet met):**
+```
+false_confirmed AUROC:  0.548  ❌ (target 0.70-0.75)
+ifd10 AUROC:            0.626
+ifd20 AUROC:            0.554
+```
 
 ### Phase 2 gate verdict
 
-| Gate | Target | Result | Status |
+| Gate | Target | Result | Decision |
 |---|---|---|---|
-| ifd10 AUROC | ≥ 0.75 | 0.765 | ✅ |
-| ifd20 AUROC | ≥ 0.75 | 0.744 | ❌ (within noise) |
+| ifd10 AUROC | ≥ 0.75 | 0.765 | ✅ continue |
+| ifd20 AUROC | ≥ 0.75 | 0.744 | ❌ borderline — within noise |
 | e-process lead time | ≥ 3f | 10f | ✅ |
-| e-process recall | ≥ 10-20% | 6.2% | ❌ analysis tool only |
+| e-process recall | ≥ 10-20% | 6.2% | ❌ → analysis tool until fc improves |
 
-**Decision: Continue. Risk branch passes AUROC gate. e-process is analysis tool until DAM memory improves risk score quality.**
-
-### e-process Phase 2A — modes summary
-
-aGRAPAmode implemented (paper Eq.12): no calibration set needed, lead=18f, recall=1.6%
-Formal (conformal): lead=10f, recall=6.2%, FA=0.2/1kf
-Engineering: recall=50%+ but FA=170+/1kf
-
-### Phase 4 infrastructure ready
-
-- memory.py: PositiveMemory + NegativeMemory (DAM-aligned)  
-- memory sidecar at saltr/data/salt_rd_memory_sidecar.npz (228 seqs, proxy embeddings)
-- teachers/: CoTracker3 infrastructure + 13 point features
-- policy_sweep.py: SimpleBboxKalmanFilter + v2-aware interventions
-- interventions.py: all Phase 6 action types
-
-141 tests pass.
-
-## Phase 2A Results (e-process) — DONE
-
-| Metric | e-process formal (α=0.10, ε=0.5) | Raw P(ifd)>0.5 | Target |
-|---|---:|---:|---:|
-| Median lead time | **11.5 frames** ✅ | — | ≥ 3 |
-| Event recall | 0.062 ❌ | 0.750 ✅ | ≥ 0.60 |
-| FA per 1000 frames | **0.21** ✅ | 171.4 ❌ | ≤ 100 |
-| Seq-level FAR | 0.167 ❌ | — | ≤ 0.10 |
-
-**Key insight:** e-process precision=44% (4/9 TP) vs baseline 1% (48/4682). Algorithm correct. Problem: raw risk score not strong enough to accumulate evidence fast. Need DAM memory to boost false_confirmed signal → e-process will fire sooner and more reliably.
-
-## P1-P3 Bug Fixes (all done)
-
-| Bug | Fix |
-|---|---|
-| P1a: ifd10/20 counted already-failed frames | `iou_trace[t] >= 0.5` + `len==horizon` guards in collect_features.py |
-| P1b: lead_time hardcoded to ifd5/6-frame window | Parameterized `label_name`, `horizon` in eval.py |
-| P2a: policy docs didn't mention v2 head gap | NOTE comment added to policy.py |
-| P2b: fake AUROC 0.5 for "correct" label | `model_predicted: false` + note field in eval.py |
-| P2c: recompute_labels_v2() silently accepted v0 | v1 schema validation in collect_features.py |
-| P3: train log said AUPRC(fc) but was composite | Renamed to "validation selection score" in train.py |
+**→ Continue. DAM memory features are the path to fixing recall + diagnostic fc.**
 
 ---
 
+## Concrete Next Task: Phase 4B — Train SALT-RD v2.1 with Memory Features
+
+### What to do
+
+Extend the model to accept memory features (9 extra dims) alongside the existing 28 telemetry features.
+
+```
+Input: [28 telemetry features | 9 memory features] = 37-dim input
+Model: GRU(37, hidden=96, layers=2) + same 13 heads
+Training: same composite early-stopping, v2_corrected labels
+```
+
+### Files to modify
+
+**`saltr/src/salt_r/model.py`** — change `input_dim` to accept optional `memory_dim`:
+```python
+class SALTRD(nn.Module):
+    def __init__(self, input_dim=28, hidden_dim=96, n_layers=2, memory_dim=0, ...):
+        actual_input = input_dim + memory_dim
+        self.gru = nn.GRU(actual_input, hidden_dim, n_layers, ...)
+```
+
+**`saltr/src/salt_r/train.py`** — load memory sidecar and concatenate per-sequence:
+```python
+# Load memory sidecar if available
+memory_npz = np.load('saltr/data/salt_rd_memory_sidecar.npz', allow_pickle=True)
+# Per-sequence: features = np.concatenate([features_v2[seq], memory_features[seq]], axis=1)
+# Fall back gracefully if sidecar missing a sequence
+```
+
+**`saltr/src/salt_r/eval.py`** — same concatenation logic during inference.
+
+### Expected result
+
+Target: diagnostic `false_confirmed` AUROC 0.548 → 0.70-0.75  
+Target: `false_confirmed` AUPRC → 0.45+ (or +25% relative)  
+Target: `template_corruption` further reduction  
+Target: e-process recall improves because fc signal is stronger  
+
+**Kill criteria:**  
+If memory features improve global val but NOT diagnostic split → overfit, do not claim improvement.  
+If diagnostic fc AUROC stays below 0.65 after v2.1 training → memory proxy embeddings insufficient → need real DINO embeddings.
+
+### Command to run after implementing
+
+```bash
+PYTHONPATH=src:saltr/src .venv/bin/python -m salt_r.train \
+  --npz saltr/data/salt_rd_v2_labels.npz \
+  --output saltr/checkpoints/v2_1_memory \
+  --epochs 50 \
+  --label-schema v2 \
+  --patience 8
+# (train.py will auto-detect memory sidecar at saltr/data/salt_rd_memory_sidecar.npz)
+```
+
+Then eval:
+```bash
+PYTHONPATH=src:saltr/src .venv/bin/python -m salt_r.eval \
+  --npz saltr/data/salt_rd_v2_labels.npz \
+  --checkpoint saltr/checkpoints/v2_1_memory/saltrd_best.pt \
+  --output saltr/results/eval_val_v2_1_memory.json \
+  --predictions-output saltr/results/preds_val_v2_1_memory.json \
+  --calibrate-heads false_confirmed imminent_failure_dynamic \
+      imminent_failure_dynamic_10 imminent_failure_dynamic_20
+# Also run diagnostic split:
+PYTHONPATH=src:saltr/src .venv/bin/python -m salt_r.eval \
+  --npz saltr/data/salt_rd_v2_labels.npz \
+  --checkpoint saltr/checkpoints/v2_1_memory/saltrd_best.pt \
+  --split diagnostic \
+  --output saltr/results/eval_diagnostic_v2_1_memory.json
+```
+
 ---
+
+## Infrastructure Implemented This Session
+
+### New modules
+
+| File | Purpose | Status |
+|---|---|---|
+| `saltr/src/salt_r/eprocess.py` | Sequential e-process alerts, 5 risk modes, aGRAPAmode | ✅ complete |
+| `saltr/src/salt_r/memory.py` | PositiveMemory (RAM) + NegativeMemory (DRM), DAM-aligned | ✅ complete |
+| `saltr/src/salt_r/memory_features.py` | Offline sidecar collection from v2 NPZ | ✅ complete |
+| `saltr/src/salt_r/interventions.py` | TrackerIntervention, AlertTier, KF residual, v2-aware | ✅ complete |
+| `saltr/src/salt_r/policy_sweep.py` | SimpleBboxKalmanFilter, threshold sweep, v2-aware policy | ✅ complete |
+| `saltr/src/salt_r/teachers/__init__.py` | Package marker | ✅ complete |
+| `saltr/src/salt_r/teachers/point_features.py` | 13 point consistency features + 3 teacher labels | ✅ complete |
+| `saltr/src/salt_r/teachers/cotracker3_export.py` | Offline CoTracker3 export (gated import) | ✅ complete |
+| `saltr/src/salt_r/diagnose_labels.py` | Label contamination audit | ✅ complete |
+| `saltr/src/salt_r/baselines.py` | Feature baseline comparison vs GRU | ✅ complete |
+
+### New tests
+
+| File | Tests | What's covered |
+|---|---|---|
+| `test_saltr_eprocess.py` | 45+ | aGRAPAmode, 5 risk modes, formal/engineering/agrapa, event metrics |
+| `test_saltr_memory.py` | 39 | PositiveMemory gates, NegativeMemory timeless prior, margin feature |
+| `test_saltr_point_features.py` | 10 | synthetic track arrays, teacher labels, no CoTracker3 at import |
+| `test_saltr_policy_sweep.py` | 10 | KF residual, v2-aware interventions, AlertTier logic |
+| `test_saltr_collect_features.py` | 5+ | v0→ValueError guard, ifd positives IoU≥0.5 invariant |
+| `test_saltr_eval.py` | updated | event-level lead-time, 3 horizons, run_lead_time_analysis |
+
+**Total: 141 tests passing.**
+
+### Key design decisions from papers
+
+**eprocess.py (WACV2026 paper):**
+- aGRAPAbetting (Eq.12): `λ_t = (ε−μ̂)/(σ̂²+(ε−μ̂)²)`, rolling window=20, no calibration needed
+- Paper's formulation: `X_t = X_{t-1} * (1 + λ_t * (ε−M_t))` where `M_t = 1 − risk_score_t`
+- Our conformal/power approach is valid but different from paper
+
+**memory.py (DAM4SAM CVPR2025 paper):**
+- PositiveMemory (RAM): FIFO, updated when `p_fc < 0.20 AND p_ifd < 0.30`, recency-weighted
+- NegativeMemory (DRM): NOT time-stamped (timeless prior), updated when distractor detected AND tracking reliable
+- Proxy embeddings: 28-dim normalized feature vector (upgrade to DINO when available)
+
+**policy_sweep.py (SAMURAI 2024 paper):**
+- SimpleBboxKalmanFilter: state=[cx,cy,w,h,vcx,vcy,vw,vh], `kf_residual = 1 − IoU(KF_pred, actual)`
+- Cheap feature: ~0.1ms/frame, catches spatial jumps orthogonal to APCE
+
+### Bug fixes from this session
+
+| Bug | Severity | File | Fix |
+|---|---|---|---|
+| ifd10/20 counted already-failed frames | P1 | collect_features.py | `iou_trace[t] >= 0.5` + full-window guard |
+| lead_time hardcoded ifd5/6-frame window | P1 | eval.py | `label_name`, `horizon` params; event-level |
+| policy.py not using v2 heads | P2 | policy.py | NOTE comment; ifd10/20 in policy_sweep.py |
+| fake AUROC 0.5 for "correct" label | P2 | eval.py | `model_predicted: false` + note field |
+| recompute_labels_v2 silently accepted v0 | P2 | collect_features.py | v1 schema validation |
+| train log said AUPRC(fc) but was composite | P3 | train.py | Renamed to "validation selection score" |
+
+---
+
+## Red Lines (unchanged)
+
+- Do NOT train on `_decide_state()`, TSA states, old scene labels
+- Do NOT claim compute/FPS without oracle labels
+- Do NOT calibrate on train split
+- Do NOT use diagnostic sequences in train
+- Do NOT tune GO gates to get better verdict
+- Do NOT use `pt_inside_gt_ratio` as runtime feature (GT-relative, teacher-only)
+- Do NOT make `hard_dynamic_scene_v2` central without intervention improvement
+- Memory features: if improving val but NOT diagnostic → do NOT claim real improvement
+
+---
+
+
 
 ## Executive Decision
 
