@@ -10,6 +10,7 @@ spatial discontinuity feature.
 from __future__ import annotations
 import argparse
 import json
+import math as _math
 import numpy as np
 from itertools import product
 from pathlib import Path
@@ -398,6 +399,12 @@ def run_policy_sweep(
     return summary
 
 
+def _nanmean(vals: list[float]) -> float:
+    """Return mean of non-NaN values, or NaN if all are NaN."""
+    valid = [v for v in vals if not _math.isnan(v)]
+    return float(np.mean(valid)) if valid else float("nan")
+
+
 def _evaluate_config(
     config: PolicySweepConfig,
     all_preds: dict[str, list[dict[str, float]]],
@@ -421,6 +428,10 @@ def _evaluate_config(
     total_alerted_failures = 0
     lead_times: list[int] = []
 
+    # Per-sequence rate lists for macro (sequence-averaged) metrics
+    seq_tcr_list: list[float] = []
+    seq_wrir_list: list[float] = []
+
     for seq, probs_seq in all_preds.items():
         if seq not in iou_traces:
             continue
@@ -430,6 +441,12 @@ def _evaluate_config(
         ep_vals = eprocess_data.get(seq, [1.0] * n)
         mem_vals = memory_data.get(seq, np.zeros(n, dtype=float))
         bbox_seq = bbox_pred_data.get(seq, None)
+
+        # Per-sequence counters for macro metrics
+        seq_allowed_low_iou = 0
+        seq_allowed = 0
+        seq_wrong_reinit = 0
+        seq_reinit_attempts = 0
 
         # Track failure events for lead-time calculation
         prev_above = False
@@ -471,8 +488,10 @@ def _evaluate_config(
             # Template update metrics
             if step["template_update"] == "allow":
                 total_allowed += 1
+                seq_allowed += 1
                 if frame_iou < 0.5:
                     total_allowed_low_iou += 1
+                    seq_allowed_low_iou += 1
             elif step["template_update"] == "block":
                 total_blocked += 1
                 if frame_iou >= 0.7:
@@ -481,8 +500,10 @@ def _evaluate_config(
             # Recovery metrics
             if step["recovery_action"] == "run":
                 total_reinit_attempts += 1
+                seq_reinit_attempts += 1
                 if frame_iou < 0.3:
                     total_wrong_reinit += 1
+                    seq_wrong_reinit += 1
 
             # Intervention density
             if len(step["triggered_by"]) > 0:
@@ -504,6 +525,13 @@ def _evaluate_config(
                 total_alerted_failures += 1
                 lead_times.append(fail_t - first_alerts[fail_t])
 
+        # Accumulate per-sequence rates for macro metrics
+        seq_tcr = seq_allowed_low_iou / max(seq_allowed, 1)
+        seq_tcr_list.append(seq_tcr)
+        if seq_reinit_attempts > 0:
+            seq_wrir = seq_wrong_reinit / seq_reinit_attempts
+            seq_wrir_list.append(seq_wrir)
+
     template_corruption_rate = (
         total_allowed_low_iou / max(total_allowed, 1)
     )
@@ -514,6 +542,7 @@ def _evaluate_config(
     lead_time_median = float(np.median(lead_times)) if lead_times else float("nan")
 
     return {
+        # Micro (frame-level, existing)
         "template_corruption_rate": round(template_corruption_rate, 4),
         "wrong_reinit_rate": round(wrong_reinit_rate, 4),
         "missed_safe_update_rate": round(missed_safe_update_rate, 4),
@@ -521,6 +550,10 @@ def _evaluate_config(
         "failure_event_recall": round(failure_event_recall, 4),
         "lead_time_median": lead_time_median,
         "total_frames": total_frames,
+        # Macro (sequence-averaged)
+        "macro_tcr": round(_nanmean(seq_tcr_list), 4) if seq_tcr_list else float("nan"),
+        "macro_wrir": round(_nanmean(seq_wrir_list), 4) if seq_wrir_list else float("nan"),
+        "n_seqs_evaluated": len(seq_tcr_list),
     }
 
 

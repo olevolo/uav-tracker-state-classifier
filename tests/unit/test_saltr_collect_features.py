@@ -122,3 +122,51 @@ def test_truncated_sequence_limits_runner_frames():
     assert len(frames_seen) == 20, f"Expected 20 frames, got {len(frames_seen)}"
     assert len(trunc.ground_truth) == 20
     assert trunc.init_bbox is full_gt[0]
+
+
+# ---------------------------------------------------------------------------
+# 4. failure_in_10 requires a full 10-frame window (no partial-horizon positives)
+# ---------------------------------------------------------------------------
+
+def test_failure_in_10_requires_full_window():
+    """Frames without a full 10-frame future window must not be labeled failure_in_10=1.
+
+    Build a 12-frame trace:
+    - Frames 0–1: IoU=0.8 (currently OK), followed by 10 frames of IoU=0.0
+      (so frames 0 and 1 have mean(iou_next10)=0.0 < 0.3).
+    - Frame 0 has t+10=10 <= 12, so a full window exists → must be labeled 1.
+    - Frame 1 has t+10=11 <= 12, so a full window exists → must be labeled 1.
+    - Frame 2 has t+10=12 > 12, so the slice iou_trace[3:13] only has 9 elements
+      → partial window → must NOT be labeled 1 (this is the bug fixed by == 10).
+    With the old `> 0` condition frame 2 would have been a false positive because
+    its 9-element partial window also has mean < 0.3.
+    """
+    from salt_r.collect_features import _compute_v2_extra_labels
+
+    # 12-frame trace: frames 0-1 good (IoU 0.8), frames 2-11 failing (IoU 0.0)
+    iou_trace = np.array(
+        [0.8, 0.8] + [0.0] * 10,
+        dtype=np.float32,
+    )
+    n = len(iou_trace)  # 12
+
+    # Minimal v1 labels — only columns 4 and 5 matter for is_dynamic,
+    # set them to 0 so ifd10/20 are irrelevant here.
+    labels_v1 = np.zeros((n, 10), dtype=np.int8)
+
+    extra = _compute_v2_extra_labels(labels_v1, iou_trace)
+    fi10 = extra[:, 0]  # failure_in_10 column
+
+    # Frames 0 and 1: currently OK (IoU 0.8) and have 10 future failing frames → labeled 1
+    assert fi10[0] == 1, "frame 0 has full 10-frame window with mean IoU 0 — should be 1"
+    assert fi10[1] == 1, "frame 1 has full 10-frame window with mean IoU 0 — should be 1"
+
+    # Frame 2 onwards: IoU already 0.0 so iou_trace[t] >= 0.5 fails → labeled 0 regardless
+    # (also partial window at frame 2 would only contribute 9 elements)
+    assert fi10[2] == 0, "frame 2 has IoU 0.0 (not >= 0.5) — should be 0"
+
+    # Verify no false positives exist beyond frame 1
+    assert fi10[2:].sum() == 0, "no partial-window or already-failed frames should be labeled 1"
+
+    # Extra sanity: only frames 0 and 1 should be positive
+    assert fi10.sum() == 2, f"expected exactly 2 positive frames, got {fi10.sum()}"

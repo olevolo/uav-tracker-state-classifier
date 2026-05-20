@@ -371,6 +371,42 @@ def compute_alert_metrics(
 
 
 # ---------------------------------------------------------------------------
+# Stratified calibration/eval split
+# ---------------------------------------------------------------------------
+
+def _stratified_cal_split(
+    seqs: list[str],
+    cal_fraction: float,
+    seed: int = 42,
+) -> tuple[list[str], list[str]]:
+    """Stratified calibration/eval split keeping dataset proportions.
+
+    Groups sequences by dataset prefix (e.g. 'uav123', 'dtb70', 'visdrone_sot').
+    Within each group, shuffles with fixed seed and takes cal_fraction for calibration.
+    Guarantees each dataset contributes to both calibration and eval sets.
+    """
+    import collections, random as _random
+
+    # Group by dataset prefix (first path component before '/')
+    by_dataset: dict[str, list[str]] = collections.defaultdict(list)
+    for s in seqs:
+        dataset = s.split("/")[0] if "/" in s else "unknown"
+        by_dataset[dataset].append(s)
+
+    cal_seqs: list[str] = []
+    eval_seqs: list[str] = []
+    rng = _random.Random(seed)
+    for dataset, ds_seqs in sorted(by_dataset.items()):
+        shuffled = list(ds_seqs)
+        rng.shuffle(shuffled)
+        n_cal = max(1, int(len(shuffled) * cal_fraction))
+        cal_seqs.extend(shuffled[:n_cal])
+        eval_seqs.extend(shuffled[n_cal:])
+
+    return cal_seqs, eval_seqs
+
+
+# ---------------------------------------------------------------------------
 # Main evaluation
 # ---------------------------------------------------------------------------
 
@@ -390,8 +426,9 @@ def evaluate(
 ) -> dict[str, Any]:
     """Evaluate e-process alerts on all non-diagnostic val sequences.
 
-    Splits sequences lexicographically: first ``cal_fraction`` → calibration,
-    rest → alert evaluation.  Diagnostic sequences are excluded from both.
+    Splits sequences using a stratified split (by dataset prefix) so each
+    dataset contributes proportionally to both calibration and eval sets.
+    Diagnostic sequences are excluded from both.
 
     Parameters
     ----------
@@ -409,9 +446,7 @@ def evaluate(
     all_seqs = sorted(
         s for s in preds if s not in _diag and s in labels and s in iou_traces
     )
-    n_cal = max(1, int(len(all_seqs) * cal_fraction))
-    cal_seqs = all_seqs[:n_cal]
-    eval_seqs = all_seqs[n_cal:]
+    cal_seqs, eval_seqs = _stratified_cal_split(all_seqs, cal_fraction)
 
     # aGRAPAmode does not need a calibration distribution
     if mode == "agrapa":
@@ -515,6 +550,7 @@ def evaluate(
             "n_eval_seqs": len(eval_seqs),
             "n_null_frames": int(len(null_scores)),
             "iou_failure_threshold": iou_failure_threshold,
+            "cal_split": "stratified_by_dataset_seed42",
         },
         "summary": {
             "total_frames": total_frames,

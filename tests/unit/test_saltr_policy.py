@@ -274,3 +274,97 @@ def test_decide_intervention_should_trigger_fallback_requires_critical_and_block
     iv_both = decide_intervention({"false_confirmed": 0.8}, eprocess_value=200.0, alpha=0.10)
     assert iv_both.should_trigger_fallback, \
         "CRITICAL + BLOCK must trigger fallback"
+
+
+# ---------------------------------------------------------------------------
+# Tests for _evaluate_config() macro metrics
+# ---------------------------------------------------------------------------
+
+def _make_fixture(
+    seq_configs: list[dict],
+) -> tuple[dict, dict, dict, dict, dict]:
+    """Build minimal fixture dicts for _evaluate_config().
+
+    seq_configs: list of dicts with keys:
+      - 'name': str sequence name
+      - 'n': int number of frames
+      - 'iou': list/array of IoU values per frame (length n)
+      - 'fc': float false_confirmed probability (constant for all frames)
+      - 'rec': float recoverable probability (constant for all frames)
+    """
+    all_preds = {}
+    iou_traces = {}
+    for sc in seq_configs:
+        name = sc["name"]
+        n = sc["n"]
+        fc = sc.get("fc", 0.0)
+        rec = sc.get("rec", 0.0)
+        all_preds[name] = [
+            {
+                "false_confirmed": fc,
+                "imminent_failure_dynamic_10": 0.0,
+                "imminent_failure_dynamic_20": 0.0,
+                "recoverable": rec,
+                "failure_in_5": 0.0,
+            }
+            for _ in range(n)
+        ]
+        iou_traces[name] = np.array(sc["iou"], dtype=np.float32)
+    return all_preds, iou_traces, {}, {}, {}
+
+
+def test_evaluate_config_has_macro_metrics():
+    """_evaluate_config returns macro_tcr, macro_wrir, and n_seqs_evaluated."""
+    from salt_r.policy_sweep import _evaluate_config, PolicySweepConfig
+
+    # 2 sequences, 20 frames each, varying IoU
+    iou_a = [0.6] * 10 + [0.3] * 10   # seq_a: half high, half low IoU
+    iou_b = [0.2] * 20                 # seq_b: all low IoU
+    all_preds, iou_traces, ep, mem, bbox = _make_fixture([
+        {"name": "seq_a", "n": 20, "iou": iou_a, "fc": 0.01},
+        {"name": "seq_b", "n": 20, "iou": iou_b, "fc": 0.01},
+    ])
+
+    config = PolicySweepConfig(fc_threshold=0.60)
+    result = _evaluate_config(config, all_preds, iou_traces, ep, mem, bbox)
+
+    assert "macro_tcr" in result, "macro_tcr must be present in result"
+    assert "macro_wrir" in result, "macro_wrir must be present in result"
+    assert "n_seqs_evaluated" in result, "n_seqs_evaluated must be present in result"
+    assert result["n_seqs_evaluated"] == 2, (
+        f"Expected n_seqs_evaluated=2, got {result['n_seqs_evaluated']}"
+    )
+
+
+def test_macro_micro_can_differ():
+    """macro_tcr ≈ 0.25 while micro template_corruption_rate reflects frame weight."""
+    from salt_r.policy_sweep import _evaluate_config, PolicySweepConfig
+
+    # seq_a: 20 frames, all IoU=1.0 → tcr_a = 0/20 = 0.0
+    # seq_b: 20 frames, all IoU=0.2  → tcr_b = 20/20 = 1.0 (all allowed updates are corrupt)
+    # macro = (0.0 + 1.0) / 2 = 0.5  (seq-averaged)
+    # micro = 20 / 40 = 0.5  (frame-weighted; happens to be same here by symmetry)
+
+    # To make them differ, use unequal frame counts:
+    # seq_a: 30 frames all IoU=1.0  → tcr_a=0.0
+    # seq_b: 10 frames all IoU=0.2  → tcr_b=1.0
+    # macro = (0.0 + 1.0) / 2 = 0.5
+    # micro = 10 / 40 = 0.25   (frame-weighted; 10 corrupt out of 40 total allowed)
+    iou_a = [1.0] * 30
+    iou_b = [0.2] * 10
+    all_preds, iou_traces, ep, mem, bbox = _make_fixture([
+        {"name": "seq_a", "n": 30, "iou": iou_a, "fc": 0.01},
+        {"name": "seq_b", "n": 10, "iou": iou_b, "fc": 0.01},
+    ])
+
+    config = PolicySweepConfig(fc_threshold=0.60)
+    result = _evaluate_config(config, all_preds, iou_traces, ep, mem, bbox)
+
+    macro = result["macro_tcr"]
+    micro = result["template_corruption_rate"]
+
+    assert abs(macro - 0.5) < 0.01, f"Expected macro_tcr≈0.5, got {macro}"
+    assert abs(micro - 0.25) < 0.01, f"Expected template_corruption_rate≈0.25, got {micro}"
+    assert abs(macro - micro) > 0.1, (
+        f"macro ({macro}) and micro ({micro}) should differ in this scenario"
+    )

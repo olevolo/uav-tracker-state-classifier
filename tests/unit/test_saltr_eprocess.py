@@ -6,6 +6,7 @@ import pytest
 from salt_r.eprocess import (
     _DIAGNOSTIC_SEQS,
     _failure_events,
+    _stratified_cal_split,
     build_null_distribution,
     compute_alert_metrics,
     compute_quality_score,
@@ -825,4 +826,86 @@ class TestEvaluateAcceptsDiagnosticSeqsParam:
         quality = rng.uniform(0.0, 1.0, 80).astype(np.float32)
         E, _ = run_eprocess_agrapa(quality, epsilon=0.5, alpha=0.10, window=20)
         assert np.all(E >= 0.0), f"E-process must be >= 0.0 everywhere; min={E.min():.6f}"
+
+
+# ---------------------------------------------------------------------------
+# _stratified_cal_split tests
+# ---------------------------------------------------------------------------
+
+class TestStratifiedCalSplit:
+    def _make_seqs(self):
+        """30 sequences: 15 uav123, 10 dtb70, 5 visdrone_sot."""
+        seqs = []
+        for i in range(15):
+            seqs.append(f"uav123/seq_{i:02d}")
+        for i in range(10):
+            seqs.append(f"dtb70/seq_{i:02d}")
+        for i in range(5):
+            seqs.append(f"visdrone_sot/seq_{i:02d}")
+        return seqs
+
+    def test_stratified_cal_split_proportional(self):
+        """Cal set has sequences from all 3 datasets, len(cal) ~ 0.40 * 30."""
+        seqs = self._make_seqs()
+        cal, evl = _stratified_cal_split(seqs, cal_fraction=0.40)
+
+        # All three datasets must be represented in calibration
+        cal_datasets = {s.split("/")[0] for s in cal}
+        assert "uav123" in cal_datasets, "uav123 must appear in cal set"
+        assert "dtb70" in cal_datasets, "dtb70 must appear in cal set"
+        assert "visdrone_sot" in cal_datasets, "visdrone_sot must appear in cal set"
+
+        # Total cal size should be close to 40% of 30
+        expected = int(0.40 * 30)  # 12
+        assert abs(len(cal) - expected) <= 2, (
+            f"len(cal)={len(cal)} should be within ±2 of {expected}"
+        )
+
+        # No overlap between cal and eval
+        assert set(cal).isdisjoint(set(evl)), "cal and eval must not overlap"
+
+        # Together they cover all sequences
+        assert set(cal) | set(evl) == set(seqs), "cal + eval must cover all sequences"
+
+    def test_stratified_cal_split_deterministic(self):
+        """Same seed gives same result; different seed gives different result."""
+        seqs = self._make_seqs()
+
+        cal_a, evl_a = _stratified_cal_split(seqs, cal_fraction=0.40, seed=42)
+        cal_b, evl_b = _stratified_cal_split(seqs, cal_fraction=0.40, seed=42)
+        assert cal_a == cal_b, "Same seed must produce identical cal sets"
+        assert evl_a == evl_b, "Same seed must produce identical eval sets"
+
+        cal_c, _ = _stratified_cal_split(seqs, cal_fraction=0.40, seed=99)
+        assert cal_a != cal_c, "Different seeds must produce different cal sets"
+
+    def test_evaluate_config_has_cal_split(self):
+        """evaluate() result['config'] must contain cal_split == 'stratified_by_dataset_seed42'."""
+        label_names = [
+            "correct", "false_confirmed", "failure_in_5", "recoverable",
+            "target_dynamic", "camera_dynamic", "hard_dynamic_scene",
+            "needs_full_compute", "hard_dynamic_scene_v2",
+            "imminent_failure_dynamic", "failure_in_10", "failure_in_20",
+            "imminent_failure_dynamic_10", "imminent_failure_dynamic_20",
+        ]
+        n_frames = 50
+        preds: dict = {}
+        labels: dict = {}
+        ious: dict = {}
+        for i in range(8):
+            seq = f"uav123/seq{i:02d}"
+            preds[seq] = [
+                {"false_confirmed": 0.1, "imminent_failure_dynamic": 0.1,
+                 "failure_in_5": 0.05, "imminent_failure_dynamic_20": 0.05}
+            ] * n_frames
+            labels[seq] = np.zeros((n_frames, 14), dtype=np.int8)
+            ious[seq] = np.ones(n_frames, dtype=np.float32)
+
+        result = evaluate(
+            preds, labels, ious, label_names,
+            alpha=0.10, epsilon=0.5, mode="formal",
+        )
+        assert result["config"]["cal_split"] == "stratified_by_dataset_seed42", (
+            f"Expected 'stratified_by_dataset_seed42', got {result['config'].get('cal_split')!r}"
+        )
 

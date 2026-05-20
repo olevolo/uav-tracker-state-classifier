@@ -102,12 +102,15 @@ def compute_memory_features_for_sequence(
         # Read apce_norm from features
         apce_norm = float(feat_t[apce_norm_feat_idx]) if features.shape[1] > apce_norm_feat_idx else 0.0
 
-        # Derive secondary_peak_ratio from n_secondary feature
-        # n_secondary > 0 indicates a secondary peak exists.
-        # We approximate the ratio as: min(n_secondary / 3, 1.0) as a
-        # simple proxy for "how strong is the distractor signal".
-        n_secondary = float(feat_t[n_secondary_feat_idx]) if features.shape[1] > n_secondary_feat_idx else 0.0
-        secondary_peak_ratio = float(np.clip(n_secondary / 3.0, 0.0, 1.0))
+        # Distractor signal: prefer p_fc proxy when preds available (n_secondary=0 in SGLATrack).
+        # When p_fc is high, the tracker is likely on a distractor — treat as distractor candidate.
+        # When preds not available, fall back to n_secondary from telemetry (usually 0).
+        if preds is not None and fc_pred_idx >= 0 and fc_pred_idx < preds.shape[1]:
+            # p_fc > 0.4 → strong distractor signal proxy; smooth via clip
+            secondary_peak_ratio = float(np.clip(float(preds[t, fc_pred_idx]) / 0.4, 0.0, 1.0))
+        else:
+            n_secondary = float(feat_t[n_secondary_feat_idx]) if features.shape[1] > n_secondary_feat_idx else 0.0
+            secondary_peak_ratio = float(np.clip(n_secondary / 3.0, 0.0, 1.0))
 
         # p_fc: use model prediction if available, else oracle from label
         if preds is not None and fc_pred_idx >= 0 and fc_pred_idx < preds.shape[1]:
@@ -127,7 +130,14 @@ def compute_memory_features_for_sequence(
 
         iou_t = float(iou_trace[t])
 
-        # Step memory
+        # Compute memory features BEFORE updating memory with this frame
+        # → features at t reflect only frames 0..t-1 (causal, no same-frame leakage)
+        feat_dict = mem.compute_features(query_emb=embedding, query_bbox=None)
+
+        for fi, fname in enumerate(MEMORY_FEATURE_NAMES):
+            result[t, fi] = float(feat_dict[fname])
+
+        # Now update memory with frame t's information
         mem.step(
             frame_idx=t,
             embedding=embedding,
@@ -138,12 +148,6 @@ def compute_memory_features_for_sequence(
             iou=iou_t,
             bbox=None,
         )
-
-        # Compute memory features for this frame
-        feat_dict = mem.compute_features(query_emb=embedding, query_bbox=None)
-
-        for fi, fname in enumerate(MEMORY_FEATURE_NAMES):
-            result[t, fi] = float(feat_dict[fname])
 
     return result
 
@@ -235,6 +239,15 @@ def collect_memory_sidecar(
     out["memory_feature_names"] = np.array(MEMORY_FEATURE_NAMES, dtype=object)
     out["created_at"] = np.array(datetime.now(tz=timezone.utc).isoformat())
     out["source_npz_md5"] = np.array(_md5_file(npz_v2_path))
+    out["uses_oracle_labels"] = np.array(preds_json_path is None)
+    out["distractor_source"] = np.array(
+        "fc_proxy_t0.4" if preds_json_path is not None else "oracle_fc_label"
+    )
+    if preds_json_path is not None:
+        out["source_preds_md5"] = np.array(_md5_file(preds_json_path))
+    else:
+        out["source_preds_md5"] = np.array("oracle")
+    out["source_split"] = np.array("val")
 
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(output_path, **out)

@@ -1045,12 +1045,16 @@ def _compute_v2_extra_labels(
         iou_10 = iou_trace[t + 1 : t + 11]
         iou_20 = iou_trace[t + 1 : t + 21]
 
-        # failure_in_10: currently OK, mean future IoU < 0.3 over 10-frame horizon
-        if iou_trace[t] >= 0.5 and len(iou_10) > 0 and float(iou_10.mean()) < 0.3:
+        # Require full 10/20-frame window — partial horizons near sequence end are excluded.
+        # Note: existing salt_rd_v2_labels.npz has ~4/17 partial positives; rerun
+        # recompute_labels_v2() to regenerate clean labels.
+
+        # failure_in_10: currently OK, mean future IoU < 0.3 over full 10-frame horizon
+        if iou_trace[t] >= 0.5 and len(iou_10) == 10 and float(iou_10.mean()) < 0.3:
             fi10[t] = 1
 
-        # failure_in_20: same but 20-frame horizon
-        if iou_trace[t] >= 0.5 and len(iou_20) > 0 and float(iou_20.mean()) < 0.3:
+        # failure_in_20: same but full 20-frame horizon
+        if iou_trace[t] >= 0.5 and len(iou_20) == 20 and float(iou_20.mean()) < 0.3:
             fi20[t] = 1
 
         # imminent_failure_dynamic_10: currently OK + dynamic scene + min IoU < 0.3 in next 10
