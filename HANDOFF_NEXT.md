@@ -86,6 +86,207 @@ ifd20 AUROC:            0.554
 
 ---
 
+## Fallback Tree And Pivot Rules
+
+We should keep a clear fallback tree so the project does not overfit emotionally or technically to one path. The core principle:
+
+> Do not discard SALT-RD too early. Narrow the claim first. If controller signals plateau, split the work into two tracks: **SALT-RD for trust/intervention** and **SALT-AUC for tracker/domain adaptation**.
+
+### If e-process does not improve recall
+
+Fallback: keep e-process as an analysis / monitoring metric, not as the runtime decision mechanism.
+
+Runtime policy becomes calibrated risk hysteresis:
+
+```text
+p_ifd10 > t_high  -> verify / expand search
+p_ifd10 < t_low   -> release
+p_fc > t_fc       -> block template update and block/reject recovery
+```
+
+This removes the formal anytime-valid alerting claim, but gives a more practical latency/recall operating point. The claim becomes:
+
+```text
+risk-aware intervention policy
+```
+
+not:
+
+```text
+anytime-valid sequential alerting
+```
+
+Use this fallback if:
+
+- e-process event recall stays below 10-20%;
+- seq-level FAR remains high after fixing calibration/plumbing;
+- e-process adds lead time but suppresses too many true events.
+
+Keep reporting e-process as an offline analysis table if it still has strong precision or useful lead time.
+
+### If DAM proxy memory does not improve false_confirmed
+
+This is expected. The current sidecar uses proxy embeddings from 28 scalar telemetry features, which is not true appearance memory.
+
+Fallback ladder:
+
+1. Use crop embeddings from SGLATrack / SGLA trunk.
+2. If weak, use DINOv2 / DINOv3 crop embeddings offline.
+3. If still weak, use CLIP / distilled DINO only as teacher features, not runtime dependencies.
+
+The goal of memory is:
+
+```text
+current target crop looks closer to target memory than to distractor memory
+```
+
+not:
+
+```text
+current telemetry vector looks like old telemetry vector
+```
+
+Use proxy memory only as a plumbing ablation. Do not make DAM-style scientific claims until real crop/appearance embeddings are tested.
+
+### If real DAM memory does not improve diagnostic false_confirmed
+
+Then the failure is probably representation quality, not memory mechanics.
+
+Fallbacks:
+
+- add explicit distractor candidate features:
+  - secondary peak crop similarity;
+  - top-2 response peak margin;
+  - top-2 appearance margin;
+  - distractor count near predicted bbox;
+- replace scalar memory margin with a contrastive distractor head;
+- train with Siamese / ranking loss:
+
+```text
+sim(target_memory, current_crop) > sim(distractor_memory, current_crop) + margin
+```
+
+- try dataset/class-specific adapter or LoRAT-style parameter-efficient adaptation.
+
+Decision rule:
+
+- if real memory improves global val but not diagnostic split, treat it as overfit;
+- if diagnostic `false_confirmed` AUROC stays below 0.65, do not claim hard-case identity-drift robustness;
+- if diagnostic AUROC reaches 0.70-0.75, Phase 4B becomes the central trust result.
+
+### If CoTracker3 teacher fails on small UAV targets
+
+Likely cause: UAV targets are often 5-20 px, so point tracking may be unstable.
+
+Fallback ladder:
+
+1. Upscale target/search crop before point tracking.
+2. Seed fewer but denser points inside the bbox.
+3. Try TAPIR / BootsTAP / RAFT / GMFlow as offline teacher instead of CoTracker3.
+4. Use SAM2 / EfficientTAM region consistency offline only.
+5. Replace point consistency with forward-backward tracker cycle consistency:
+
+```text
+track forward N frames
+track backward to the start
+measure bbox cycle error
+```
+
+Do not run CoTracker3, SAM2, DINO, or CLIP in the edge runtime loop unless explicitly framed as a rare fallback mode.
+
+### If corrected ifd10 / ifd20 labels are too sparse
+
+The corrected labels are honest but rare. Binary BCE may be the wrong learning objective.
+
+Fallbacks:
+
+- regress `time_to_failure`;
+- regress `min_future_iou_10` / `min_future_iou_20`;
+- regress `iou_drop_slope`;
+- use ordinal heads:
+
+```text
+failure within 5 / 10 / 20 / 40 frames
+```
+
+- use survival modeling / hazard rate instead of BCE;
+- add sequence-balanced positive sampler;
+- expand positives to the last `K` frames before an event, not only isolated frames.
+
+Preferred fallback: survival / hazard modeling. It matches the real problem better:
+
+```text
+risk increases before failure
+```
+
+instead of:
+
+```text
+this single frame is positive or negative
+```
+
+### If policy replay does not transfer to runtime
+
+Do not make a deployment claim.
+
+Fallbacks:
+
+- present an offline safe-intervention oracle benchmark;
+- replay on recorded tracker trajectories;
+- use conservative runtime only:
+  - block or verify template update;
+  - do not automatically run recovery/fallback;
+- run small-subset rollout only after offline gates pass.
+
+The safest deployment action is:
+
+```text
+block / verify template update
+```
+
+It usually harms less than wrong re-initialization.
+
+### If tracker AUC does not improve
+
+This is acceptable for SALT-RD. SALT-RD's core claim is trust and intervention safety, not tracker backbone accuracy.
+
+If the goal becomes AUC improvement, open a separate track:
+
+```text
+SALT-AUC = tracker/domain adaptation
+```
+
+Options:
+
+- fine-tune SGLATrack / LoRAT on UAV123 + VisDrone + DTB70-like data;
+- replace base tracker with a stronger lightweight UAV tracker;
+- add class-agnostic re-detector / fallback;
+- improve recovery with spatial hint / crop detector;
+- train detector-assisted re-acquisition head.
+
+Rule:
+
+- SALT-RD = trust controller;
+- SALT-AUC = tracker or domain adaptation work.
+
+### Fallback Priority
+
+1. Fix plumbing and run honest v2-aware policy replay.
+2. If e-process is weak, use calibrated hysteresis risk policy.
+3. If proxy memory is weak, move to real crop embeddings.
+4. If real memory is weak, train a contrastive distractor head.
+5. If CoTracker3 is weak, try crop-upscaled TAPIR / RAFT / forward-backward cycle.
+6. If all controller signals plateau, pivot to LoRAT / domain adaptation for actual AUC.
+
+Most realistic fallback:
+
+```text
+Keep SALT-RD, but narrow the claim to safe template/recovery gating.
+Open a separate AUC/FPS track only if the user goal becomes tracker accuracy or compute.
+```
+
+---
+
 ## Concrete Next Task: Phase 4B — Train SALT-RD v2.1 with Memory Features
 
 ### What to do

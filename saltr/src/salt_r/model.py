@@ -54,16 +54,19 @@ class SALTRD(nn.Module):
         dropout: float = 0.2,
         window: int = 20,
         head_names: list[str] | None = None,
+        memory_dim: int = 0,
     ) -> None:
         super().__init__()
         self.window = window
         self.n_features = n_features
+        self.memory_dim = memory_dim
         self.hidden_dim = hidden_dim
         _heads = head_names if head_names is not None else HEAD_NAMES
 
-        self.input_norm = nn.LayerNorm(n_features)
+        actual_input = n_features + memory_dim
+        self.input_norm = nn.LayerNorm(actual_input)
         self.gru = nn.GRU(
-            input_size=n_features,
+            input_size=actual_input,
             hidden_size=hidden_dim,
             num_layers=n_layers,
             batch_first=True,
@@ -120,9 +123,17 @@ class SALTRD(nn.Module):
 
 def build_model(checkpoint: str | None = None, device: str = "cpu") -> SALTRD:
     """Build SALTRD model, optionally loading a checkpoint."""
-    model = SALTRD()
     if checkpoint:
         state = torch.load(checkpoint, map_location=device)
-        model.load_state_dict(state["model_state_dict"])
+        ckpt_data = state if isinstance(state, dict) else {}
+        memory_dim = int(ckpt_data.get("memory_dim", 0))
+        head_names = ckpt_data.get("head_names", None)
+        model = SALTRD(memory_dim=memory_dim, head_names=head_names)
+        if "model_state_dict" in ckpt_data:
+            model.load_state_dict(ckpt_data["model_state_dict"])
+        else:
+            model.load_state_dict(state)
+    else:
+        model = SALTRD()
     model.to(device)
     return model

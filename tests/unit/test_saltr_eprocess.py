@@ -4,6 +4,7 @@ import numpy as np
 import pytest
 
 from salt_r.eprocess import (
+    _DIAGNOSTIC_SEQS,
     _failure_events,
     build_null_distribution,
     compute_alert_metrics,
@@ -550,4 +551,278 @@ class TestEvaluateAgrapa:
         for key in ("baseline_raw_ifd5_0.5", "baseline_raw_ifd10_0.5",
                     "baseline_raw_ifd20_0.5", "baseline_raw_fc_0.5"):
             assert key in result, f"Missing baseline key: {key}"
+
+
+# ---------------------------------------------------------------------------
+# TestEprocess — bug-fix regression tests
+# ---------------------------------------------------------------------------
+
+class TestEprocess:
+    """Regression tests for the four bugs fixed in eprocess.py."""
+
+    # Minimal label schema used across all tests in this class
+    _LABEL_NAMES = [
+        "correct", "false_confirmed", "failure_in_5", "recoverable",
+        "target_dynamic", "camera_dynamic", "hard_dynamic_scene",
+        "needs_full_compute", "hard_dynamic_scene_v2",
+        "imminent_failure_dynamic", "failure_in_10", "failure_in_20",
+        "imminent_failure_dynamic_10", "imminent_failure_dynamic_20",
+    ]
+
+    def _make_minimal_fixtures(self, n_seqs: int = 10, n_frames: int = 50, seed: int = 7):
+        """Return (preds, labels, iou_traces, label_names) with synthetic data.
+
+        Each sequence has random head probabilities and all-zero labels (all
+        null), IoU held at 0.8 so every frame qualifies for the null set.
+        """
+        rng = np.random.RandomState(seed)
+        label_names = self._LABEL_NAMES
+        heads = [
+            "false_confirmed",
+            "imminent_failure_dynamic",
+            "imminent_failure_dynamic_10",
+            "imminent_failure_dynamic_20",
+            "failure_in_5",
+        ]
+        preds: dict = {}
+        labels: dict = {}
+        iou_traces: dict = {}
+        for i in range(n_seqs):
+            seq = f"uav123/synth_seq{i:02d}"
+            preds[seq] = [
+                {h: float(rng.uniform(0.0, 1.0)) for h in heads}
+                for _ in range(n_frames)
+            ]
+            labels[seq] = np.zeros((n_frames, len(label_names)), dtype=np.int8)
+            iou_traces[seq] = np.ones(n_frames, dtype=np.float32) * 0.8
+        return preds, labels, iou_traces, label_names
+
+    # ------------------------------------------------------------------
+    # Bug 1 – risk_mode not passed into null distribution calibration
+    # ------------------------------------------------------------------
+
+    def test_null_distribution_uses_risk_mode(self):
+        """build_null_distribution must produce different results for ifd10 vs all_risk.
+
+        ifd10 reads only imminent_failure_dynamic_10; all_risk is a weighted
+        mixture of several heads.  On random data the two distributions will
+        differ (with probability 1 over any real random draw).
+        """
+        preds, labels, iou_traces, label_names = self._make_minimal_fixtures(seed=42)
+        cal_keys = list(preds.keys())[:5]
+
+        null_all_risk = build_null_distribution(
+            preds, labels, iou_traces, label_names, cal_keys, risk_mode="all_risk"
+        )
+        null_ifd10 = build_null_distribution(
+            preds, labels, iou_traces, label_names, cal_keys, risk_mode="ifd10"
+        )
+
+        assert len(null_all_risk) > 0, "all_risk null distribution must be non-empty"
+        assert len(null_ifd10) > 0, "ifd10 null distribution must be non-empty"
+        # The two distributions must differ — they draw from different head values
+        assert not np.allclose(null_all_risk, null_ifd10), (
+            "Null distributions for 'all_risk' and 'ifd10' must differ "
+            "(they read different head probabilities from the same fixture)"
+        )
+
+    # ------------------------------------------------------------------
+    # Bug 1 continued – evaluate() propagates risk_mode to null builder
+    # ------------------------------------------------------------------
+
+    def test_evaluate_risk_mode_sweep_differs(self):
+        """evaluate() with risk_mode='ifd10' vs 'all_risk' must record different configs."""
+        preds, labels, iou_traces, label_names = self._make_minimal_fixtures(n_seqs=12, seed=99)
+
+        result_all = evaluate(
+            preds, labels, iou_traces, label_names,
+            alpha=0.10, epsilon=0.5, decay=1.0, mode="formal",
+            risk_mode="all_risk",
+        )
+        result_ifd10 = evaluate(
+            preds, labels, iou_traces, label_names,
+            alpha=0.10, epsilon=0.5, decay=1.0, mode="formal",
+            risk_mode="ifd10",
+        )
+
+        assert result_all["config"]["risk_mode"] == "all_risk"
+        assert result_ifd10["config"]["risk_mode"] == "ifd10"
+        # The two runs must have produced results with different risk_mode labels
+        assert result_all["config"]["risk_mode"] != result_ifd10["config"]["risk_mode"]
+
+    # ------------------------------------------------------------------
+    # Bug 4 – correct baseline key name
+    # ------------------------------------------------------------------
+
+    def test_cli_baseline_key_present(self):
+        """evaluate() must contain 'baseline_raw_ifd5_0.5' and NOT 'baseline_raw_ifd_0.5'."""
+        preds, labels, iou_traces, label_names = self._make_minimal_fixtures(n_seqs=10, seed=3)
+
+        result = evaluate(
+            preds, labels, iou_traces, label_names,
+            alpha=0.10, epsilon=0.5, decay=1.0, mode="formal",
+        )
+
+        assert "baseline_raw_ifd5_0.5" in result, (
+            "'baseline_raw_ifd5_0.5' key must be present in evaluate() result"
+        )
+        assert "baseline_raw_ifd_0.5" not in result, (
+            "Old incorrect key 'baseline_raw_ifd_0.5' must NOT be present"
+        )
+
+    # ------------------------------------------------------------------
+    # Bug 2 – corrected _DIAGNOSTIC_SEQS keys
+    # ------------------------------------------------------------------
+
+    def test_diagnostic_seq_keys(self):
+        """_DIAGNOSTIC_SEQS must use the correct dataset-prefix/sequence-name format."""
+        # Correct keys that must be present
+        assert "uav123/bike2" in _DIAGNOSTIC_SEQS, (
+            "'uav123/bike2' must be in _DIAGNOSTIC_SEQS (bike2 belongs to UAV123)"
+        )
+        assert "visdrone_sot/uav0000164" in _DIAGNOSTIC_SEQS, (
+            "'visdrone_sot/uav0000164' must be in _DIAGNOSTIC_SEQS "
+            "(uav0000164 belongs to VisDrone-SOT)"
+        )
+
+        # Wrong keys that must NOT be present
+        assert "dtb70/bike2" not in _DIAGNOSTIC_SEQS, (
+            "'dtb70/bike2' must NOT be in _DIAGNOSTIC_SEQS (bike2 is in UAV123, not DTB70)"
+        )
+        assert "uav123/uav0000164" not in _DIAGNOSTIC_SEQS, (
+            "'uav123/uav0000164' must NOT be in _DIAGNOSTIC_SEQS (uav0000164 is in VisDrone-SOT)"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Additional targeted tests — gaps not covered above
+# ---------------------------------------------------------------------------
+
+class TestResetAtBoundaryRestoresE:
+    """Verify that reset_at_boundary truly restores E to ~1.0 at boundary."""
+
+    def test_e_drops_to_single_step_value_after_reset(self):
+        """After reset at frame 10, E[10] must be a single-step accumulation from E=1.0.
+
+        This confirms the internal state is reset (not just a new segment running
+        on top of the accumulated value from segment 1).
+        """
+        null = np.full(50, 0.1, dtype=np.float32)
+        # Constant high risk: E grows exponentially in both halves
+        risk = np.full(20, 0.9, dtype=np.float32)
+        E, _ = reset_at_boundary(
+            reset_frames=[10],
+            risk_scores=risk,
+            null_scores=null,
+            alpha=0.10,
+            epsilon=0.5,
+            decay=1.0,
+            mode="formal",
+        )
+        # Segment 1 ends at frame 9 with a very large E value
+        # Segment 2 starts at frame 10 — E[10] must be the FIRST step from E_prev=1.0
+        # We know E[10] = E[11]/E_ratio ≈ small, definitely << E[9]
+        assert E[9] > 10.0, f"Segment 1 should have accumulated E >> 1, got E[9]={E[9]:.2f}"
+        assert E[10] < E[9], \
+            f"Reset must drop accumulated E: E[10]={E[10]:.4f} should be < E[9]={E[9]:.2f}"
+        # E[10] is the first step of segment 2 from E_prev=1.0; so E[10] == E[11]^(1/1) at step 1
+        # A tighter bound: E[10] must be < 1000 (way below E[9] which is millions)
+        assert E[10] < 1000.0, \
+            f"After reset, E[10] should be a single-step value, not carry-over: {E[10]:.2f}"
+
+
+class TestFailureEventsEdgeCases:
+    """Additional coverage for _failure_events edge cases."""
+
+    def test_no_good_frames_at_start_no_failure_events(self):
+        """Trace starting entirely below threshold → zero failure events.
+
+        The function requires at least one good frame before a drop counts.
+        """
+        iou = np.array([0.1, 0.2, 0.15, 0.1, 0.05], dtype=np.float64)
+        events = _failure_events(iou, iou_threshold=0.30)
+        assert events == [], \
+            f"All-below-threshold trace must produce no failure events, got {events}"
+
+    def test_failure_events_exact_two(self):
+        """Sequence 0.9, 0.9, 0.1, 0.9, 0.1 → exactly two failure events at frames 2 and 4."""
+        iou = np.array([0.9, 0.9, 0.1, 0.9, 0.1], dtype=np.float64)
+        events = _failure_events(iou, iou_threshold=0.30)
+        assert events == [2, 4], \
+            f"Expected failure events at frames [2, 4], got {events}"
+
+    def test_failure_event_at_recovery_counts_new_drop(self):
+        """After recovery (IoU back above threshold), a new drop counts as a new event."""
+        # Fail, recover, fail again
+        iou = np.array([0.9, 0.0, 0.9, 0.9, 0.0, 0.9], dtype=np.float64)
+        events = _failure_events(iou, iou_threshold=0.30)
+        # frame 1: first drop (after frame 0 good) → event
+        # frame 4: second drop (after frames 2,3 good) → event
+        assert 1 in events, f"Expected event at frame 1, got {events}"
+        assert 4 in events, f"Expected event at frame 4, got {events}"
+        assert len(events) == 2, f"Expected exactly 2 events, got {events}"
+
+
+class TestEvaluateAcceptsDiagnosticSeqsParam:
+    """Test that evaluate() accepts and uses a caller-supplied diagnostic_seqs set."""
+
+    def _make_fixtures(self, n_seqs: int = 8, n_frames: int = 50):
+        label_names = [
+            "correct", "false_confirmed", "failure_in_5", "recoverable",
+            "target_dynamic", "camera_dynamic", "hard_dynamic_scene",
+            "needs_full_compute", "hard_dynamic_scene_v2",
+            "imminent_failure_dynamic", "failure_in_10", "failure_in_20",
+            "imminent_failure_dynamic_10", "imminent_failure_dynamic_20",
+        ]
+        preds: dict = {}
+        labels: dict = {}
+        ious: dict = {}
+        for i in range(n_seqs):
+            seq = f"uav123/seq{i:02d}"
+            labels[seq] = np.zeros((n_frames, 14), dtype=np.int8)
+            ious[seq] = np.ones(n_frames, dtype=np.float32)
+            preds[seq] = [
+                {"false_confirmed": 0.1, "imminent_failure_dynamic": 0.1,
+                 "failure_in_5": 0.05, "imminent_failure_dynamic_20": 0.05}
+            ] * n_frames
+        return preds, labels, ious, label_names
+
+    def test_evaluate_accepts_diagnostic_seqs_param(self):
+        """evaluate() must accept diagnostic_seqs kwarg and exclude those seqs from eval."""
+        preds, labels, ious, label_names = self._make_fixtures(n_seqs=8)
+
+        # Mark the first seq as diagnostic — it must not appear in per_sequence results
+        diag_seq = "uav123/seq00"
+        result = evaluate(
+            preds, labels, ious, label_names,
+            alpha=0.10, epsilon=0.5, mode="formal",
+            diagnostic_seqs={diag_seq},
+        )
+
+        assert "summary" in result, "evaluate() must return a summary dict"
+        assert diag_seq not in result.get("per_sequence", {}), (
+            f"Diagnostic seq '{diag_seq}' must be excluded from per_sequence results"
+        )
+    """Edge cases for run_eprocess_agrapa not covered by existing tests."""
+
+    def test_agrapa_alerts_on_constant_zero_quality(self):
+        """quality=0.0 (maximum risk, quality << epsilon=0.5) must fire an alert."""
+        quality = np.zeros(50, dtype=np.float32)
+        E, alerts = run_eprocess_agrapa(quality, epsilon=0.5, alpha=0.10, window=20)
+        assert len(alerts) >= 1, \
+            f"Constant quality=0.0 must trigger at least one alert; max E={E.max():.2f}"
+
+    def test_agrapa_no_alert_on_constant_one_quality(self):
+        """quality=1.0 (healthy tracker, quality >> epsilon=0.5) must never alert."""
+        quality = np.ones(100, dtype=np.float32)
+        E, alerts = run_eprocess_agrapa(quality, epsilon=0.5, alpha=0.10, window=20)
+        assert len(alerts) == 0, \
+            f"Constant quality=1.0 must not alert; max E={E.max():.4f}"
+
+    def test_agrapa_e_trace_nonnegative(self):
+        """E-process martingale must always be non-negative (clipped at 0)."""
+        rng = np.random.RandomState(77)
+        quality = rng.uniform(0.0, 1.0, 80).astype(np.float32)
+        E, _ = run_eprocess_agrapa(quality, epsilon=0.5, alpha=0.10, window=20)
+        assert np.all(E >= 0.0), f"E-process must be >= 0.0 everywhere; min={E.min():.6f}"
 

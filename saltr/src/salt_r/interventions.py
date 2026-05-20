@@ -21,6 +21,7 @@ class TemplateUpdateAction(str, Enum):
 
 
 class RecoveryAction(str, Enum):
+    NONE = "none"
     RUN = "run"
     VERIFY = "verify"
     ABSTAIN = "abstain"
@@ -50,7 +51,7 @@ class AlertTier(str, Enum):
 class TrackerIntervention:
     """Complete intervention specification for one frame."""
     template_update: TemplateUpdateAction = TemplateUpdateAction.ALLOW
-    recovery_action: RecoveryAction = RecoveryAction.RUN
+    recovery_action: RecoveryAction = RecoveryAction.NONE
     compute_mode: ComputeMode = ComputeMode.ADAPTIVE
     search_mode: SearchMode = SearchMode.NORMAL
     alert_tier: AlertTier = AlertTier.NONE
@@ -172,14 +173,12 @@ def decide_intervention(
     # -----------------------------------------------------------------------
     # Priority 6: recovery decision
     # -----------------------------------------------------------------------
-    # Only run recovery when NOT in fc_block state and fc is sufficiently low
-    if not fc_block and intervention.recovery_action == RecoveryAction.RUN:
-        if p_rec >= reinit_reject_threshold and p_fc < 0.40:
-            # Allow recovery
-            triggered.append(f"recoverable={p_rec:.2f}")
-        elif p_rec < reinit_reject_threshold:
-            # Default: no explicit recovery signal
-            intervention.recovery_action = RecoveryAction.RUN  # stays as default
+    # Only explicitly run recovery when NOT in fc_block state,
+    # p_rec is high, and fc is low.
+    if not fc_block and p_rec >= reinit_reject_threshold and p_fc < 0.40:
+        intervention.recovery_action = RecoveryAction.RUN
+        triggered.append(f"recoverable={p_rec:.2f}")
+    # else: stays NONE (deployment-safe default)
 
     intervention.triggered_by = triggered
     return intervention

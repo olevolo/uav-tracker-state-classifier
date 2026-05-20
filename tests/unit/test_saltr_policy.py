@@ -167,3 +167,110 @@ def test_replay_policy_template_corruption_rate():
         "Low false_confirmed -> should rarely block updates"
     assert result["template_corruption_rate"] > 0.5, \
         "IoU=0.3 + allowed updates -> corruption rate should be high"
+
+
+# ---------------------------------------------------------------------------
+# Tests for decide_intervention() — v2-aware intervention logic
+# ---------------------------------------------------------------------------
+
+def test_decide_intervention_none_by_default():
+    """Empty probs with default thresholds → safe no-op defaults."""
+    from salt_r.interventions import (
+        decide_intervention, RecoveryAction, TemplateUpdateAction, AlertTier
+    )
+    iv = decide_intervention({})
+    assert iv.recovery_action == RecoveryAction.NONE, \
+        f"Default recovery_action should be NONE, got {iv.recovery_action}"
+    assert iv.template_update == TemplateUpdateAction.ALLOW, \
+        f"Default template_update should be ALLOW, got {iv.template_update}"
+    assert iv.alert_tier == AlertTier.NONE, \
+        f"Default alert_tier should be NONE, got {iv.alert_tier}"
+    assert iv.triggered_by == [], \
+        f"No triggers should fire on empty probs, got {iv.triggered_by}"
+
+
+def test_decide_intervention_fc_block():
+    """High p_fc (0.8 > 0.65 threshold) → BLOCK + ABSTAIN + fc_block in triggered_by."""
+    from salt_r.interventions import (
+        decide_intervention, RecoveryAction, TemplateUpdateAction
+    )
+    iv = decide_intervention({"false_confirmed": 0.8})
+    assert iv.template_update == TemplateUpdateAction.BLOCK, \
+        f"Expected BLOCK, got {iv.template_update}"
+    assert iv.recovery_action == RecoveryAction.ABSTAIN, \
+        f"Expected ABSTAIN, got {iv.recovery_action}"
+    assert any("fc_block" in t for t in iv.triggered_by), \
+        f"Expected fc_block entry in triggered_by, got {iv.triggered_by}"
+
+
+def test_decide_intervention_recovery_run_conditions():
+    """Recovery RUN fires iff p_rec >= threshold AND p_fc < 0.40; both must hold."""
+    from salt_r.interventions import decide_intervention, RecoveryAction
+
+    # p_rec=0.9, p_fc=0.1 → RUN
+    iv_run = decide_intervention({"recoverable": 0.9, "false_confirmed": 0.1})
+    assert iv_run.recovery_action == RecoveryAction.RUN, \
+        f"Expected RUN when p_rec=0.9 and p_fc=0.1, got {iv_run.recovery_action}"
+
+    # p_rec too low → stays NONE
+    iv_low_rec = decide_intervention({"recoverable": 0.3, "false_confirmed": 0.1})
+    assert iv_low_rec.recovery_action == RecoveryAction.NONE, \
+        f"Expected NONE when p_rec=0.3 (below threshold), got {iv_low_rec.recovery_action}"
+
+    # p_fc too high → stays NONE (fc not quite at block threshold but >= 0.40)
+    iv_high_fc = decide_intervention({"recoverable": 0.9, "false_confirmed": 0.5})
+    assert iv_high_fc.recovery_action == RecoveryAction.NONE, \
+        f"Expected NONE when p_fc=0.5 (>= 0.40 guard), got {iv_high_fc.recovery_action}"
+
+
+def test_decide_intervention_eprocess_critical():
+    """eprocess_value >> 1/alpha → CRITICAL alert tier."""
+    from salt_r.interventions import decide_intervention, AlertTier
+
+    # alpha=0.10 → 1/alpha=10; CRITICAL requires >= 10*5=50
+    iv = decide_intervention({}, eprocess_value=200.0, alpha=0.10)
+    assert iv.alert_tier == AlertTier.CRITICAL, \
+        f"Expected CRITICAL when eprocess_value=200 >> 50, got {iv.alert_tier}"
+    assert any("eprocess_critical" in t for t in iv.triggered_by), \
+        f"Expected eprocess_critical in triggered_by, got {iv.triggered_by}"
+
+
+def test_decide_intervention_eprocess_intervene_tier():
+    """eprocess_value >= 1/alpha but < 5/alpha → INTERVENE tier."""
+    from salt_r.interventions import decide_intervention, AlertTier
+
+    # alpha=0.10 → threshold=10; INTERVENE: 10 <= value < 50
+    iv = decide_intervention({}, eprocess_value=15.0, alpha=0.10)
+    assert iv.alert_tier == AlertTier.INTERVENE, \
+        f"Expected INTERVENE for eprocess_value=15, got {iv.alert_tier}"
+
+
+def test_decide_intervention_kf_residual_verify():
+    """High kf_residual promotes template_update from ALLOW to VERIFY."""
+    from salt_r.interventions import decide_intervention, TemplateUpdateAction
+
+    iv = decide_intervention({}, kf_residual=0.8, kf_residual_flag_threshold=0.50)
+    assert iv.template_update == TemplateUpdateAction.VERIFY, \
+        f"High kf_residual should set VERIFY, got {iv.template_update}"
+    assert any("kf_residual" in t for t in iv.triggered_by), \
+        f"Expected kf_residual in triggered_by, got {iv.triggered_by}"
+
+
+def test_decide_intervention_should_trigger_fallback_requires_critical_and_block():
+    """should_trigger_fallback is True only when CRITICAL tier + BLOCK template."""
+    from salt_r.interventions import decide_intervention
+
+    # fc=0.8 gives BLOCK but no CRITICAL (eprocess=1)
+    iv_block_only = decide_intervention({"false_confirmed": 0.8})
+    assert not iv_block_only.should_trigger_fallback, \
+        "BLOCK without CRITICAL should not trigger fallback"
+
+    # CRITICAL (eprocess=200) without BLOCK (fc low)
+    iv_critical_only = decide_intervention({}, eprocess_value=200.0, alpha=0.10)
+    assert not iv_critical_only.should_trigger_fallback, \
+        "CRITICAL without BLOCK should not trigger fallback"
+
+    # Both CRITICAL and BLOCK: fc=0.8 + eprocess=200
+    iv_both = decide_intervention({"false_confirmed": 0.8}, eprocess_value=200.0, alpha=0.10)
+    assert iv_both.should_trigger_fallback, \
+        "CRITICAL + BLOCK must trigger fallback"

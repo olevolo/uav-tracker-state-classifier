@@ -8,6 +8,7 @@ Also incorporates SAMURAI-inspired KF residual idea as a cheap
 spatial discontinuity feature.
 """
 from __future__ import annotations
+import argparse
 import json
 import numpy as np
 from itertools import product
@@ -329,14 +330,26 @@ def run_policy_sweep(
             seq = k[len("iou_trace/"):]
             iou_traces[seq] = data[k]
 
+    bbox_pred_data: dict[str, np.ndarray] = {}
+    for k in data.files:
+        if k.startswith("bbox_pred/"):
+            seq = k[len("bbox_pred/"):]
+            bbox_pred_data[seq] = data[k]
+
     # Load e-process values if provided
     eprocess_data: dict[str, list[float]] = {}
     if eprocess_json_path is not None:
         with open(eprocess_json_path) as f:
             ep_raw = json.load(f)
-        # Expected format: {seq: [e_t0, e_t1, ...]} or nested
         if isinstance(ep_raw, dict):
-            eprocess_data = ep_raw
+            # New format: per_sequence[seq]["e_trace"]
+            per_seq_ep = ep_raw.get("per_sequence", {})
+            for seq, seq_data in per_seq_ep.items():
+                if isinstance(seq_data, dict) and "e_trace" in seq_data:
+                    eprocess_data[seq] = seq_data["e_trace"]
+                elif isinstance(seq_data, list):
+                    # Legacy flat format: {seq: [e_t0, ...]}
+                    eprocess_data[seq] = seq_data
 
     # Load memory sidecar if provided
     memory_data: dict[str, np.ndarray] = {}
@@ -363,7 +376,7 @@ def run_policy_sweep(
 
     for config in configs:
         metrics = _evaluate_config(
-            config, all_preds, iou_traces, eprocess_data, memory_data
+            config, all_preds, iou_traces, eprocess_data, memory_data, bbox_pred_data
         )
         row = config.to_dict()
         row.update(metrics)
@@ -388,8 +401,11 @@ def _evaluate_config(
     iou_traces: dict[str, np.ndarray],
     eprocess_data: dict[str, list[float]],
     memory_data: dict[str, np.ndarray],
+    bbox_pred_data: dict[str, np.ndarray] | None = None,
 ) -> dict[str, float]:
     """Evaluate one policy config across all sequences."""
+    if bbox_pred_data is None:
+        bbox_pred_data = {}
     total_frames = 0
     total_allowed_low_iou = 0
     total_allowed = 0
@@ -410,6 +426,7 @@ def _evaluate_config(
         n = min(len(probs_seq), len(iou))
         ep_vals = eprocess_data.get(seq, [1.0] * n)
         mem_vals = memory_data.get(seq, np.zeros(n, dtype=float))
+        bbox_seq = bbox_pred_data.get(seq, None)
 
         # Track failure events for lead-time calculation
         prev_above = False
@@ -429,14 +446,22 @@ def _evaluate_config(
             ep_val = float(ep_vals[t]) if t < len(ep_vals) else 1.0
             mem_val = float(mem_vals[t]) if t < len(mem_vals) else 0.0
 
+            if bbox_seq is not None and t < len(bbox_seq):
+                xywh = bbox_seq[t]
+                curr_bbox = np.array([xywh[0], xywh[1],
+                                       xywh[0] + xywh[2], xywh[1] + xywh[3]], dtype=np.float64)
+            else:
+                curr_bbox = None
+
             step = simulate_policy_step(
                 probs=probs_seq[t],
                 prev_bbox=prev_bbox,
-                curr_bbox=None,  # no actual bbox data in pred JSON
+                curr_bbox=curr_bbox,
                 eprocess_value=ep_val,
                 memory_margin=mem_val,
                 config=config,
             )
+            prev_bbox = curr_bbox
 
             frame_iou = float(iou[t])
 
@@ -494,3 +519,62 @@ def _evaluate_config(
         "lead_time_median": lead_time_median,
         "total_frames": total_frames,
     }
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def _parse_args() -> "argparse.Namespace":
+    import argparse
+    p = argparse.ArgumentParser(
+        description="Phase 2E: Policy threshold sweep for SALT-RD interventions."
+    )
+    p.add_argument("--preds", required=True,
+                   help="Path to preds_val_*.json (calibrated model predictions)")
+    p.add_argument("--labels", required=True,
+                   help="Path to salt_rd_v2_labels.npz")
+    p.add_argument("--eprocess", default=None,
+                   help="Optional path to eprocess_val_*.json (for E-trace per sequence). "
+                        "When omitted, e-process contribution is zeroed out.")
+    p.add_argument("--memory", default=None,
+                   help="Optional path to salt_rd_memory_sidecar.npz (for memory_margin per sequence). "
+                        "When omitted, memory contribution is zeroed out.")
+    p.add_argument("--output", default="saltr/results/policy_sweep_v2.json",
+                   help="Output path for sweep results JSON")
+    return p.parse_args()
+
+
+def main() -> None:
+    args = _parse_args()
+    print(f"[policy_sweep] Preds:    {args.preds}", flush=True)
+    print(f"[policy_sweep] Labels:   {args.labels}", flush=True)
+    print(f"[policy_sweep] E-process:{args.eprocess or '(none)'}", flush=True)
+    print(f"[policy_sweep] Memory:   {args.memory or '(none)'}", flush=True)
+    print(f"[policy_sweep] Output:   {args.output}", flush=True)
+
+    summary = run_policy_sweep(
+        preds_json_path=args.preds,
+        labels_npz_path=args.labels,
+        eprocess_json_path=args.eprocess,
+        memory_sidecar_path=args.memory,
+        output_path=args.output,
+    )
+    n = summary.get("n_configs", 0)
+    configs = summary.get("configs", [])
+    if configs:
+        # Print the single best config by template_corruption_rate
+        best = min(configs, key=lambda r: r.get("template_corruption_rate", 1.0))
+        print(f"\n[policy_sweep] {n} configs evaluated.", flush=True)
+        print(f"[policy_sweep] Best template_corruption_rate: "
+              f"{best['template_corruption_rate']:.4f} "
+              f"(fc_t={best['fc_threshold']}, reinit_t={best['reinit_threshold']}, "
+              f"ep_a={best['eprocess_alpha']}, mem_t={best['mem_margin_threshold']})",
+              flush=True)
+        print(f"[policy_sweep] Best wrong_reinit_rate: {best['wrong_reinit_rate']:.4f}",
+              flush=True)
+    print(f"[policy_sweep] Results written to {args.output}", flush=True)
+
+
+if __name__ == "__main__":
+    main()

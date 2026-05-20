@@ -755,8 +755,8 @@ def _load_npz_split(
 def _load_model(checkpoint_path: str, n_features: int, n_labels: int, device: str):
     """Load SALTRD model from checkpoint.
 
-    Reads ``head_names`` from checkpoint metadata so v0 (7 heads) and v1 (9 heads)
-    checkpoints both load correctly without manual schema selection.
+    Reads ``head_names`` and ``memory_dim`` from checkpoint metadata so v0 (7 heads),
+    v1 (9 heads), and v2.1 (37-dim input) checkpoints all load correctly.
 
     Returns model or None on failure.
     """
@@ -769,8 +769,10 @@ def _load_model(checkpoint_path: str, n_features: int, n_labels: int, device: st
 
         # Derive head names: prefer metadata embedded by train.py, else v0 default.
         head_names = checkpoint_data.get("head_names", list(HEAD_NAMES))
+        # memory_dim: default 0 for backwards compatibility with pre-v2.1 checkpoints.
+        memory_dim = int(checkpoint_data.get("memory_dim", 0))
 
-        model = SALTRD(head_names=head_names)
+        model = SALTRD(head_names=head_names, memory_dim=memory_dim)
         if isinstance(checkpoint_data, dict) and "model_state_dict" in checkpoint_data:
             model.load_state_dict(checkpoint_data["model_state_dict"])
         elif isinstance(checkpoint_data, dict) and "state_dict" in checkpoint_data:
@@ -949,6 +951,7 @@ def evaluate(
     output_path: str | None = None,
     predictions_output: str | None = None,
     calibrate_heads: list[str] | None = None,
+    memory_sidecar_path: str | None = None,
 ) -> dict[str, Any]:
     """Run full evaluation and return results dict.
 
@@ -973,6 +976,11 @@ def evaluate(
     predictions_output:
         If provided, write per-frame per-head probabilities as JSON for
         policy.py offline replay (format: {seq_key: [{head: prob}, ...]}).
+    memory_sidecar_path:
+        Optional path to memory sidecar NPZ with keys ``memory_features/{seq}``
+        (float32, T×9).  If None or file does not exist, evaluation uses the
+        base 28-dim features only.  Sequences missing from the sidecar are
+        padded with zeros when the checkpoint expects a 37-dim model.
 
     Returns
     -------
@@ -1010,13 +1018,53 @@ def evaluate(
         )
 
     # ------------------------------------------------------------------
+    # 1b. Load and apply memory sidecar (optional — DAM-style 9-dim features)
+    # ------------------------------------------------------------------
+    eval_memory_features: dict[str, np.ndarray] = {}
+    if memory_sidecar_path and Path(memory_sidecar_path).exists():
+        mem_npz = np.load(memory_sidecar_path, allow_pickle=True)
+        for k in mem_npz.files:
+            if k.startswith("memory_features/"):
+                seq = k[len("memory_features/"):]
+                eval_memory_features[seq] = mem_npz[k].astype(np.float32)
+        print(f"  Loaded memory features for {len(eval_memory_features)} sequences")
+    elif memory_sidecar_path:
+        print(f"  Memory sidecar not found at {memory_sidecar_path}, using base features only")
+
+    # ------------------------------------------------------------------
     # 2. Load model and run inference
     # ------------------------------------------------------------------
     n_features = next(iter(features_dict.values())).shape[1] if features_dict else 28
     n_labels = len(label_names)
 
     model = _load_model(checkpoint_path, n_features, n_labels, device)
-    preds_dict = _run_inference(model, features_dict, window_size, device)
+
+    # Build augmented features dict for inference when model expects memory dims.
+    # If model has memory_dim > 0 and sidecar was loaded, concatenate per-sequence.
+    # Sequences missing from the sidecar are zero-padded to match model input size.
+    infer_features_dict = features_dict
+    if model is not None and getattr(model, "memory_dim", 0) > 0:
+        mem_dim = model.memory_dim
+        aug: dict[str, np.ndarray] = {}
+        for seq_key, feats in features_dict.items():
+            if seq_key in eval_memory_features:
+                mem = eval_memory_features[seq_key]
+                T = min(feats.shape[0], mem.shape[0])
+                if T < feats.shape[0]:
+                    pad = np.zeros((feats.shape[0] - T, mem.shape[1]), dtype=np.float32)
+                    mem_full = np.concatenate([mem[:T], pad], axis=0)
+                else:
+                    mem_full = mem[:feats.shape[0]]
+                aug[seq_key] = np.concatenate([feats, mem_full], axis=1)
+            else:
+                # Pad with zeros for sequences not in sidecar
+                aug[seq_key] = np.concatenate(
+                    [feats, np.zeros((feats.shape[0], mem_dim), dtype=np.float32)],
+                    axis=1,
+                )
+        infer_features_dict = aug
+
+    preds_dict = _run_inference(model, infer_features_dict, window_size, device)
     has_preds = bool(preds_dict)
 
     # Derive actual head names from the loaded model (works for v0 and v1 schemas).
@@ -1332,6 +1380,15 @@ def main() -> None:
             f"{list(RELIABILITY_HEADS)}."
         ),
     )
+    parser.add_argument(
+        "--memory-sidecar",
+        default="saltr/data/salt_rd_memory_sidecar.npz",
+        help=(
+            "Path to optional memory sidecar NPZ with keys memory_features/{seq} "
+            "(float32, T×9).  If the file does not exist, evaluation uses 28-dim "
+            "features only. (default: saltr/data/salt_rd_memory_sidecar.npz)"
+        ),
+    )
     args = parser.parse_args()
 
     calibrate_heads: list[str] | None = None
@@ -1347,6 +1404,7 @@ def main() -> None:
         output_path=args.output,
         predictions_output=args.predictions_output,
         calibrate_heads=calibrate_heads,
+        memory_sidecar_path=args.memory_sidecar,
     )
     verdict = check_go_nogo(results)
     print(f"\nGO/NO-GO: {verdict}")

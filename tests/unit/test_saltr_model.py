@@ -192,3 +192,47 @@ def test_v2_checkpoint_label_schema_metadata(tmp_path):
     loaded = _load_model(ckpt_path, n_features=28, n_labels=len(LABEL_NAMES_V2), device="cpu")
     assert loaded is not None
     assert list(loaded.heads.keys()) == list(HEAD_NAMES_V2)
+
+
+# ---------------------------------------------------------------------------
+# Phase 4B — memory_dim extension (v2.1 model)
+# ---------------------------------------------------------------------------
+
+def test_saltrd_memory_dim_zero():
+    """Model with memory_dim=0 and input (B, T, 28) works fine."""
+    from salt_r.model import SALTRD, HEAD_NAMES
+
+    B, T = 2, 20
+    model = SALTRD(memory_dim=0)
+    model.eval()
+    with torch.no_grad():
+        out = model(torch.zeros(B, T, 28))
+    assert isinstance(out, dict)
+    assert set(out.keys()) == set(HEAD_NAMES)
+    for name, v in out.items():
+        assert v.shape == (B,), f"{name}: expected ({B},), got {v.shape}"
+        assert 0.0 <= float(v.min()) and float(v.max()) <= 1.0
+
+
+def test_saltrd_memory_dim_9():
+    """Model with memory_dim=9 and input (B, T, 37) works fine, output shapes correct."""
+    from salt_r.model import SALTRD, HEAD_NAMES
+
+    B, T = 3, 20
+    model = SALTRD(memory_dim=9)
+    model.eval()
+    with torch.no_grad():
+        out = model(torch.zeros(B, T, 37))
+    assert isinstance(out, dict)
+    assert set(out.keys()) == set(HEAD_NAMES)
+    for name, v in out.items():
+        assert v.shape == (B,), f"{name}: expected ({B},), got {v.shape}"
+        assert 0.0 <= float(v.min()) and float(v.max()) <= 1.0
+
+
+def test_saltrd_memory_dim_in_state_dict():
+    """model.memory_dim == 9 is accessible after construction."""
+    from salt_r.model import SALTRD
+
+    model = SALTRD(memory_dim=9)
+    assert model.memory_dim == 9, f"Expected memory_dim=9, got {model.memory_dim}"

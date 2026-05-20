@@ -30,8 +30,8 @@ import numpy as np
 # ---------------------------------------------------------------------------
 
 _DIAGNOSTIC_SEQS = {
-    "uav123/uav0000164",
-    "dtb70/bike2",
+    "visdrone_sot/uav0000164",
+    "uav123/bike2",
     "dtb70/Gull2",
     "dtb70/Sheep1",
     "dtb70/StreetBasketball1",
@@ -91,6 +91,7 @@ def build_null_distribution(
     iou_traces: dict[str, np.ndarray],
     label_names: list[str],
     cal_seq_keys: list[str],
+    risk_mode: str = "all_risk",
 ) -> np.ndarray:
     """Return risk scores from null frames in calibration sequences.
 
@@ -122,7 +123,7 @@ def build_null_distribution(
                 continue
             if any(c < lab.shape[1] and lab[t, c] == 1 for c in failure_cols):
                 continue
-            null_scores.append(compute_risk_score(frames[t]))
+            null_scores.append(compute_risk_score(frames[t], mode=risk_mode))
 
     return np.array(null_scores, dtype=np.float32)
 
@@ -385,6 +386,7 @@ def evaluate(
     cal_fraction: float = _CAL_FRACTION,
     iou_failure_threshold: float = 0.30,
     risk_mode: str = "all_risk",
+    diagnostic_seqs: set[str] | None = None,
 ) -> dict[str, Any]:
     """Evaluate e-process alerts on all non-diagnostic val sequences.
 
@@ -399,9 +401,13 @@ def evaluate(
     mode:
         E-process accumulation mode.  "formal" | "engineering" | "agrapa".
         "agrapa" uses online aGRAPAbetting (no calibration set needed).
+    diagnostic_seqs:
+        Set of sequence keys to exclude from calibration and evaluation.
+        If None, falls back to the module-level ``_DIAGNOSTIC_SEQS`` constant.
     """
+    _diag = diagnostic_seqs if diagnostic_seqs is not None else _DIAGNOSTIC_SEQS
     all_seqs = sorted(
-        s for s in preds if s not in _DIAGNOSTIC_SEQS and s in labels and s in iou_traces
+        s for s in preds if s not in _diag and s in labels and s in iou_traces
     )
     n_cal = max(1, int(len(all_seqs) * cal_fraction))
     cal_seqs = all_seqs[:n_cal]
@@ -411,7 +417,7 @@ def evaluate(
     if mode == "agrapa":
         null_scores = np.array([], dtype=np.float32)
     else:
-        null_scores = build_null_distribution(preds, labels, iou_traces, label_names, cal_seqs)
+        null_scores = build_null_distribution(preds, labels, iou_traces, label_names, cal_seqs, risk_mode=risk_mode)
         if len(null_scores) == 0:
             return {"error": "null distribution is empty — check calibration sequences"}
 
@@ -480,6 +486,7 @@ def evaluate(
             "tp_alerts": m["tp_alerts"],
             "false_alerts": m["false_alerts"],
             "lead_times": m["lead_times"],
+            "e_trace": E_trace.tolist(),
         }
 
     fa_per_1000 = 1000.0 * total_false_alerts / max(total_frames, 1)
@@ -547,6 +554,7 @@ def sweep(
     alphas: tuple[float, ...] = _DEFAULT_ALPHAS,
     decays: tuple[float, ...] = _DEFAULT_DECAYS,
     risk_modes: tuple[str, ...] = _DEFAULT_RISK_MODES,
+    diagnostic_seqs: set[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Run evaluate() over all combinations of (epsilon, alpha, decay, mode, risk_mode)."""
     rows: list[dict[str, Any]] = []
@@ -559,6 +567,7 @@ def sweep(
         result = evaluate(
             preds, labels, iou_traces, label_names,
             alpha=alp, epsilon=eps, decay=dec, mode=mode, risk_mode=rmode,
+            diagnostic_seqs=diagnostic_seqs,
         )
         s = result.get("summary", {})
         row = {
@@ -588,12 +597,13 @@ def sweep(
 # I/O helpers
 # ---------------------------------------------------------------------------
 
-def _load_npz(npz_path: str) -> tuple[dict, dict, list[str]]:
-    """Return (labels_dict, iou_dict, label_names) from a v2 NPZ."""
+def _load_npz(npz_path: str) -> tuple[dict, dict, list[str], set[str]]:
+    """Return (labels_dict, iou_dict, label_names, diagnostic_seqs) from a v2 NPZ."""
     data = np.load(npz_path, allow_pickle=True)
     label_names = list(data["label_names"])
     labels: dict[str, np.ndarray] = {}
     ious: dict[str, np.ndarray] = {}
+    diagnostic_seqs: set[str] = set()
     for k in data.files:
         if k.startswith("labels/"):
             seq = k[len("labels/"):]
@@ -601,7 +611,18 @@ def _load_npz(npz_path: str) -> tuple[dict, dict, list[str]]:
         elif k.startswith("iou_trace/"):
             seq = k[len("iou_trace/"):]
             ious[seq] = data[k]
-    return labels, ious, label_names
+        elif k.startswith("split/"):
+            seq = k[len("split/"):]
+            try:
+                split_val = str(data[k])
+            except Exception:
+                split_val = ""
+            if split_val == "diagnostic":
+                diagnostic_seqs.add(seq)
+    # Fallback: if NPZ has no split metadata, use hardcoded set
+    if not diagnostic_seqs:
+        diagnostic_seqs = _DIAGNOSTIC_SEQS.copy()
+    return labels, ious, label_names, diagnostic_seqs
 
 
 def _load_preds(preds_path: str) -> dict[str, list[dict[str, float]]]:
@@ -623,6 +644,8 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--epsilon", type=float, default=0.50)
     p.add_argument("--decay",   type=float, default=1.00)
     p.add_argument("--mode",    default="formal", choices=["formal", "engineering", "agrapa"])
+    p.add_argument("--risk-mode", default="all_risk",
+                   choices=["all_risk", "ifd5", "ifd10", "ifd20", "fc_ifd20"])
     p.add_argument("--sweep",   action="store_true", help="Run full parameter sweep")
     return p.parse_args()
 
@@ -632,12 +655,14 @@ def main() -> None:
     print(f"[eprocess] Loading predictions from {args.preds}", flush=True)
     preds = _load_preds(args.preds)
     print(f"[eprocess] Loading labels from {args.labels}", flush=True)
-    labels, iou_traces, label_names = _load_npz(args.labels)
-    print(f"[eprocess] {len(preds)} pred seqs, {len(labels)} label seqs, labels={label_names}")
+    labels, iou_traces, label_names, diagnostic_seqs = _load_npz(args.labels)
+    print(f"[eprocess] {len(preds)} pred seqs, {len(labels)} label seqs, "
+          f"labels={label_names}, diagnostic_seqs={len(diagnostic_seqs)}")
 
     if args.sweep:
         print("[eprocess] Running threshold sweep ...", flush=True)
-        rows = sweep(preds, labels, iou_traces, label_names)
+        rows = sweep(preds, labels, iou_traces, label_names,
+                     diagnostic_seqs=diagnostic_seqs)
         Path(args.out_sweep).parent.mkdir(parents=True, exist_ok=True)
         with open(args.out_sweep, "w", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
@@ -647,12 +672,13 @@ def main() -> None:
 
     print(
         f"[eprocess] Evaluating: alpha={args.alpha} epsilon={args.epsilon} "
-        f"decay={args.decay} mode={args.mode}",
+        f"decay={args.decay} mode={args.mode} risk_mode={args.risk_mode}",
         flush=True,
     )
     result = evaluate(
         preds, labels, iou_traces, label_names,
         alpha=args.alpha, epsilon=args.epsilon, decay=args.decay, mode=args.mode,
+        risk_mode=args.risk_mode, diagnostic_seqs=diagnostic_seqs,
     )
 
     Path(args.out_json).parent.mkdir(parents=True, exist_ok=True)
@@ -666,8 +692,8 @@ def main() -> None:
     print(f"  event recall     : {s['failure_event_recall']:.3f}  (target >= 0.60)")
     print(f"  FA per 1000f     : {s['false_alerts_per_1000_frames']:.1f}  (target <= 100)")
     print(f"  seq-level FAR    : {s['seq_level_far']:.3f}  (target <= 0.10)")
-    bl = result["baseline_raw_ifd_0.5"]
-    print(f"\n--- Baseline P(ifd)>0.5 ---")
+    bl = result["baseline_raw_ifd5_0.5"]
+    print(f"\n--- Baseline P(ifd5)>0.5 ---")
     print(f"  event recall : {bl['failure_event_recall']:.3f}")
     print(f"  FA per 1000f : {bl['false_alerts_per_1000_frames']:.1f}")
 

@@ -5,6 +5,7 @@ per-frame DAM-style memory features.
 """
 from __future__ import annotations
 
+import argparse
 import hashlib
 from datetime import datetime, timezone
 from pathlib import Path
@@ -228,6 +229,8 @@ def collect_memory_sidecar(
             head_names=head_names,
         )
         out[f"memory_features/{seq_key}"] = mem_feats.astype(np.float32)
+        MARGIN_COL = MEMORY_FEATURE_NAMES.index("mem_target_minus_distractor_margin")
+        out[f"memory_margin/{seq_key}"] = mem_feats[:, MARGIN_COL].astype(np.float32)
 
     out["memory_feature_names"] = np.array(MEMORY_FEATURE_NAMES, dtype=object)
     out["created_at"] = np.array(datetime.now(tz=timezone.utc).isoformat())
@@ -236,3 +239,38 @@ def collect_memory_sidecar(
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(output_path, **out)
     print(f"Memory sidecar written to: {output_path}  ({len(compound_keys)} sequences)")
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def _parse_args() -> "argparse.Namespace":
+    p = argparse.ArgumentParser(
+        description="Collect DAM-style memory sidecar from v2 NPZ."
+    )
+    p.add_argument("--npz", required=True,
+                   help="Path to salt_rd_v2_labels.npz")
+    p.add_argument("--preds", default=None,
+                   help="Optional path to preds_val_*.json (calibrated model predictions). "
+                        "When omitted, oracle labels are used as gate signals.")
+    p.add_argument("--output", required=True,
+                   help="Output path for memory sidecar NPZ, e.g. saltr/data/salt_rd_memory_sidecar.npz")
+    return p.parse_args()
+
+
+def main() -> None:
+    args = _parse_args()
+    print(f"[memory_features] NPZ:    {args.npz}", flush=True)
+    print(f"[memory_features] Preds:  {args.preds or '(oracle labels)'}", flush=True)
+    print(f"[memory_features] Output: {args.output}", flush=True)
+    collect_memory_sidecar(
+        npz_v2_path=args.npz,
+        preds_json_path=args.preds,
+        output_path=args.output,
+    )
+    print("[memory_features] Done.", flush=True)
+
+
+if __name__ == "__main__":
+    main()

@@ -9,15 +9,15 @@ This module provides the infrastructure to:
 5. Save sidecar NPZ with provenance
 
 Sidecar NPZ schema:
-  point_tracks/{seq}:     float32 (T, P, 2)  — NaN = not visible
-  point_visibility/{seq}: bool    (T, P)
-  point_features/{seq}:   float32 (T, F_point)
-  teacher_labels/{seq}:   dict of (T,) arrays (point_consistency_good, etc.)
-  point_feature_names:    list[str]
-  teacher_label_names:    list[str]
-  teacher_version:        str
-  teacher_model:          str ("cotracker3" | "synthetic" | "precomputed")
-  created_at:             str
+  point_tracks/{seq}:                float32 (T, P, 2)  — NaN = not visible
+  point_visibility/{seq}:            bool    (T, P)
+  point_features/{seq}:              float32 (T, F_point)
+  teacher_labels/{label}/{seq}:      uint8   (T,)
+  teacher_model/{seq}:               str     "cotracker3" | "precomputed" | "synthetic" | "unknown"
+  point_feature_names:               list[str]
+  teacher_label_names:               list[str]
+  teacher_version:                   str
+  created_at:                        str
 """
 
 import numpy as np
@@ -206,10 +206,15 @@ def process_sequence_to_sidecar(
     precomputed_tracks: Optional[np.ndarray] = None,  # (T, P, 2) if already computed
     precomputed_visibility: Optional[np.ndarray] = None,  # (T, P) if already computed
     device: str = "cpu",
+    allow_synthetic: bool = False,   # ← set True only for non-reported experiments
 ) -> dict:
     """Process one sequence to point teacher sidecar data.
 
     Returns a dict with all sidecar fields for this sequence.
+
+    Note: gt_bboxes and pred_bboxes must be in [x1,y1,x2,y2] format.
+    If loading from the v2 NPZ (which stores bbox_pred/bbox_gt in xywh format),
+    convert first with collect_features.xywh_to_xyxy().
     """
     T = len(gt_bboxes)
     teacher_model = "unknown"
@@ -256,6 +261,12 @@ def process_sequence_to_sidecar(
                 pass
 
         if not cotracker_ok:
+            if not allow_synthetic:
+                raise RuntimeError(
+                    f"CoTracker3 unavailable for seq '{seq_key}' and allow_synthetic=False. "
+                    "Pass allow_synthetic=True explicitly if you want GT-following synthetic tracks "
+                    "(not suitable for reported experiments)."
+                )
             # Fall back to synthetic tracks following GT bboxes
             P = len(query_pts)
             tracks, visibility = _make_synthetic_tracks(T, P, gt_bboxes)
@@ -288,6 +299,17 @@ def save_sidecar_npz(
     Args:
         sidecar_data: list of dicts from process_sequence_to_sidecar
         output_path: path to output NPZ file
+
+    NPZ schema:
+      point_tracks/{seq}:                float32 (T, P, 2)
+      point_visibility/{seq}:            bool    (T, P)
+      point_features/{seq}:              float32 (T, F)
+      teacher_labels/{label}/{seq}:      uint8   (T,)
+      teacher_model/{seq}:               str     "cotracker3" | "precomputed" | "synthetic" | "unknown"
+      point_feature_names:               list[str]
+      teacher_label_names:               list[str]
+      teacher_version:                   str
+      created_at:                        str
     """
     arrays: dict[str, np.ndarray] = {}
 
@@ -296,6 +318,7 @@ def save_sidecar_npz(
         arrays[f"point_tracks/{seq}"] = entry["point_tracks"]
         arrays[f"point_visibility/{seq}"] = entry["point_visibility"]
         arrays[f"point_features/{seq}"] = entry["point_features"]
+        arrays[f"teacher_model/{seq}"] = np.array(entry.get("teacher_model", "unknown"))
 
         # Teacher labels — store each as a separate array
         for label_name, label_arr in entry["teacher_labels"].items():

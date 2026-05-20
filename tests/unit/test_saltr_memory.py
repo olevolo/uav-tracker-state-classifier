@@ -506,3 +506,83 @@ class TestEmbeddingFallback:
         assert feats["mem_neg_size"] == 3.0, (
             f"Expected mem_neg_size=3.0, got {feats['mem_neg_size']}"
         )
+
+
+# ---------------------------------------------------------------------------
+# 6. MEMORY_FEATURE_NAMES — structural guarantees
+# ---------------------------------------------------------------------------
+
+class TestMemoryFeatureNames:
+
+    def test_memory_margin_col_exists(self):
+        """mem_target_minus_distractor_margin must be a named feature in MEMORY_FEATURE_NAMES."""
+        from salt_r.memory_features import MEMORY_FEATURE_NAMES
+        assert "mem_target_minus_distractor_margin" in MEMORY_FEATURE_NAMES, (
+            "Column 'mem_target_minus_distractor_margin' must exist in MEMORY_FEATURE_NAMES"
+        )
+
+    def test_memory_margin_col_index(self):
+        """mem_target_minus_distractor_margin is at index 6 in MEMORY_FEATURE_NAMES.
+
+        collect_memory_sidecar uses a hardcoded MARGIN_COL index — this test
+        guards against accidental reordering of FEATURE_NAMES.
+        """
+        from salt_r.memory_features import MEMORY_FEATURE_NAMES
+        idx = MEMORY_FEATURE_NAMES.index("mem_target_minus_distractor_margin")
+        assert idx == 6, (
+            f"Expected mem_target_minus_distractor_margin at index 6, found at {idx}. "
+            f"Reordering FEATURE_NAMES breaks collect_memory_sidecar MARGIN_COL."
+        )
+
+    def test_memory_feature_names_length_is_9(self):
+        """MEMORY_FEATURE_NAMES must have exactly 9 entries (matches (T, 9) output shape)."""
+        from salt_r.memory_features import MEMORY_FEATURE_NAMES
+        assert len(MEMORY_FEATURE_NAMES) == 9, (
+            f"Expected 9 memory feature names, got {len(MEMORY_FEATURE_NAMES)}: {MEMORY_FEATURE_NAMES}"
+        )
+
+    def test_memory_features_oracle_vs_preds_differ(self):
+        """Using oracle labels vs model preds should produce different memory feature arrays.
+
+        When preds (all zeros = no risk) are provided, the memory updates more
+        freely than when oracle labels mark some frames as failure, causing the
+        accumulated similarity features to differ between the two runs.
+        """
+        from salt_r.memory_features import compute_memory_features_for_sequence
+        from salt_r.collect_features import LABEL_NAMES_V2
+        from salt_r.model import HEAD_NAMES_V2
+
+        T = 40
+        rng = np.random.default_rng(5)
+        features = rng.standard_normal((T, 28)).astype(np.float32)
+        features[:, 1] = 0.65   # apce_norm above update threshold
+        iou_trace = np.ones(T, dtype=np.float32) * 0.85
+
+        # Oracle labels: mark half frames as false_confirmed
+        labels = np.zeros((T, 14), dtype=np.int8)
+        fc_idx = list(LABEL_NAMES_V2).index("false_confirmed")
+        labels[::2, fc_idx] = 1  # every other frame is a "failure"
+
+        # Oracle mode (preds=None): uses label values as gate signals
+        result_oracle = compute_memory_features_for_sequence(
+            features=features, labels=labels, iou_trace=iou_trace,
+            preds=None, label_names=list(LABEL_NAMES_V2),
+        )
+
+        # Pred mode: all-zero predictions (no risk ever) → gates always open
+        preds = np.zeros((T, len(HEAD_NAMES_V2)), dtype=np.float32)
+        result_preds = compute_memory_features_for_sequence(
+            features=features, labels=labels, iou_trace=iou_trace,
+            preds=preds, label_names=list(LABEL_NAMES_V2),
+            head_names=list(HEAD_NAMES_V2),
+        )
+
+        # Both must have correct shape
+        assert result_oracle.shape == (T, 9)
+        assert result_preds.shape == (T, 9)
+
+        # With oracle half-failure vs all-open preds, the update histories differ
+        # → at least some feature values must differ by the end of the sequence
+        assert not np.allclose(result_oracle[-1], result_preds[-1], atol=1e-5), (
+            "Oracle labels vs all-zero preds should produce different memory features"
+        )

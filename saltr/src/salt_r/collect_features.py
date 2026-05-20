@@ -20,6 +20,34 @@ from typing import Any, Dict, List
 
 import numpy as np
 
+
+# ---------------------------------------------------------------------------
+# Bbox convention conversion utilities
+# ---------------------------------------------------------------------------
+
+
+def xywh_to_xyxy(bbox: np.ndarray) -> np.ndarray:
+    """Convert (x, y, w, h) bbox to (x1, y1, x2, y2). Works on (4,) or (N,4) arrays."""
+    bbox = np.asarray(bbox, dtype=np.float64)
+    if bbox.ndim == 1:
+        return np.array([bbox[0], bbox[1], bbox[0] + bbox[2], bbox[1] + bbox[3]])
+    result = bbox.copy()
+    result[..., 2] = bbox[..., 0] + bbox[..., 2]
+    result[..., 3] = bbox[..., 1] + bbox[..., 3]
+    return result
+
+
+def xyxy_to_xywh(bbox: np.ndarray) -> np.ndarray:
+    """Convert (x1, y1, x2, y2) bbox to (x, y, w, h). Works on (4,) or (N,4) arrays."""
+    bbox = np.asarray(bbox, dtype=np.float64)
+    if bbox.ndim == 1:
+        return np.array([bbox[0], bbox[1], bbox[2] - bbox[0], bbox[3] - bbox[1]])
+    result = bbox.copy()
+    result[..., 2] = bbox[..., 2] - bbox[..., 0]
+    result[..., 3] = bbox[..., 3] - bbox[..., 1]
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Feature schema
 # ---------------------------------------------------------------------------
