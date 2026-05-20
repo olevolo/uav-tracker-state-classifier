@@ -1,9 +1,9 @@
 # HANDOFF — SALT-RD: Reliability + Neural Scene Dynamicity for UAV SOT
 
 **Дата:** 2026-05-19  
-**Оновлено:** 2026-05-20 (Phases 0–2 complete, dry-run ✅, collection running)  
-**Статус:** Phases 0→1a→1b→1c→2 DONE — наступна сесія: верифікація NPZ → train → eval GO/NO-GO  
-**Читай також:** `THOUGHTS.md`, `ANALYSIS.md`, `papers/README.md`, `FROZEN.md`
+**Оновлено:** 2026-05-20 — pipeline complete, BORDERLINE verdict, next = calibration + LODO  
+**Статус:** Phases 0→1a→1b→1c→2 DONE + tested. NPZ collected, model trained, eval done.  
+**Читай також:** `THOUGHTS.md`, `papers/README.md`, `FROZEN.md`
 
 ---
 
@@ -477,67 +477,150 @@ Priority rule:
 
 ---
 
-## ✅ Реалізовано — Phases 1a→1b→1c→2 (commits 64f307b…fe60482)
+## ✅ Реалізовано — Phases 1a→2 + fixes + tests (commits 64f307b…7d9b693)
 
-| Phase | Завдання | Commit |
+### Модулі saltr/
+
+| Файл | Статус | Ключові деталі |
 |---|---|---|
-| **1a** | `collect_features.py` — collection loop, NPZ schema, 28 features, GT labels | `64f307b`, `e8d5630` |
-| **1a fixes** | `_TruncatedSequence`, GT-derived dynamic labels, `root=None` autodetect | `e8d5630` |
-| **1a tests** | 3 regression tests in `tests/unit/test_saltr_collect_features.py` | `e8d5630` |
-| **1b** | `model.py` — SALTRD GRU ~43k params, 7 heads | `39beee0` |
-| **1b** | `train.py` — focal BCE, empirical pos_weight, early stopping | `39beee0` |
-| **1b** | `eval.py` — AUROC/AUPRC/ECE/NT2F/bootstrap CI/GO-NO-GO | `39beee0` |
-| **1c** | `policy.py` — TrackerAction, RiskThresholds, apply_policy, replay_policy | `fe60482` |
-| **2** | `integrate.py` — SALTRDRunner, FeatureBuffer, RiskEntry, run_with_risk | `fe60482` |
+| `collect_features.py` | ✅ | 28 features, GT labels, `_TruncatedSequence`, `root=None` autodetect |
+| `model.py` | ✅ | SALTRD GRU hidden=64 layers=2, ~43k params, 7 ModuleDict heads, sigmoid в head |
+| `train.py` | ✅ | focal BCE, empirical pos_weight, early stop on AUPRC(fc), subclasses model.SALTRD |
+| `eval.py` | ✅ | AUROC/AUPRC/ECE/Brier/NLL/recall@5%FPR, NT2F, bootstrap CI (seq-level), GO/NO-GO |
+| `policy.py` | ✅ | TrackerAction, RiskThresholds, apply_policy (4-priority chain), replay_policy |
+| `integrate.py` | ✅ | SALTRDRunner wraps frozen SALTRunner, FeatureBuffer, run_with_risk |
+| `run_phase1.sh` | ✅ | collect→train→eval→predictions→policy replay (one command) |
 
-**Dry-run verified:** `--dry-run` passes for all 3 datasets (123+35+70 = 228 sequences).
+### Важливі pipeline fixes (commit bc34a5b)
+
+| Bug | Fix |
+|---|---|
+| Double-sigmoid in eval.py | `out[h].detach().cpu().numpy()` + `HEAD_NAMES` + `np.clip`; ECE 0.537→0.320 |
+| IoU key mismatch в policy.py | raw `np.load` + strip `iou_trace/` prefix + warning on missing |
+| `--dry-run` завантажував модель | SALTRunner.from_config() тільки коли `not dry_run` |
+| Predictions export відсутній | `--predictions-output` зберігає `{seq_key: [{head: prob},...]}` JSON |
+| Label-head mapping off-by-one | HEAD_NAMES lookup (не index) для named prediction mapping |
+| train.py дублював SALTRD | підклас model.SALTRD, не окрема архітектура |
+
+### Unit tests (200 passed — commit 7d9b693)
+
+| Файл | Тестів | Що покрито |
+|---|---|---|
+| `test_saltr_collect_features.py` | 3 | flat labels, key collision, _TruncatedSequence |
+| `test_saltr_model.py` | 6 | forward contract, param count, train/eval compat, no double-sigmoid |
+| `test_saltr_eval.py` | 6 | ECE, NT2F, bootstrap CI, GO/NO-GO, predictions schema |
+| `test_saltr_policy.py` | 7 | apply_policy cases, replay_policy real IoU |
+| `test_saltr_integrate.py` | 4 | FeatureBuffer, extract_features shape/NaN |
+
+---
+
+## 📊 Поточні результати (val split, 49 sequences)
+
+NPZ: `saltr/data/salt_rd_v0.npz` — 228 seqs, 161k frames (UAV123+VisDrone+DTB70)  
+Checkpoint: `saltr/checkpoints/saltrd_best.pt` — epoch 4 (early stop)
+
+| Head | base% | AUROC | AUPRC | ECE | Brier | R@5FPR |
+|---|---|---|---|---|---|---|
+| **false_confirmed** | 5.5 | **0.884** | **0.331** | 0.320 | 0.162 | 0.445 |
+| **failure_in_5** | 0.1 | **0.863** | 0.010 | 0.244 | 0.069 | 0.333 |
+| recoverable | 0.6 | 0.892 | 0.044 | 0.260 | 0.091 | 0.481 |
+| target_dynamic | 5.6 | 0.769 | 0.162 | 0.375 | 0.192 | 0.264 |
+| camera_dynamic | 24.7 | 0.573 | 0.302 | 0.237 | 0.241 | 0.063 |
+| hard_dynamic_scene | 11.9 | 0.638 | 0.264 | 0.332 | 0.209 | 0.204 |
+| needs_full_compute | 12.0 | 0.641 | 0.266 | 0.334 | 0.211 | 0.211 |
+
+**NT2F(IoU≥0.5):** mean=0.555, std=0.375, never_failed=17/49  
+**Bootstrap AUPRC(fc) 95%CI:** [0.216, 0.538] (n_seq=19)
+
+**GO/NO-GO: BORDERLINE**
+
+| Metric | Value | GO threshold | Status |
+|---|---|---|---|
+| AUPRC(fc) | 0.331 | > 0.30 | ✅ |
+| AUROC(fc) | 0.884 | > 0.65 | ✅ |
+| AUROC(fail5) | 0.863 | > 0.75 | ✅ |
+| AUROC(hard_dyn) | 0.638 | > 0.75 | ⚠️ |
+| AUROC(full_cmp) | 0.641 | > 0.70 | ⚠️ |
+| ECE(fc) | 0.320 | < 0.12 | ❌ needs calibration |
+
+**Policy replay (val):**
+```
+wrong_reinit_rate:       0.216  ← 21.6% recovery → wrong object
+template_blocked_rate:   0.004  ← conservative at default thresholds
+template_corruption_rate: 0.097 ← target for false_confirmed improvement
+compute_cheap_rate:      0.000  ← needs_full_compute head too weak
+abstention_gain:         0.051  ← blocking update gives +5% IoU
+```
+
+**Diagnostic sequences (4 hard seqs: bike2, Gull2, Sheep1, StreetBasketball1):**
+- AUROC(fc)=0.604, AUPRC(fc)=0.279 (base=20.3%), NT2F=0.105 — model weaker on hardest cases
 
 ---
 
 ## Стартовий промпт для наступної coding сесії
 
-> Phases 0→1a→1b→1c→2 реалізовані. Наступна сесія = NPZ збірка → train → eval GO/NO-GO.
+> Pipeline complete. NPZ + checkpoint exist. BORDERLINE verdict. Next = calibration → LODO → operating point tuning.
 
 ```text
-Прочитай HANDOFF_NEXT.md (секцію "Реалізовано") та FROZEN.md.
+Прочитай HANDOFF_NEXT.md секцію "Поточні результати" та FROZEN.md.
 
-СТАН: Всі модулі saltr/ реалізовані. NPZ ще не зібрано.
+СТАН:
+- saltr/data/salt_rd_v0.npz — 228 seqs, 161k frames ✓
+- saltr/checkpoints/saltrd_best.pt — trained, early stop epoch 4 ✓
+- eval_val.json — val metrics з fixed pipeline ✓
+- GO/NO-GO: BORDERLINE (ECE=0.320 > GO 0.12, hard_dyn AUROC=0.638 < GO 0.75)
 
-ЗАДАЧА 1 — Зібрати NPZ (якщо не існує saltr/data/salt_rd_v0.npz):
-  PYTHONPATH=src python saltr/src/salt_r/collect_features.py \
-    --output saltr/data/salt_rd_v0.npz \
-    --datasets uav123 visdrone_sot dtb70
+ЗАДАЧА 1 — Temperature scaling для ECE
+ECE(fc)=0.320 → target <0.12. Реалізуй у saltr/src/salt_r/eval.py:
 
-  Після збірки перевір base rates (виводяться в summary).
-  false_confirmed base rate: очікується 1-3%.
-  Якщо > 10% або < 0.5% → ЗУПИНИСЬ і перевір label logic у compute_labels().
+  from torch import nn
+  class TemperatureScaler(nn.Module):
+      # Learn T on val split, apply on val/test
+      # Scale logits (before sigmoid) by 1/T
+      # Fit: NLL minimization over val set
+  
+  Після calibration перегенеруй eval_val.json і перевір ECE.
+  НЕ роби calibration на train split.
 
-ЗАДАЧА 2 — Тренування (після NPZ):
+ЗАДАЧА 2 — LODO eval (обов'язкова для paper)
   PYTHONPATH=src:saltr/src python saltr/src/salt_r/train.py \
     --npz saltr/data/salt_rd_v0.npz \
-    --output saltr/checkpoints/
+    --output saltr/checkpoints/lodo_dtb70/
 
-  Спостерігай за val AUPRC(false_confirmed) — це primary metric.
-  Якщо не росте за 8 epochs → early stopping.
+  Але спочатку потрібен новий NPZ з LODO split:
+  - train: uav123 + visdrone_sot sequences
+  - val: dtb70 sequences  
+  Або: зробити окремий збір тільки для DTB70 і оцінити checkpoint trained on
+  UAV123+VisDrone.
 
-ЗАДАЧА 3 — Eval GO/NO-GO:
-  PYTHONPATH=src:saltr/src python saltr/src/salt_r/eval.py \
+ЗАДАЧА 3 — Аналіз weak heads
+  hard_dynamic_scene AUROC=0.638 < 0.75. Перевір:
+  - base rate на train split (чи не < 5% → дуже рідко)
+  - correlation між hard_dynamic_scene labels і actual IoU drops
+  - чи compute_labels правильно рахує hard_dynamic_scene (HANDOFF_NEXT.md §Labels v0)
+
+ЗАДАЧА 4 — Policy operating point
+  compute_cheap_rate=0.000 означає поточний поріг (needs_full_compute < 0.25) не спрацьовує.
+  needs_full_compute base rate = 12%, AUROC=0.641.
+  Спробуй поріг 0.40 і перевір compute regret (AUC delta при 10% cheap frames).
+  
+  Після calibration: запусти policy replay з оновленими ймовірностями:
+  PYTHONPATH=src:saltr/src python -m salt_r.policy \
+    --probs-json saltr/checkpoints/preds_val.json \
     --npz saltr/data/salt_rd_v0.npz \
-    --checkpoint saltr/checkpoints/saltrd_best.pt \
-    --split val
+    --output saltr/checkpoints/policy_val.json
 
-  GO gate (з HANDOFF_NEXT.md):
-    AUPRC(false_confirmed) > 0.30
-    AUROC(failure_in_5) > 0.75
-    AUROC(hard_dynamic_scene) > 0.75
+ЗАДАЧА 5 — Feature diagnostics (якщо ECE не покращується після calibration)
+  Перед додаванням нових features (v1 additions з papers/README.md):
+  - feature importance: permutation importance або gradient-based
+  - correlation matrix features vs labels
+  - які features мають найбільший signal для false_confirmed
 
-  STOP якщо AUPRC(false_confirmed) < 0.15 → analyse features, consider LoRAT.
-
-КРИТИЧНО:
-- Verify diagnostic sequences are excluded from train/val (bike2, Gull2, etc.)
-- Report LODO: train UAV123+VisDrone → test DTB70 окремо
-- Bootstrap CI must be by sequence (не frame)
-- DO NOT tune thresholds to make numbers look better — negative result policy stands
+RED LINES (не робити):
+- НЕ тюнити GO thresholds щоб отримати GO verdict
+- НЕ тренувати на діагностичних sequences (bike2, Gull2, Sheep1, StreetBasketball1)
+- НЕ робити calibration на train split
+- НЕ видаляти CE/DYNAMIC/VelocityDrift з src/uav_tracker/ (потрібні для ablations)
 ```
 
 ---
