@@ -771,6 +771,7 @@ def _load_model(checkpoint_path: str, n_features: int, n_labels: int, device: st
         head_names = checkpoint_data.get("head_names", list(HEAD_NAMES))
         # memory_dim: default 0 for backwards compatibility with pre-v2.1 checkpoints.
         memory_dim = int(checkpoint_data.get("memory_dim", 0))
+        memory_feature_names_ckpt = checkpoint_data.get("memory_feature_names", None)
 
         model = SALTRD(head_names=head_names, memory_dim=memory_dim)
         if isinstance(checkpoint_data, dict) and "model_state_dict" in checkpoint_data:
@@ -1028,6 +1029,27 @@ def evaluate(
                 seq = k[len("memory_features/"):]
                 eval_memory_features[seq] = mem_npz[k].astype(np.float32)
         print(f"  Loaded memory features for {len(eval_memory_features)} sequences")
+
+        # Subset columns to match the features the checkpoint was trained on.
+        # Read memory_feature_names from checkpoint; fall back to all dims if absent.
+        _ckpt_feature_names: list[str] | None = None
+        if checkpoint_path:
+            try:
+                import torch as _torch
+                _ckpt_state = _torch.load(checkpoint_path, map_location="cpu")
+                if isinstance(_ckpt_state, dict):
+                    _ckpt_feature_names = _ckpt_state.get("memory_feature_names", None)
+            except Exception:
+                pass
+        if _ckpt_feature_names:
+            _all_feat_names = list(mem_npz.get("memory_feature_names", [f"dim_{i}" for i in range(9)]))
+            _selected_indices = [_all_feat_names.index(n) for n in _ckpt_feature_names]
+            for seq in eval_memory_features:
+                eval_memory_features[seq] = eval_memory_features[seq][:, _selected_indices]
+            print(
+                f"  Subsetting memory features to {len(_ckpt_feature_names)} dims "
+                f"(from checkpoint): {_ckpt_feature_names}"
+            )
     elif memory_sidecar_path:
         print(f"  Memory sidecar not found at {memory_sidecar_path}, using base features only")
 

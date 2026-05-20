@@ -388,6 +388,7 @@ def train(
     seed: int = 42,
     label_schema: str = "v0",
     memory_sidecar_path: str | None = None,
+    memory_feature_names: list[str] | None = None,
 ) -> None:
     """Train SALTRD on the given NPZ dataset.
 
@@ -417,6 +418,10 @@ def train(
         Optional path to memory sidecar NPZ with keys ``memory_features/{seq}``
         (float32, T×9).  If None or file does not exist, training uses the base
         28-dim input only.
+    memory_feature_names:
+        Optional list of memory feature names to select (subset of all 9 dims).
+        If None, all dims from the sidecar are used (backwards-compatible default).
+        Example: ["mem_pos_max_sim", "mem_pos_mean_sim"] uses only 2 dims.
     """
     # ------------------------------------------------------------------
     # 0. Seed
@@ -432,13 +437,25 @@ def train(
     # 0b. Load memory sidecar (optional — DAM-style 9-dim features)
     # ------------------------------------------------------------------
     memory_features: dict[str, np.ndarray] = {}
+    all_feature_names: list[str] = []
     if memory_sidecar_path and Path(memory_sidecar_path).exists():
         mem_npz = np.load(memory_sidecar_path, allow_pickle=True)
+        # Read feature name metadata from sidecar (fallback to positional names).
+        all_feature_names = list(mem_npz.get("memory_feature_names", [f"dim_{i}" for i in range(9)]))
         for k in mem_npz.files:
             if k.startswith("memory_features/"):
                 seq = k[len("memory_features/"):]
                 memory_features[seq] = mem_npz[k].astype(np.float32)
         print(f"[train] Loaded memory features for {len(memory_features)} sequences", flush=True)
+        # Subset to selected feature names if requested.
+        if memory_feature_names is not None:
+            selected_indices = [all_feature_names.index(n) for n in memory_feature_names]
+            for seq in memory_features:
+                memory_features[seq] = memory_features[seq][:, selected_indices]
+            print(
+                f"[train] Subsetting to {len(memory_feature_names)} memory features: {memory_feature_names}",
+                flush=True,
+            )
     else:
         if memory_sidecar_path:
             print(f"[train] Memory sidecar not found at {memory_sidecar_path}, using 28-dim input only", flush=True)
@@ -535,7 +552,7 @@ def train(
     # ------------------------------------------------------------------
     n_features = len(FEATURE_NAMES)   # 28
     n_heads = len(train_ds.head_names)
-    memory_dim = 9 if memory_features else 0
+    memory_dim = len(memory_feature_names) if memory_feature_names else (9 if memory_features else 0)
 
     model = SALTRD(n_features=n_features, memory_dim=memory_dim, head_names=train_ds.head_names).to(dev)
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -661,6 +678,7 @@ def train(
                     "n_heads": n_heads,
                     "memory_dim": memory_dim,
                     "memory_sidecar_path": str(memory_sidecar_path) if memory_sidecar_path else "",
+                    "memory_feature_names": memory_feature_names or (all_feature_names if memory_features else []),
                 },
                 ckpt_path,
             )
@@ -725,6 +743,16 @@ def main() -> None:
             "Example: --memory-sidecar saltr/data/salt_rd_memory_sidecar.npz"
         ),
     )
+    parser.add_argument(
+        "--memory-feature-names",
+        type=str,
+        default=None,
+        help=(
+            "Comma-separated subset of memory feature names to use from the sidecar. "
+            "If omitted, all dims are used (default, backwards-compatible). "
+            "Example: --memory-feature-names mem_target_minus_distractor_margin"
+        ),
+    )
     args = parser.parse_args()
 
     train(
@@ -739,6 +767,7 @@ def main() -> None:
         patience=args.patience,
         label_schema=args.label_schema,
         memory_sidecar_path=args.memory_sidecar,
+        memory_feature_names=args.memory_feature_names.split(",") if args.memory_feature_names else None,
     )
 
 
