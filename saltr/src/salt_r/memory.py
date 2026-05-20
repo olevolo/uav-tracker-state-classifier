@@ -133,10 +133,19 @@ class NegativeMemory:
         self._entries: List[MemoryEntry] = []
 
     def should_update(self, secondary_peak_ratio: float, p_fc: float,
-                      apce_norm: float) -> bool:
+                      apce_norm: float, fc_proxy: bool = False) -> bool:
         """Distractor detected: secondary_peak_ratio > 0.65
         Tracking reliable: p_fc < 0.25 AND apce_norm > 0.4
-        Both conditions must hold (DAM4SAM DRM trigger)."""
+        Both conditions must hold (DAM4SAM DRM trigger).
+
+        fc_proxy=True: use p_fc directly as distractor signal (bypasses
+        the secondary_peak gate; avoids the contradiction where
+        secondary_peak_ratio=p_fc/0.4 requires p_fc>0.26 but
+        tracking_reliable requires p_fc<0.25).
+        """
+        if fc_proxy:
+            # p_fc is the distractor signal — tracker is likely on wrong object
+            return p_fc > 0.40
         distractor_detected = secondary_peak_ratio > 0.65
         tracking_reliable = (p_fc < 0.25) and (apce_norm > 0.4)
         return distractor_detected and tracking_reliable
@@ -233,8 +242,14 @@ class DistractorAwareMemory:
         secondary_peak_ratio: float = 0.0,
         iou: Optional[float] = None,
         bbox: Optional[np.ndarray] = None,
+        fc_proxy_distractor: bool = False,
     ) -> None:
-        """Update memory for one frame."""
+        """Update memory for one frame.
+
+        fc_proxy_distractor=True: use p_fc>0.40 as distractor signal for
+        negative memory instead of secondary_peak_ratio (avoids gate conflict
+        when n_secondary=0 in tracker).
+        """
         self._current_frame = frame_idx
 
         # Positive memory update
@@ -259,6 +274,7 @@ class DistractorAwareMemory:
             secondary_peak_ratio=secondary_peak_ratio,
             p_fc=p_fc,
             apce_norm=apce_norm,
+            fc_proxy=fc_proxy_distractor,
         ):
             entry = MemoryEntry(
                 embedding=embedding.copy(),

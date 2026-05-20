@@ -413,7 +413,12 @@ def _evaluate_config(
     memory_data: dict[str, np.ndarray],
     bbox_pred_data: dict[str, np.ndarray] | None = None,
 ) -> dict[str, float]:
-    """Evaluate one policy config across all sequences."""
+    """Evaluate one policy config across all sequences.
+
+    When memory_data is empty (no sidecar loaded), memory gate is disabled:
+    mem_val defaults to +inf so memory_margin < threshold never fires.
+    """
+    has_memory = bool(memory_data)
     if bbox_pred_data is None:
         bbox_pred_data = {}
     total_frames = 0
@@ -439,7 +444,9 @@ def _evaluate_config(
         iou = iou_traces[seq]
         n = min(len(probs_seq), len(iou))
         ep_vals = eprocess_data.get(seq, [1.0] * n)
-        mem_vals = memory_data.get(seq, np.zeros(n, dtype=float))
+        # When no memory sidecar loaded, use +inf so memory gate never fires
+        _mem_default = np.full(n, np.inf, dtype=float) if not has_memory else np.zeros(n, dtype=float)
+        mem_vals = memory_data.get(seq, _mem_default)
         bbox_seq = bbox_pred_data.get(seq, None)
 
         # Per-sequence counters for macro metrics

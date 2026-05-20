@@ -102,15 +102,12 @@ def compute_memory_features_for_sequence(
         # Read apce_norm from features
         apce_norm = float(feat_t[apce_norm_feat_idx]) if features.shape[1] > apce_norm_feat_idx else 0.0
 
-        # Distractor signal: prefer p_fc proxy when preds available (n_secondary=0 in SGLATrack).
-        # When p_fc is high, the tracker is likely on a distractor — treat as distractor candidate.
-        # When preds not available, fall back to n_secondary from telemetry (usually 0).
-        if preds is not None and fc_pred_idx >= 0 and fc_pred_idx < preds.shape[1]:
-            # p_fc > 0.4 → strong distractor signal proxy; smooth via clip
-            secondary_peak_ratio = float(np.clip(float(preds[t, fc_pred_idx]) / 0.4, 0.0, 1.0))
-        else:
-            n_secondary = float(feat_t[n_secondary_feat_idx]) if features.shape[1] > n_secondary_feat_idx else 0.0
-            secondary_peak_ratio = float(np.clip(n_secondary / 3.0, 0.0, 1.0))
+        # Distractor signal: n_secondary from telemetry (always 0 in SGLATrack).
+        # The fc_proxy_distractor flag on mem.step() handles the distractor case
+        # when preds are available — using p_fc>0.4 directly in the gate
+        # (avoids the secondary_peak_ratio vs tracking_reliable conflict).
+        n_secondary = float(feat_t[n_secondary_feat_idx]) if features.shape[1] > n_secondary_feat_idx else 0.0
+        secondary_peak_ratio = float(np.clip(n_secondary / 3.0, 0.0, 1.0))
 
         # p_fc: use model prediction if available, else oracle from label
         if preds is not None and fc_pred_idx >= 0 and fc_pred_idx < preds.shape[1]:
@@ -147,6 +144,9 @@ def compute_memory_features_for_sequence(
             secondary_peak_ratio=secondary_peak_ratio,
             iou=iou_t,
             bbox=None,
+            # When preds available, use p_fc>0.4 directly as distractor gate
+            # (avoids secondary_peak_ratio > 0.65 AND p_fc < 0.25 conflict)
+            fc_proxy_distractor=(preds is not None),
         )
 
     return result

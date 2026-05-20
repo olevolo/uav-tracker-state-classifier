@@ -164,10 +164,22 @@ PREDS_JSON="${RESULTS_DIR}/preds_val_${SCHEMA_TAG}.json"
 echo ""
 echo "=== Step 4: Policy offline replay ==="
 if [[ -f "${PREDS_JSON}" ]]; then
-    PYTHONPATH="${PYTHONPATH}" "${PYTHON}" -m salt_r.policy \
-        --probs-json "${PREDS_JSON}" \
-        --npz "${NPZ}" \
-        --output "${RESULTS_DIR}/policy_val_${SCHEMA_TAG}.json"
+    if [[ "${LABEL_SCHEMA}" == "v2" ]]; then
+        # v2 schema: use Phase 6 policy_sweep (v2-aware: ifd10/20, memory, e-process)
+        # legacy salt_r.policy does NOT use these signals; use run_phase6.sh instead.
+        echo "NOTE: label-schema=v2 → using policy_sweep.py (Phase 6). For memory/e-process, run run_phase6.sh."
+        PYTHONPATH="${PYTHONPATH}" "${PYTHON}" -m salt_r.policy_sweep \
+            --preds "${PREDS_JSON}" \
+            --labels "${NPZ}" \
+            --output "${RESULTS_DIR}/policy_val_${SCHEMA_TAG}.json"
+    else
+        # v0/v1 schema: legacy policy replay (ifd5 only, no ifd10/20/memory/e-process)
+        echo "NOTE: salt_r.policy is legacy (v0/v1 only). For v2 experiments, use run_phase6.sh."
+        PYTHONPATH="${PYTHONPATH}" "${PYTHON}" -m salt_r.policy \
+            --probs-json "${PREDS_JSON}" \
+            --npz "${NPZ}" \
+            --output "${RESULTS_DIR}/policy_val_${SCHEMA_TAG}.json"
+    fi
 else
     echo "No predictions JSON found; skipping policy replay."
 fi
