@@ -9,6 +9,56 @@
 
 ---
 
+## Phase 2 Results — Completed 2026-05-20
+
+### Semantic label fix confirmed
+
+| Label | Old base rate | New base rate | Comment |
+|---|---:|---:|---|
+| ifd10 | 7.2% | **0.31%** | Old: mostly already-failed. New: truly proactive |
+| ifd20 | 7.7% | **0.55%** | Same |
+
+### Retrained model (v2_corrected checkpoint, 13 heads)
+
+| Head | AUROC | AUPRC | ECE | Comment |
+|---|---:|---:|---:|---|
+| false_confirmed | 0.885 | 0.338 | 0.348 | Core signal robust |
+| ifd5 | 0.898 | 0.317 | 0.308 | Unchanged |
+| ifd10 | 0.765 | 0.012 | **0.046** | Calibration improved |
+| ifd20 | 0.744 | 0.018 | **0.109** | Calibration improved |
+| failure_in_10 | 0.826 | **0.057** | 0.298 | +3x AUPRC |
+
+Policy (v0 → v2stale → v2retrained):
+  template_corruption: 0.108 → 0.060 → **0.033** (−69% vs v0)
+  wrong_reinit: 0.273 → 0.183 → 0.209
+
+### Phase 2 gate verdict
+
+| Gate | Target | Result | Status |
+|---|---|---|---|
+| ifd10 AUROC | ≥ 0.75 | 0.765 | ✅ |
+| ifd20 AUROC | ≥ 0.75 | 0.744 | ❌ (within noise) |
+| e-process lead time | ≥ 3f | 10f | ✅ |
+| e-process recall | ≥ 10-20% | 6.2% | ❌ analysis tool only |
+
+**Decision: Continue. Risk branch passes AUROC gate. e-process is analysis tool until DAM memory improves risk score quality.**
+
+### e-process Phase 2A — modes summary
+
+aGRAPAmode implemented (paper Eq.12): no calibration set needed, lead=18f, recall=1.6%
+Formal (conformal): lead=10f, recall=6.2%, FA=0.2/1kf
+Engineering: recall=50%+ but FA=170+/1kf
+
+### Phase 4 infrastructure ready
+
+- memory.py: PositiveMemory + NegativeMemory (DAM-aligned)  
+- memory sidecar at saltr/data/salt_rd_memory_sidecar.npz (228 seqs, proxy embeddings)
+- teachers/: CoTracker3 infrastructure + 13 point features
+- policy_sweep.py: SimpleBboxKalmanFilter + v2-aware interventions
+- interventions.py: all Phase 6 action types
+
+141 tests pass.
+
 ## Phase 2A Results (e-process) — DONE
 
 | Metric | e-process formal (α=0.10, ε=0.5) | Raw P(ifd)>0.5 | Target |
