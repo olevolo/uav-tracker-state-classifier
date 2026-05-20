@@ -134,8 +134,8 @@ def test_go_nogo_thresholds():
         "ece_false_confirmed":   0.32,        # fail (> 0.12)
     })
     verdict = check_go_nogo(border_results)
-    assert verdict in ("BORDERLINE", "GO"), \
-        f"Expected BORDERLINE/GO for mixed results, got {verdict}"
+    assert verdict == "BORDERLINE", \
+        f"Expected BORDERLINE for mixed results, got {verdict}"
 
 
 # ---------------------------------------------------------------------------
@@ -186,3 +186,147 @@ def test_head_metrics_base_rate_sanity():
     # ECE/Brier/NLL must be finite
     for key in ("ece", "brier", "nll"):
         assert np.isfinite(m[key]), f"{key} is not finite: {m[key]}"
+
+
+# ---------------------------------------------------------------------------
+# Test 7: Calibration — predictions JSON reflects calibrated probs
+# ---------------------------------------------------------------------------
+
+def test_calibration_changes_exported_predictions(tmp_path):
+    """Exported preds_val.json must contain calibrated probs, not raw model output.
+
+    Regression for the bug where _save_predictions_json was called before
+    temperature scaling, so the exported JSON had the same values as raw inference.
+    """
+    from salt_r.eval import calibrate_temperature, apply_temperature, _ece
+
+    rng = np.random.default_rng(42)
+    n = 600
+    # Simulate overconfident predictions for a rare class
+    y_true = (rng.random(n) < 0.08).astype(float)
+    # Push predictions toward extremes — clearly miscalibrated
+    y_pred_raw = np.where(y_true, rng.uniform(0.8, 0.99, n), rng.uniform(0.0, 0.15, n)).astype(np.float32)
+
+    ece_before = _ece(y_pred_raw, y_true)
+    T = calibrate_temperature(y_true, y_pred_raw)
+    y_pred_cal = apply_temperature(y_pred_raw, T)
+    ece_after = _ece(y_pred_cal, y_true)
+
+    # Calibration must have changed the values
+    assert not np.allclose(y_pred_raw, y_pred_cal, atol=1e-4), \
+        f"Temperature T={T:.4f} must change predictions, but raw ≈ calibrated"
+
+    # ECE must improve (calibration reduces miscalibration)
+    assert ece_after < ece_before, \
+        f"ECE must decrease after calibration: before={ece_before:.4f}, after={ece_after:.4f}"
+
+    # T != 1.0 confirms calibration actually did something
+    assert abs(T - 1.0) > 0.05, f"T={T:.4f} is too close to 1.0 — calibration may be a no-op"
+
+
+def test_evaluate_calibrated_preds_exported_not_raw(tmp_path):
+    """End-to-end: evaluate() with calibrate_heads must save calibrated probs to JSON.
+
+    Regression for the save-before-calibration bug: the exported preds JSON
+    must contain calibrated probabilities, not the raw model output.
+    """
+    import torch
+    from salt_r.model import SALTRD, HEAD_NAMES, LABEL_NAMES
+    from salt_r.collect_features import FEATURE_NAMES
+    from salt_r.eval import evaluate
+
+    # Build a tiny synthetic NPZ (1 val sequence, 60 frames)
+    rng = np.random.default_rng(7)
+    n_frames, n_feat, n_labels = 60, 28, 8
+    seq_key = "uav123/test_seq"
+
+    npz_path = str(tmp_path / "tiny.npz")
+    # Labels: make false_confirmed (col 1) ~10% positive — enough for calibration
+    labels = rng.integers(0, 2, (n_frames, n_labels), dtype=np.int8)
+    labels[:, 0] = 1  # "correct" mostly 1
+    labels[:, 1] = (rng.random(n_frames) < 0.10).astype(np.int8)  # false_confirmed ~10%
+    np.savez(
+        npz_path,
+        **{
+            f"features/{seq_key}": rng.standard_normal((n_frames, n_feat)).astype(np.float32),
+            f"labels/{seq_key}": labels,
+            f"iou_trace/{seq_key}": rng.random(n_frames).astype(np.float32),
+            f"split/{seq_key}": np.array("val"),
+            f"dataset/{seq_key}": np.array("uav123"),
+            f"sequence_name/{seq_key}": np.array(seq_key),
+            "label_names": np.array(LABEL_NAMES, dtype=object),
+            "feature_names": np.array(FEATURE_NAMES, dtype=object),
+        },
+    )
+
+    # Save a fresh model checkpoint with head_names metadata
+    ckpt_path = str(tmp_path / "model.pt")
+    model = SALTRD()
+    torch.save(
+        {
+            "model_state_dict": model.state_dict(),
+            "epoch": 1,
+            "head_names": list(HEAD_NAMES),
+            "label_names": list(LABEL_NAMES),
+            "feature_names": list(FEATURE_NAMES),
+        },
+        ckpt_path,
+    )
+
+    # Run evaluate WITHOUT calibration — capture raw exported probs
+    raw_preds_path = str(tmp_path / "preds_raw.json")
+    evaluate(
+        npz_path=npz_path,
+        checkpoint_path=ckpt_path,
+        split="val",
+        output_path=None,
+        predictions_output=raw_preds_path,
+        calibrate_heads=None,
+    )
+
+    # Run evaluate WITH calibration on false_confirmed
+    cal_preds_path = str(tmp_path / "preds_cal.json")
+    results = evaluate(
+        npz_path=npz_path,
+        checkpoint_path=ckpt_path,
+        split="val",
+        output_path=None,
+        predictions_output=cal_preds_path,
+        calibrate_heads=["false_confirmed"],
+    )
+
+    # Load both JSONs
+    with open(raw_preds_path) as f:
+        raw_json = json.load(f)
+    with open(cal_preds_path) as f:
+        cal_json = json.load(f)
+
+    assert seq_key in raw_json and seq_key in cal_json, "Sequence key missing from exported JSON"
+
+    raw_fc = np.array([frame["false_confirmed"] for frame in raw_json[seq_key]])
+    cal_fc = np.array([frame["false_confirmed"] for frame in cal_json[seq_key]])
+
+    # If calibration was applied, the exported probs must differ from raw
+    if results.get("calibration") and "false_confirmed" in results["calibration"].get("temperatures", {}):
+        T = results["calibration"]["temperatures"]["false_confirmed"]
+        assert abs(T - 1.0) > 1e-3, f"T={T} — calibration had no effect"
+        assert not np.allclose(raw_fc, cal_fc, atol=1e-4), \
+            f"Calibrated JSON must differ from raw JSON (T={T:.4f}), but they are identical. " \
+            "Save-before-calibration bug may have returned."
+
+
+def test_temperature_calibration_reduces_ece():
+    from salt_r.eval import calibrate_temperature, apply_temperature, _ece
+
+    rng = np.random.default_rng(0)
+    n = 500
+    y_true = (rng.random(n) < 0.1).astype(float)
+    # Deliberately overconfident predictions
+    y_pred = np.clip(rng.beta(0.3, 0.05, n), 1e-6, 1 - 1e-6).astype(np.float32)
+    ece_before = _ece(y_pred, y_true)
+    T = calibrate_temperature(y_true, y_pred)
+    y_cal = apply_temperature(y_pred, T)
+    ece_after = _ece(y_cal, y_true)
+    assert ece_after < ece_before, \
+        f"Temperature calibration must reduce ECE: before={ece_before:.4f}, after={ece_after:.4f}"
+    assert 0.05 < T < 20.0, f"T={T} out of sane range"

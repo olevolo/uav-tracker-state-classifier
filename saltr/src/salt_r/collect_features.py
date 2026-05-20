@@ -113,6 +113,30 @@ LABEL_NAMES: List[str] = [
 
 N_LABELS: int = len(LABEL_NAMES)  # 8
 
+# v1 schema: adds two semantically distinct dynamic labels.
+# hard_dynamic_scene_v2  — motion/ambiguity only (no future IoU lookahead)
+# imminent_failure_dynamic — dynamic scene approaching failure (future_risk component)
+# v0 hard_dynamic_scene = union of both, retained for continuity.
+LABEL_NAMES_V1: List[str] = LABEL_NAMES + [
+    "hard_dynamic_scene_v2",     # 8: is_dynamic & (peak_margin_low | flow_consistency_low)
+    "imminent_failure_dynamic",  # 9: is_dynamic & future_risk (5-frame window)
+]
+N_LABELS_V1: int = len(LABEL_NAMES_V1)  # 10
+
+# v2 schema: adds longer-horizon failure labels for proactive recovery research.
+# All v1 columns (0-9) preserved.  New columns:
+#   10: failure_in_10           — currently OK, mean IoU < 0.3 in next 10 frames
+#   11: failure_in_20           — currently OK, mean IoU < 0.3 in next 20 frames
+#   12: imminent_failure_dyn_10 — is_dynamic & min(iou_next10) < 0.3
+#   13: imminent_failure_dyn_20 — is_dynamic & min(iou_next20) < 0.3
+LABEL_NAMES_V2: List[str] = LABEL_NAMES_V1 + [
+    "failure_in_10",                  # 10: proactive 10-frame failure warning
+    "failure_in_20",                  # 11: proactive 20-frame failure warning
+    "imminent_failure_dynamic_10",    # 12: dynamic + 10-frame future risk
+    "imminent_failure_dynamic_20",    # 13: dynamic + 20-frame future risk
+]
+N_LABELS_V2: int = len(LABEL_NAMES_V2)  # 14
+
 # ---------------------------------------------------------------------------
 # Diagnostic sequences — known edge-cases for per-sequence debugging
 # ---------------------------------------------------------------------------
@@ -839,6 +863,241 @@ def collect_dataset(
         print(f"Saved {output_path}")
         print(ds.summary())
     return ds
+
+
+# ---------------------------------------------------------------------------
+# Label versioning — v1 extends v0 without re-running the tracker
+# ---------------------------------------------------------------------------
+
+
+def _compute_v1_extra_labels(
+    labels_v0: np.ndarray,
+    features: np.ndarray,
+    iou_trace: np.ndarray,
+    feature_names: List[str],
+) -> np.ndarray:
+    """Compute the two v1-only label columns from existing v0 data.
+
+    Parameters
+    ----------
+    labels_v0:
+        Existing v0 label array, shape (n_frames, 8).
+    features:
+        Feature matrix, shape (n_frames, n_features).
+    iou_trace:
+        GT IoU per frame, shape (n_frames,).
+    feature_names:
+        Ordered list matching features columns.
+
+    Returns
+    -------
+    np.ndarray of shape (n_frames, 2) — columns:
+        0: hard_dynamic_scene_v2   (is_dynamic & ambiguity only)
+        1: imminent_failure_dynamic (is_dynamic & future_risk)
+    """
+    n = len(iou_trace)
+    is_dynamic = (labels_v0[:, 4] | labels_v0[:, 5]).astype(bool)
+
+    # Recover peak_margin and flow_consistency from feature matrix
+    peak_margin = np.zeros(n, dtype=np.float32)
+    flow_consistency = np.full(n, 1.0, dtype=np.float32)
+    for i, name in enumerate(feature_names):
+        if name == "peak_margin" and i < features.shape[1]:
+            peak_margin = features[:, i].astype(float)
+        if name == "flow_consistency" and i < features.shape[1]:
+            flow_consistency = features[:, i].astype(float)
+
+    peak_margin_low = peak_margin < np.percentile(peak_margin, 25)
+    flow_consistency_low = flow_consistency < 0.3
+
+    # v2: motion/ambiguity only — no future IoU lookahead
+    hds_v2 = (is_dynamic & (peak_margin_low | flow_consistency_low)).astype(np.int8)
+
+    # imminent_failure_dynamic: dynamic + future_risk
+    future_risk = np.zeros(n, dtype=bool)
+    for t in range(n):
+        future = iou_trace[t + 1 : t + 6]
+        if len(future) > 0 and future.min() < 0.3:
+            future_risk[t] = True
+    ifd = (is_dynamic & future_risk).astype(np.int8)
+
+    return np.stack([hds_v2, ifd], axis=1)
+
+
+def recompute_labels_v1(
+    npz_v0_path: str,
+    output_path: str,
+) -> None:
+    """Produce a v1 NPZ from an existing v0 NPZ without re-running the tracker.
+
+    v1 adds two columns to each ``labels/{seq}`` array:
+    - ``hard_dynamic_scene_v2``   (index 8): motion/ambiguity, no future_risk
+    - ``imminent_failure_dynamic`` (index 9): is_dynamic & future_risk
+
+    v0 labels (indices 0–7) are preserved unchanged.
+
+    Parameters
+    ----------
+    npz_v0_path:
+        Path to the source ``salt_rd_v0.npz``.
+    output_path:
+        Where to write the new ``salt_rd_v1.npz``.
+        Must be different from ``npz_v0_path``.
+    """
+    import os
+    if os.path.abspath(npz_v0_path) == os.path.abspath(output_path):
+        raise ValueError("output_path must differ from npz_v0_path to avoid overwriting v0")
+
+    data = np.load(npz_v0_path, allow_pickle=True)
+
+    try:
+        feature_names: List[str] = list(data["feature_names"].tolist())
+    except Exception:
+        feature_names = list(FEATURE_NAMES)
+
+    keys = [k[len("features/"):] for k in data.files if k.startswith("features/")]
+
+    out: dict = {}
+    # Copy all non-label arrays verbatim
+    for k in data.files:
+        if not k.startswith("labels/"):
+            out[k] = data[k]
+
+    # Extend each labels array with the 2 new columns
+    for seq_key in keys:
+        labels_v0 = data[f"labels/{seq_key}"].astype(np.int8)
+        features = data[f"features/{seq_key}"].astype(np.float32)
+        iou_trace = data[f"iou_trace/{seq_key}"].astype(np.float32)
+        extra = _compute_v1_extra_labels(labels_v0, features, iou_trace, feature_names)
+        out[f"labels/{seq_key}"] = np.concatenate([labels_v0, extra], axis=1)
+
+    # Update label schema metadata
+    out["label_names"] = np.array(LABEL_NAMES_V1, dtype=object)
+
+    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+    np.savez_compressed(output_path, **out)
+    print(f"v1 NPZ written to: {output_path}  ({len(keys)} sequences, {N_LABELS_V1} labels)")
+
+
+# ---------------------------------------------------------------------------
+# Label versioning — v2 extends v1 with longer-horizon failure labels
+# ---------------------------------------------------------------------------
+
+
+def _compute_v2_extra_labels(
+    labels_v1: np.ndarray,
+    iou_trace: np.ndarray,
+) -> np.ndarray:
+    """Compute the four v2-only label columns from existing v1 data.
+
+    Parameters
+    ----------
+    labels_v1:
+        Existing v1 label array, shape (n_frames, 10).
+    iou_trace:
+        GT IoU per frame, shape (n_frames,).
+
+    Returns
+    -------
+    np.ndarray of shape (n_frames, 4) — columns:
+        0: failure_in_10              (currently OK, mean IoU < 0.3 within 10 frames)
+        1: failure_in_20              (currently OK, mean IoU < 0.3 within 20 frames)
+        2: imminent_failure_dynamic_10 (is_dynamic & min(iou_next10) < 0.3)
+        3: imminent_failure_dynamic_20 (is_dynamic & min(iou_next20) < 0.3)
+    """
+    n = len(iou_trace)
+    is_dynamic = (labels_v1[:, 4] | labels_v1[:, 5]).astype(bool)
+
+    fi10 = np.zeros(n, dtype=np.int8)
+    fi20 = np.zeros(n, dtype=np.int8)
+    ifd10 = np.zeros(n, dtype=np.int8)
+    ifd20 = np.zeros(n, dtype=np.int8)
+
+    for t in range(n):
+        iou_10 = iou_trace[t + 1 : t + 11]
+        iou_20 = iou_trace[t + 1 : t + 21]
+
+        # failure_in_10: currently OK, mean future IoU < 0.3 over 10-frame horizon
+        if iou_trace[t] >= 0.5 and len(iou_10) > 0 and float(iou_10.mean()) < 0.3:
+            fi10[t] = 1
+
+        # failure_in_20: same but 20-frame horizon
+        if iou_trace[t] >= 0.5 and len(iou_20) > 0 and float(iou_20.mean()) < 0.3:
+            fi20[t] = 1
+
+        # imminent_failure_dynamic_10: currently OK + dynamic scene + min IoU < 0.3 in next 10
+        # Requires iou_trace[t] >= 0.5 so this is a proactive warning, not "already failed"
+        if iou_trace[t] >= 0.5 and is_dynamic[t] and len(iou_10) == 10 and float(iou_10.min()) < 0.3:
+            ifd10[t] = 1
+
+        # imminent_failure_dynamic_20: currently OK + dynamic scene + min IoU < 0.3 in next 20
+        if iou_trace[t] >= 0.5 and is_dynamic[t] and len(iou_20) == 20 and float(iou_20.min()) < 0.3:
+            ifd20[t] = 1
+
+    return np.stack([fi10, fi20, ifd10, ifd20], axis=1)
+
+
+def recompute_labels_v2(
+    npz_v1_path: str,
+    output_path: str,
+) -> None:
+    """Produce a v2 NPZ from an existing v1 NPZ without re-running the tracker.
+
+    v2 adds four columns to each ``labels/{seq}`` array:
+    - ``failure_in_10``               (index 10): 10-frame horizon failure warning
+    - ``failure_in_20``               (index 11): 20-frame horizon failure warning
+    - ``imminent_failure_dynamic_10`` (index 12): dynamic + 10-frame future risk
+    - ``imminent_failure_dynamic_20`` (index 13): dynamic + 20-frame future risk
+
+    v0/v1 labels (indices 0–9) are preserved unchanged.
+
+    Parameters
+    ----------
+    npz_v1_path:
+        Path to the source ``salt_rd_v1_labels.npz``.
+    output_path:
+        Where to write ``salt_rd_v2_labels.npz``.  Must differ from input.
+    """
+    import os
+    if os.path.abspath(npz_v1_path) == os.path.abspath(output_path):
+        raise ValueError("output_path must differ from npz_v1_path to avoid overwriting v1")
+
+    data = np.load(npz_v1_path, allow_pickle=True)
+
+    # Validate input is v1 schema to prevent silent corruption from v0 input
+    stored_names = list(data["label_names"]) if "label_names" in data else []
+    if stored_names != LABEL_NAMES_V1:
+        raise ValueError(
+            f"Input NPZ has label_names={stored_names!r} — expected v1 schema {LABEL_NAMES_V1!r}. "
+            "Run recompute_labels_v1() first if starting from v0."
+        )
+    # Also validate per-sequence shape
+    sample_keys = [k[len("labels/"):] for k in data.files if k.startswith("labels/")]
+    if sample_keys:
+        sample = data[f"labels/{sample_keys[0]}"]
+        if sample.shape[1] != N_LABELS_V1:
+            raise ValueError(
+                f"labels/{sample_keys[0]} has shape {sample.shape} — expected (T, {N_LABELS_V1}). "
+                "Input is not a valid v1 NPZ."
+            )
+    keys = [k[len("features/"):] for k in data.files if k.startswith("features/")]
+
+    out: dict = {}
+    for k in data.files:
+        if not k.startswith("labels/"):
+            out[k] = data[k]
+
+    for seq_key in keys:
+        labels_v1 = data[f"labels/{seq_key}"].astype(np.int8)
+        iou_trace = data[f"iou_trace/{seq_key}"].astype(np.float32)
+        extra = _compute_v2_extra_labels(labels_v1, iou_trace)
+        out[f"labels/{seq_key}"] = np.concatenate([labels_v1, extra], axis=1)
+
+    out["label_names"] = np.array(LABEL_NAMES_V2, dtype=object)
+
+    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+    np.savez_compressed(output_path, **out)
+    print(f"v2 NPZ written to: {output_path}  ({len(keys)} sequences, {N_LABELS_V2} labels)")
 
 
 # ---------------------------------------------------------------------------

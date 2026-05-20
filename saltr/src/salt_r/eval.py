@@ -16,8 +16,12 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import subprocess
+import sys
 import warnings
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -28,6 +32,115 @@ try:
     from salt_r.model import HEAD_NAMES as _HEAD_NAMES
 except Exception:
     _HEAD_NAMES: list[str] = []
+
+
+
+# ---------------------------------------------------------------------------
+# Provenance helpers
+# ---------------------------------------------------------------------------
+
+
+def _file_md5(path: str | None) -> str | None:
+    if not path:
+        return None
+    p = Path(path)
+    if not p.exists():
+        return None
+    h = hashlib.md5()
+    with open(p, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _git_commit() -> str | None:
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], stderr=subprocess.DEVNULL
+        ).decode().strip()
+    except Exception:
+        return None
+
+
+def _build_provenance(
+    npz_path: str,
+    checkpoint_path: str | None,
+    split: str,
+) -> dict[str, Any]:
+    return {
+        "git_commit": _git_commit(),
+        "npz_path": str(npz_path),
+        "npz_md5": _file_md5(npz_path),
+        "checkpoint_path": str(checkpoint_path) if checkpoint_path else None,
+        "checkpoint_md5": _file_md5(checkpoint_path) if checkpoint_path else None,
+        "split": split,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "command": sys.argv,
+    }
+
+
+
+# ---------------------------------------------------------------------------
+# Temperature scaling (post-hoc calibration)
+# ---------------------------------------------------------------------------
+
+#: Reliability heads for which calibration is well-defined (clean labels, good AUROC).
+RELIABILITY_HEADS: tuple[str, ...] = ("false_confirmed", "failure_in_5", "recoverable")
+
+
+def calibrate_temperature(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    """Fit a per-head scalar temperature T by minimising NLL on the val split.
+
+    Calibration formula: ``p_cal = sigmoid(logit(p) / T)``
+    where ``logit(p) = log(p / (1-p))``.
+
+    Uses a grid search (100 candidates over [0.1, 10]) followed by ternary
+    search refinement.  No scipy dependency.
+
+    Parameters
+    ----------
+    y_true:
+        Binary ground-truth, shape ``(N,)``.  Must be from the **val split only**.
+        Never pass train-split labels.
+    y_pred:
+        Predicted probabilities in ``(0, 1)``, shape ``(N,)``.
+
+    Returns
+    -------
+    float
+        Optimal temperature T (T=1.0 ↔ no calibration needed).
+    """
+    eps = 1e-6
+    p_safe = np.clip(y_pred.astype(np.float64), eps, 1 - eps)
+    logits = np.log(p_safe / (1 - p_safe))
+
+    def nll_at_T(T: float) -> float:
+        T = max(T, eps)
+        p_cal = 1.0 / (1.0 + np.exp(-logits / T))
+        p_cal = np.clip(p_cal, eps, 1 - eps)
+        return float(-np.mean(y_true * np.log(p_cal) + (1 - y_true) * np.log(1 - p_cal)))
+
+    T_grid = np.linspace(0.1, 10.0, 100)
+    best_T = float(T_grid[np.argmin([nll_at_T(T) for T in T_grid])])
+
+    lo, hi = max(0.05, best_T - 1.0), best_T + 1.0
+    for _ in range(50):
+        m1 = lo + (hi - lo) / 3
+        m2 = hi - (hi - lo) / 3
+        if nll_at_T(m1) < nll_at_T(m2):
+            hi = m2
+        else:
+            lo = m1
+    return float((lo + hi) / 2.0)
+
+
+def apply_temperature(y_pred: np.ndarray, T: float) -> np.ndarray:
+    """Apply temperature T: ``p_cal = sigmoid(logit(p) / T)``."""
+    eps = 1e-6
+    p_safe = np.clip(y_pred.astype(np.float64), eps, 1 - eps)
+    logits = np.log(p_safe / (1 - p_safe))
+    p_cal = 1.0 / (1.0 + np.exp(-logits / T))
+    return np.clip(p_cal, 0.0, 1.0).astype(np.float32)
 
 
 # ---------------------------------------------------------------------------
@@ -102,18 +215,23 @@ def _average_precision_score(y_true: np.ndarray, y_score: np.ndarray) -> float:
 # ---------------------------------------------------------------------------
 
 GO_THRESHOLDS: dict[str, float] = {
-    "auprc_false_confirmed":     0.30,   # > → GO
-    "auroc_false_confirmed":     0.65,
-    "auroc_failure_in_5":        0.75,
-    "auroc_hard_dynamic_scene":  0.75,
-    "auroc_needs_full_compute":  0.70,
-    "ece_false_confirmed":       0.12,   # < → GO (lower is better)
+    # Reliability heads (all schemas)
+    "auprc_false_confirmed":              0.30,   # > → GO
+    "auroc_false_confirmed":              0.65,
+    "auroc_failure_in_5":                 0.75,
+    "ece_false_confirmed":                0.12,   # < → GO (lower is better)
+    # Compute policy (all schemas)
+    "auroc_needs_full_compute":           0.70,
+    # v1 schema: dynamicity decomposed — replaces auroc_hard_dynamic_scene
+    # Gate is skipped (NaN) when head is absent, so v0 evals are unaffected.
+    "auroc_imminent_failure_dynamic":     0.75,
+    "auprc_imminent_failure_dynamic":     0.15,  # ≈ 3.5x base rate (~4.2%)
 }
 
 STOP_THRESHOLDS: dict[str, float] = {
-    "auprc_false_confirmed":     0.15,
-    "auroc_false_confirmed":     0.55,
-    "auroc_failure_in_5":        0.65,
+    "auprc_false_confirmed":              0.15,
+    "auroc_false_confirmed":              0.55,
+    "auroc_failure_in_5":                 0.65,
 }
 
 # Heads whose ECE is lower-is-better for the GO gate
@@ -289,6 +407,101 @@ def compute_nt2f(
 
 
 # ---------------------------------------------------------------------------
+# Failure lead-time metric for imminent_failure_dynamic
+# ---------------------------------------------------------------------------
+
+
+def compute_failure_lead_time(
+    iou_dict: dict[str, np.ndarray],
+    preds_dict: dict[str, np.ndarray],
+    labels_dict: dict[str, np.ndarray],
+    label_names: list[str],
+    head_names: list[str],
+    threshold: float = 0.50,
+    iou_failure_threshold: float = 0.30,
+    label_name: str = "imminent_failure_dynamic",
+    horizon: int = 5,
+) -> dict[str, Any]:
+    """Measure how many frames before IoU degradation the model raises an alarm.
+
+    For each frame t where ``imminent_failure_dynamic=1`` (label) and
+    ``P(imminent_failure_dynamic) > threshold`` (model), compute the lead
+    time as the number of frames until the nearest future IoU drop below
+    ``iou_failure_threshold`` in the window [t+1, t+6].
+
+    Returns a dict with:
+      - ``lead_times``: list of per-TP lead time values (frames, 1–5)
+      - ``median_lead_time``: median over all TP frames (frames)
+      - ``mean_lead_time``: mean over all TP frames
+      - ``n_true_positives``: TP count at given threshold
+      - ``n_false_alarms``: FP count at given threshold
+      - ``recall_at_threshold``: TP / (TP + FN) at given threshold
+      - ``false_alarm_rate``: FP / (FP + TN) at given threshold
+    """
+    if label_name not in label_names:
+        return {"note": f"{label_name} not in label schema — skipping lead-time"}
+    if label_name not in head_names:
+        return {"note": f"{label_name} not in model heads — skipping lead-time"}
+
+    lbl_idx = label_names.index(label_name)
+    pred_idx = head_names.index(label_name)
+
+    lead_times: list[int] = []
+    tp = fp = tn = fn = 0
+
+    for seq_key in labels_dict:
+        lab = labels_dict[seq_key].astype(int)
+        iou = iou_dict.get(seq_key)
+        pred_arr = preds_dict.get(seq_key)
+
+        if iou is None or pred_arr is None:
+            continue
+        if lbl_idx >= lab.shape[1] or pred_idx >= pred_arr.shape[1]:
+            continue
+
+        y_true = lab[:, lbl_idx]
+        y_pred = pred_arr[:, pred_idx]
+        n = len(iou)
+
+        for t in range(n):
+            predicted_high = y_pred[t] > threshold
+            actually_positive = y_true[t] == 1
+
+            if predicted_high and actually_positive:
+                tp += 1
+                # Lead time = first future frame where IoU drops below threshold
+                lead = 0
+                for k in range(1, horizon + 2):
+                    if t + k < n and iou[t + k] < iou_failure_threshold:
+                        lead = k
+                        break
+                lead_times.append(lead)
+            elif predicted_high and not actually_positive:
+                fp += 1
+            elif not predicted_high and actually_positive:
+                fn += 1
+            else:
+                tn += 1
+
+    n_pos = tp + fn
+    n_neg = fp + tn
+    return {
+        "threshold": threshold,
+        "median_lead_time": float(np.median(lead_times)) if lead_times else float("nan"),
+        "mean_lead_time": float(np.mean(lead_times)) if lead_times else float("nan"),
+        "n_true_positives": tp,
+        "n_false_alarms": fp,
+        "recall_at_threshold": tp / max(n_pos, 1),
+        "false_alarm_rate": fp / max(n_neg, 1),
+        "lead_time_dist": {
+            "p25": float(np.percentile(lead_times, 25)) if lead_times else float("nan"),
+            "p50": float(np.percentile(lead_times, 50)) if lead_times else float("nan"),
+            "p75": float(np.percentile(lead_times, 75)) if lead_times else float("nan"),
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
 # Bootstrap confidence intervals (sequence-level resampling)
 # ---------------------------------------------------------------------------
 
@@ -443,35 +656,26 @@ def _load_npz_split(
 def _load_model(checkpoint_path: str, n_features: int, n_labels: int, device: str):
     """Load SALTRD model from checkpoint.
 
-    Falls back gracefully when the model module has not yet been fully
-    implemented (stub) — returns None in that case so callers can skip
-    the inference step and still exercise the metric functions.
+    Reads ``head_names`` from checkpoint metadata so v0 (7 heads) and v1 (9 heads)
+    checkpoints both load correctly without manual schema selection.
 
-    Parameters
-    ----------
-    checkpoint_path:
-        Path to a PyTorch checkpoint (.pt / .pth) saved by train.py.
-    n_features:
-        Number of input features (typically 28).
-    n_labels:
-        Number of output heads (typically 8).
-    device:
-        Torch device string, e.g. "cpu" or "cuda".
-
-    Returns
-    -------
-    model or None.
+    Returns model or None on failure.
     """
     try:
         import torch
-        from salt_r.model import SALTRD
+        from salt_r.model import SALTRD, HEAD_NAMES
 
-        model = SALTRD()
         state = torch.load(checkpoint_path, map_location=device)
-        if isinstance(state, dict) and "model_state_dict" in state:
-            model.load_state_dict(state["model_state_dict"])
-        elif isinstance(state, dict) and "state_dict" in state:
-            model.load_state_dict(state["state_dict"])
+        checkpoint_data = state if isinstance(state, dict) else {}
+
+        # Derive head names: prefer metadata embedded by train.py, else v0 default.
+        head_names = checkpoint_data.get("head_names", list(HEAD_NAMES))
+
+        model = SALTRD(head_names=head_names)
+        if isinstance(checkpoint_data, dict) and "model_state_dict" in checkpoint_data:
+            model.load_state_dict(checkpoint_data["model_state_dict"])
+        elif isinstance(checkpoint_data, dict) and "state_dict" in checkpoint_data:
+            model.load_state_dict(checkpoint_data["state_dict"])
         else:
             model.load_state_dict(state)
         model.eval()
@@ -548,10 +752,11 @@ def _run_inference(
             )  # (n, window_size, F)
 
             out = model(x_batch)  # dict[str, Tensor(n,)] or Tensor(n, heads)
-            from salt_r.model import HEAD_NAMES
             if isinstance(out, dict):
+                # Use key order from the model's own heads — correct for v0 and v1.
+                _out_heads = list(out.keys())
                 prob_matrix = np.stack(
-                    [out[h].detach().cpu().numpy() for h in HEAD_NAMES],
+                    [out[h].detach().cpu().numpy() for h in _out_heads],
                     axis=1,
                 ).astype(np.float32)
             else:
@@ -614,13 +819,16 @@ def _print_summary_table(
 def _save_predictions_json(
     preds_dict: dict[str, np.ndarray],
     predictions_output: str,
+    head_names: list[str] | None = None,
 ) -> None:
     """Save per-sequence per-frame probabilities as JSON for policy.py --probs-json."""
-    from salt_r.model import HEAD_NAMES
+    if head_names is None:
+        from salt_r.model import HEAD_NAMES
+        head_names = list(HEAD_NAMES)
     serializable: dict[str, list[dict[str, float]]] = {}
     for seq_key, pred in preds_dict.items():
         serializable[seq_key] = [
-            {h: float(pred[t, i]) for i, h in enumerate(HEAD_NAMES)}
+            {h: float(pred[t, i]) for i, h in enumerate(head_names) if i < pred.shape[1]}
             for t in range(pred.shape[0])
         ]
     Path(predictions_output).parent.mkdir(parents=True, exist_ok=True)
@@ -641,6 +849,7 @@ def evaluate(
     device: str = "cpu",
     output_path: str | None = None,
     predictions_output: str | None = None,
+    calibrate_heads: list[str] | None = None,
 ) -> dict[str, Any]:
     """Run full evaluation and return results dict.
 
@@ -711,8 +920,19 @@ def evaluate(
     preds_dict = _run_inference(model, features_dict, window_size, device)
     has_preds = bool(preds_dict)
 
-    if predictions_output and preds_dict:
-        _save_predictions_json(preds_dict, predictions_output)
+    # Derive actual head names from the loaded model (works for v0 and v1 schemas).
+    # Fallback to module-level default when no model is available.
+    if model is not None:
+        _model_head_names: list[str] = list(model.heads.keys())
+    else:
+        _model_head_names = list(_HEAD_NAMES)
+
+    # Labels not predicted by the model (e.g. "correct") get a 0.5 placeholder —
+    # track them explicitly so metrics output is clearly marked as "no model prediction".
+    _labels_without_model_pred: set[str] = set(label_names) - set(_model_head_names)
+
+    # predictions_output is saved AFTER calibration (step 3.5) so that
+    # exported JSON always reflects the calibrated probabilities.
 
     # ------------------------------------------------------------------
     # 3. Aggregate labels and predictions across sequences
@@ -741,9 +961,8 @@ def evaluate(
             if has_preds and seq_key in preds_dict:
                 p = preds_dict[seq_key]  # (n_frames, n_head_preds)
                 try:
-                    from salt_r.model import HEAD_NAMES as _HN
-                    if head in _HN:
-                        pred_col = _HN.index(head)
+                    if head in _model_head_names:
+                        pred_col = _model_head_names.index(head)
                         all_y_pred[head].append(p[:, pred_col] if pred_col < p.shape[1] else np.full(len(lab), 0.5, np.float32))
                     else:
                         all_y_pred[head].append(np.full(len(lab), 0.5, np.float32))
@@ -757,10 +976,9 @@ def evaluate(
             yt = lab[:, fc_idx]
             if has_preds and seq_key in preds_dict:
                 try:
-                    from salt_r.model import HEAD_NAMES as _HN2
-                    fc_pred_idx = _HN2.index("false_confirmed")
+                    fc_pred_idx = _model_head_names.index("false_confirmed")
                     yp = preds_dict[seq_key][:, fc_pred_idx]
-                except Exception:
+                except (ValueError, IndexError):
                     yp = preds_dict[seq_key][:, fc_idx] if fc_idx < preds_dict[seq_key].shape[1] else np.full(len(yt), yt.mean(), np.float32)
             else:
                 yp = np.full(len(yt), yt.mean(), dtype=np.float32)
@@ -774,12 +992,58 @@ def evaluate(
                     pass
 
     # ------------------------------------------------------------------
+    # 3.5. Temperature calibration — reliability heads only (val split)
+    # ------------------------------------------------------------------
+    temperatures: dict[str, float] = {}
+    metrics_before_cal: dict[str, dict[str, float]] = {}
+
+    if calibrate_heads:
+        print("\n--- Temperature scaling ---")
+        for head in calibrate_heads:
+            if head not in label_names:
+                print(f"  {head}: not in label_names — skipping")
+                continue
+            if not all_y_true.get(head) or not all_y_pred.get(head):
+                continue
+            y_true_cat = np.concatenate(all_y_true[head])
+            y_pred_cat = np.concatenate(all_y_pred[head])
+            if len(y_true_cat) == 0:
+                continue
+            br = float(y_true_cat.mean())
+            if br == 0.0 or br == 1.0:
+                print(f"  {head}: base_rate={br:.4f} — degenerate, skipping calibration")
+                continue
+
+            metrics_before_cal[head] = compute_head_metrics(y_true_cat, y_pred_cat, head)
+            T = calibrate_temperature(y_true_cat, y_pred_cat)
+            temperatures[head] = T
+
+            # Apply T in-place to per-sequence prediction lists (step 4 sees calibrated probs)
+            all_y_pred[head] = [apply_temperature(arr, T) for arr in all_y_pred[head]]
+
+            # Also calibrate the predictions JSON output (preds_dict)
+            if preds_dict and head in _model_head_names:
+                head_col = _model_head_names.index(head)
+                for seq_key in preds_dict:
+                    preds_dict[seq_key][:, head_col] = apply_temperature(
+                        preds_dict[seq_key][:, head_col], T
+                    )
+
+            ece_before = metrics_before_cal[head]["ece"]
+            print(f"  {head:<25}  T={T:.4f}  ECE_before={ece_before:.4f}")
+
+    # Save predictions after calibration so the JSON reflects calibrated probs.
+    if predictions_output and preds_dict:
+        _save_predictions_json(preds_dict, predictions_output, head_names=_model_head_names)
+
+    # ------------------------------------------------------------------
     # 4. Compute per-head metrics
     # ------------------------------------------------------------------
     head_metrics: dict[str, dict[str, float]] = {}
     for head in label_names:
         y_true_cat = np.concatenate(all_y_true[head]) if all_y_true[head] else np.array([])
         y_pred_cat = np.concatenate(all_y_pred[head]) if all_y_pred[head] else np.array([])
+        model_predicted = head not in _labels_without_model_pred
         if len(y_true_cat) == 0:
             head_metrics[head] = {
                 "base_rate": float("nan"),
@@ -789,9 +1053,14 @@ def evaluate(
                 "brier": float("nan"),
                 "nll": float("nan"),
                 "recall_at_5pct_fpr": float("nan"),
+                "model_predicted": model_predicted,
             }
         else:
-            head_metrics[head] = compute_head_metrics(y_true_cat, y_pred_cat, head)
+            m = compute_head_metrics(y_true_cat, y_pred_cat, head)
+            m["model_predicted"] = model_predicted
+            if not model_predicted:
+                m["note"] = "0.5 baseline — no model head for this label"
+            head_metrics[head] = m
 
     # ------------------------------------------------------------------
     # 5. NT2F at IoU thresholds 0.5 and 0.2
@@ -844,7 +1113,39 @@ def evaluate(
         "nt2f_05": nt2f_05,
         "nt2f_02": nt2f_02,
         "bootstrap_auprc_false_confirmed": bootstrap_result,
+        "provenance": _build_provenance(npz_path, checkpoint_path, split),
     }
+
+    if calibrate_heads and temperatures:
+        cal_summary: dict[str, Any] = {
+            "heads_calibrated": list(temperatures.keys()),
+            "temperatures": temperatures,
+            "metrics_before": metrics_before_cal,
+        }
+        for head in temperatures:
+            ece_after = head_metrics.get(head, {}).get("ece", float("nan"))
+            ece_before = metrics_before_cal.get(head, {}).get("ece", float("nan"))
+            print(f"  {head:<25}  ECE: {ece_before:.4f} → {ece_after:.4f}  (Δ={ece_after-ece_before:+.4f})")
+        results["calibration"] = cal_summary
+
+    # Lead-time metric for imminent_failure_dynamic (v1 schema only; skipped silently for v0)
+    if preds_dict:
+        lead_time_result = compute_failure_lead_time(
+            iou_dict=iou_dict,
+            preds_dict=preds_dict,
+            labels_dict=labels_dict,
+            label_names=label_names,
+            head_names=_model_head_names,
+        )
+        if "note" not in lead_time_result:
+            results["failure_lead_time"] = lead_time_result
+            print(
+                f"\nFailure lead-time (P(ifd)>0.50):  "
+                f"median={lead_time_result['median_lead_time']:.1f}f  "
+                f"recall={lead_time_result['recall_at_threshold']:.3f}  "
+                f"FAR={lead_time_result['false_alarm_rate']:.3f}  "
+                f"n_TP={lead_time_result['n_true_positives']}"
+            )
 
     # Determine GO/NO-GO
     verdict = check_go_nogo(results)
@@ -917,7 +1218,23 @@ def main() -> None:
         default=20,
         help="GRU temporal window size (default: 20).",
     )
+    parser.add_argument(
+        "--calibrate-heads",
+        nargs="*",
+        metavar="HEAD",
+        default=None,
+        help=(
+            "Apply temperature scaling to these heads (val split only). "
+            "Omit to skip calibration. Use --calibrate-heads without arguments "
+            "to calibrate the default reliability heads: "
+            f"{list(RELIABILITY_HEADS)}."
+        ),
+    )
     args = parser.parse_args()
+
+    calibrate_heads: list[str] | None = None
+    if args.calibrate_heads is not None:
+        calibrate_heads = args.calibrate_heads if args.calibrate_heads else list(RELIABILITY_HEADS)
 
     results = evaluate(
         npz_path=args.npz,
@@ -927,6 +1244,7 @@ def main() -> None:
         device=args.device,
         output_path=args.output,
         predictions_output=args.predictions_output,
+        calibrate_heads=calibrate_heads,
     )
     verdict = check_go_nogo(results)
     print(f"\nGO/NO-GO: {verdict}")

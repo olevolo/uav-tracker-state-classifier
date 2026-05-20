@@ -15,6 +15,19 @@ LABEL_NAMES = [
     "target_dynamic", "camera_dynamic", "hard_dynamic_scene", "needs_full_compute",
 ]
 HEAD_NAMES = LABEL_NAMES[1:]  # all except "correct" (correct = 1 - P(failure) implicitly)
+
+# v1 schema: adds two semantically distinct dynamic-label heads.
+LABEL_NAMES_V1 = LABEL_NAMES + ["hard_dynamic_scene_v2", "imminent_failure_dynamic"]
+HEAD_NAMES_V1 = LABEL_NAMES_V1[1:]  # 9 heads
+
+# v2 schema: longer-horizon failure labels for proactive recovery research.
+LABEL_NAMES_V2 = LABEL_NAMES_V1 + [
+    "failure_in_10",
+    "failure_in_20",
+    "imminent_failure_dynamic_10",
+    "imminent_failure_dynamic_20",
+]
+HEAD_NAMES_V2 = LABEL_NAMES_V2[1:]  # 13 heads
 N_FEATURES = 28
 HIDDEN_DIM = 64
 N_LAYERS = 2
@@ -40,11 +53,13 @@ class SALTRD(nn.Module):
         n_layers: int = N_LAYERS,
         dropout: float = 0.2,
         window: int = 20,
+        head_names: list[str] | None = None,
     ) -> None:
         super().__init__()
         self.window = window
         self.n_features = n_features
         self.hidden_dim = hidden_dim
+        _heads = head_names if head_names is not None else HEAD_NAMES
 
         self.input_norm = nn.LayerNorm(n_features)
         self.gru = nn.GRU(
@@ -57,7 +72,7 @@ class SALTRD(nn.Module):
         # Separate head per predicted label (excluding "correct")
         self.heads = nn.ModuleDict({
             name: SALTRDHead(hidden_dim)
-            for name in HEAD_NAMES
+            for name in _heads
         })
         self._init_weights()
 

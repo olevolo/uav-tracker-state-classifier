@@ -38,21 +38,29 @@ def _ensure_salt_r_on_path() -> None:
 
 _ensure_salt_r_on_path()
 
-from salt_r.collect_features import SavedDataset, FEATURE_NAMES, LABEL_NAMES  # noqa: E402
-from salt_r.model import SALTRD as _SALTRDBase, HEAD_NAMES as _HEAD_NAMES  # noqa: E402
+from salt_r.collect_features import SavedDataset, FEATURE_NAMES, LABEL_NAMES, LABEL_NAMES_V1, LABEL_NAMES_V2  # noqa: E402
+from salt_r.model import SALTRD as _SALTRDBase, HEAD_NAMES as _HEAD_NAMES, HEAD_NAMES_V1 as _HEAD_NAMES_V1, HEAD_NAMES_V2 as _HEAD_NAMES_V2  # noqa: E402
 
 # Indices of _HEAD_NAMES within LABEL_NAMES (label 0 = "correct" is excluded)
 _HEAD_LABEL_INDICES: List[int] = [LABEL_NAMES.index(h) for h in _HEAD_NAMES]
 
 # Per-head loss weight multiplier (higher = more emphasis)
 _HEAD_IMPORTANCE: dict[str, float] = {
-    "false_confirmed":    3.0,   # Most critical — silent tracker failure
-    "failure_in_5":       2.0,
-    "recoverable":        1.5,
-    "target_dynamic":     1.0,
-    "camera_dynamic":     1.0,
-    "hard_dynamic_scene": 1.5,
-    "needs_full_compute": 1.0,
+    "false_confirmed":         3.0,   # Most critical — silent tracker failure
+    "failure_in_5":            2.0,
+    "recoverable":             1.5,
+    "target_dynamic":          1.0,
+    "camera_dynamic":          1.0,
+    "hard_dynamic_scene":      1.5,
+    "needs_full_compute":      1.0,
+    # v1 heads
+    "hard_dynamic_scene_v2":   1.5,
+    "imminent_failure_dynamic": 2.0,
+    # v2 heads — longer-horizon failure labels
+    "failure_in_10":               2.0,  # same emphasis as failure_in_5
+    "failure_in_20":               1.5,  # moderate — harder to learn
+    "imminent_failure_dynamic_10": 2.0,
+    "imminent_failure_dynamic_20": 1.5,
 }
 
 # ---------------------------------------------------------------------------
@@ -67,6 +75,14 @@ DEFAULT_POS_WEIGHTS: dict[str, float] = {
     "camera_dynamic":      3.0,
     "hard_dynamic_scene":  5.0,
     "needs_full_compute":  3.0,
+    # v1 heads — base rates from label audit (~5-10%)
+    "hard_dynamic_scene_v2":    6.0,
+    "imminent_failure_dynamic": 12.0,
+    # v2 heads — longer-horizon labels (~8-15% base rate, more positives)
+    "failure_in_10":               8.0,
+    "failure_in_20":               6.0,
+    "imminent_failure_dynamic_10": 5.0,
+    "imminent_failure_dynamic_20": 4.0,
 }
 
 # ---------------------------------------------------------------------------
@@ -158,12 +174,17 @@ class SALTRDDataset(Dataset):
         split: str,
         window_size: int = 20,
         head_names: Optional[List[str]] = None,
+        all_label_names: Optional[List[str]] = None,
     ) -> None:
         assert split in {"train", "val", "diagnostic"}, f"Unknown split: {split!r}"
         self.split = split
         self.window_size = window_size
         self.head_names: List[str] = head_names if head_names is not None else list(_HEAD_NAMES)
-        self.head_label_indices: List[int] = [LABEL_NAMES.index(h) for h in self.head_names]
+        # Use provided label schema or fall back to v0 default.
+        # When training on v1 NPZ, pass all_label_names=LABEL_NAMES_V1 so that
+        # indices for hard_dynamic_scene_v2 and imminent_failure_dynamic resolve correctly.
+        _all_labels = all_label_names if all_label_names is not None else list(LABEL_NAMES)
+        self.head_label_indices: List[int] = [_all_labels.index(h) for h in self.head_names]
 
         # Load NPZ
         ds = SavedDataset.load(npz_path)
@@ -185,7 +206,7 @@ class SALTRDDataset(Dataset):
                 self._index.append((seq_idx, t))
 
         self.feature_names: List[str] = list(FEATURE_NAMES)
-        self.label_names: List[str] = list(LABEL_NAMES)
+        self.label_names: List[str] = _all_labels
 
     def __len__(self) -> int:
         return len(self._index)
@@ -267,7 +288,8 @@ class SALTRD(_SALTRDBase):
 
     def forward(self, x: "Tensor") -> "Tensor":  # type: ignore[override]
         probs_dict = super().forward(x)
-        return torch.stack([probs_dict[h] for h in _HEAD_NAMES], dim=1)  # (B, n_heads)
+        # Use self.heads key order — correct for both v0 (7) and v1 (9) schemas.
+        return torch.stack([probs_dict[h] for h in self.heads], dim=1)  # (B, n_heads)
 
 
 # ---------------------------------------------------------------------------
@@ -362,6 +384,7 @@ def train(
     patience: int = 8,
     device: str = "auto",
     seed: int = 42,
+    label_schema: str = "v0",
 ) -> None:
     """Train SALTRD on the given NPZ dataset.
 
@@ -396,17 +419,34 @@ def train(
     torch.manual_seed(seed)
 
     dev = _resolve_device(device)
-    print(f"[train] device={dev}  npz={npz_path}", flush=True)
+    print(f"[train] device={dev}  npz={npz_path}  schema={label_schema}", flush=True)
+
+    # Select label schema — v1 adds hard_dynamic_scene_v2 + imminent_failure_dynamic
+    if label_schema == "v2":
+        _schema_head_names = list(_HEAD_NAMES_V2)
+        _schema_label_names = list(LABEL_NAMES_V2)
+    elif label_schema == "v1":
+        _schema_head_names = list(_HEAD_NAMES_V1)
+        _schema_label_names = list(LABEL_NAMES_V1)
+    else:
+        _schema_head_names = list(_HEAD_NAMES)
+        _schema_label_names = list(LABEL_NAMES)
 
     # ------------------------------------------------------------------
     # 1. Datasets / dataloaders
     # ------------------------------------------------------------------
     print("[train] Loading train split ...", flush=True)
-    train_ds = SALTRDDataset(npz_path, split="train", window_size=window_size)
+    train_ds = SALTRDDataset(
+        npz_path, split="train", window_size=window_size,
+        head_names=_schema_head_names, all_label_names=_schema_label_names,
+    )
     print(f"[train] train samples: {len(train_ds):,}", flush=True)
 
     print("[train] Loading val split ...", flush=True)
-    val_ds = SALTRDDataset(npz_path, split="val", window_size=window_size)
+    val_ds = SALTRDDataset(
+        npz_path, split="val", window_size=window_size,
+        head_names=_schema_head_names, all_label_names=_schema_label_names,
+    )
     print(f"[train] val samples:   {len(val_ds):,}", flush=True)
 
     if len(train_ds) == 0:
@@ -438,9 +478,9 @@ def train(
     # 2. Model
     # ------------------------------------------------------------------
     n_features = len(FEATURE_NAMES)   # 28
-    n_heads = len(_HEAD_NAMES)         # 7, from model.HEAD_NAMES
+    n_heads = len(train_ds.head_names)
 
-    model = SALTRD(n_features=n_features).to(dev)
+    model = SALTRD(n_features=n_features, head_names=train_ds.head_names).to(dev)
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"[train] SALTRD  params={total_params:,}", flush=True)
 
@@ -529,9 +569,19 @@ def train(
             flush=True,
         )
 
-        # -- Early stopping on val AUPRC(false_confirmed) --
-        # If val set is empty or metric is nan, fall back to val loss
-        improvement_metric = auprc_fc if not np.isnan(auprc_fc) else -val_loss
+        # -- Early stopping: composite improvement metric --
+        # v2: AUPRC(fc) + 0.5*AUPRC(ifd10) + 0.25*AUPRC(ifd20) — optimises for both
+        #     false-confirmed reliability and long-horizon failure risk simultaneously.
+        # v0/v1: AUPRC(fc) only (existing behaviour, unchanged).
+        if label_schema == "v2":
+            auprc_ifd10 = val_metrics.get("auprc_imminent_failure_dynamic_10", float("nan"))
+            auprc_ifd20 = val_metrics.get("auprc_imminent_failure_dynamic_20", float("nan"))
+            fc_part   = auprc_fc    if not np.isnan(auprc_fc)    else 0.0
+            ifd10_part = auprc_ifd10 * 0.5  if not np.isnan(auprc_ifd10) else 0.0
+            ifd20_part = auprc_ifd20 * 0.25 if not np.isnan(auprc_ifd20) else 0.0
+            improvement_metric = fc_part + ifd10_part + ifd20_part or -val_loss
+        else:
+            improvement_metric = auprc_fc if not np.isnan(auprc_fc) else -val_loss
 
         if improvement_metric > best_auprc_fc:
             best_auprc_fc = improvement_metric
@@ -547,7 +597,8 @@ def train(
                     "base_rates": base_rates,
                     "window_size": window_size,
                     "feature_names": list(FEATURE_NAMES),
-                    "label_names": list(LABEL_NAMES),
+                    "label_names": list(_schema_label_names),   # schema-correct, not hardcoded v0
+                    "label_schema": label_schema,
                     "head_names": list(train_ds.head_names),
                     "n_features": n_features,
                     "n_heads": n_heads,
@@ -565,7 +616,7 @@ def train(
                 break
 
     print(f"\n[train] Best checkpoint saved to: {ckpt_path}", flush=True)
-    print(f"[train] Best val AUPRC(false_confirmed): {best_auprc_fc:.4f}", flush=True)
+    print(f"[train] Best validation selection score: {best_auprc_fc:.4f}", flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -595,6 +646,16 @@ def main() -> None:
     parser.add_argument("--window-size", type=int, default=20)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--patience", type=int, default=8)
+    parser.add_argument(
+        "--label-schema",
+        choices=["v0", "v1", "v2"],
+        default="v0",
+        help=(
+            "Label schema: v0 = 7 heads; v1 = v0 + hard_dynamic_scene_v2 + imminent_failure_dynamic (9 heads); "
+            "v2 = v1 + failure_in_10/20 + imminent_failure_dynamic_10/20 (13 heads). "
+            "Match --npz to the correct schema NPZ."
+        ),
+    )
     args = parser.parse_args()
 
     train(
@@ -607,6 +668,7 @@ def main() -> None:
         device=args.device,
         seed=args.seed,
         patience=args.patience,
+        label_schema=args.label_schema,
     )
 
 

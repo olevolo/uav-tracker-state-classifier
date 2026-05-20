@@ -1,643 +1,1335 @@
-# HANDOFF — SALT-RD: Reliability + Neural Scene Dynamicity for UAV SOT
+# HANDOFF_NEXT — SALT-RD Phase 2B: DAM-Style Distractor Memory
 
-**Дата:** 2026-05-19  
-**Оновлено:** 2026-05-20 — pipeline complete, BORDERLINE verdict, next = calibration + LODO  
-**Статус:** Phases 0→1a→1b→1c→2 DONE + tested. NPZ collected, model trained, eval done.  
-**Читай також:** `THOUGHTS.md`, `papers/README.md`, `FROZEN.md`
-
----
-
-## ✅ Реалізовано — Phase 0 (commit ecfcb0f)
-
-| Завдання | Статус | Файл |
-|---|---|---|
-| `FROZEN.md` — policy freeze | ✅ done | `FROZEN.md` |
-| Config gates в YAML | ✅ done | `configs/prod/salt.yaml` |
-| `enable_ce` gate → runtime | ✅ done | `sglatrack.py` + `salt_runner.py` |
-| `enable_velocity_drift` gate → runtime | ✅ done | `target_state_assessor.py` + `salt_runner.py` |
-| `enable_dynamic` / `enable_salt_rd` в YAML | ✅ done | `configs/prod/salt.yaml` (motion_predictor.enabled вже був false) |
-| `TrackState` extended: +5 fields | ✅ done | `types.py` |
-| `score_map_stats` computation в SGLATracker | ✅ done | `sglatrack.py` (обидва update/update_with_state) |
-| `saltr/` scaffold | ✅ done | `saltr/src/salt_r/` |
-| `collect_features.py` skeleton + NPZ schema | ✅ done | `saltr/src/salt_r/collect_features.py` |
-| `model.py` / `train.py` / `eval.py` stubs | ✅ done | `saltr/src/salt_r/` |
-| 174 тести проходять | ✅ verified | — |
-
-### Що реально gate-ується в runtime
-
-| Gate | YAML ключ | Де читається | Ефект при `false` |
-|---|---|---|---|
-| `enable_ce` | top-level | `salt_runner.py:183` → `SGLATracker.__init__` | `ce_keep_rate = 1.0` (no pruning) |
-| `enable_velocity_drift` | top-level | `salt_runner.py:193` → `TargetStateAssessor.__init__` | `is_drifted()` не викликається, DISTRACTOR_RISK недосяжний |
-| `enable_dynamic` (alias) | `motion_predictor.enabled` | вже `false` у YAML — `lstm_pred` завжди `None` | DYNAMIC state недосяжний |
-| `enable_salt_rd` | top-level | **не читається ще** — для Phase 2 |
-
-### score_map_stats — поля в TrackState
-
-```python
-track_state.score_map_stats = {
-    "top1":             float,   # highest response value (raw)
-    "top2":             float,   # second highest
-    "peak_margin":      float,   # top1 - top2 (ambiguity metric)
-    "peak_width":       int,     # cells above 50% of peak
-    "n_secondary":      int,     # 0 placeholder (v1: local-maxima detection)
-    "peak_distance":    float,   # peak location distance from map center (cells)
-    "heatmap_mass_topk":float,   # fraction of total mass in top-10 cells
-}
-```
+**Дата:** 2026-05-20  
+**Оновлено:** 2026-05-20 — Phase 2A done: e-process implemented + 6 P1-P3 bugs fixed + 62 tests green.  
+**Owner:** Staff CV/AI/ML review track  
+**Поточний стан:** Phase 2A complete. e-process formal mode: 11.5f lead time, 44% precision, 6.25% recall. Bottleneck: risk score quality, not algorithm. Need DAM memory features.  
+**Новий пріоритет:** **Phase 2B: DAM4SAM-style distractor memory → boost false_confirmed signal → improve e-process recall**.  
+**Мета:** отримати реальне deployment-покращення: менше false-confirmed drift, менше wrong recovery/template corruption, кращий proactive alert lead-time. Compute/FPS — тільки після oracle replay.
 
 ---
 
-## Рішення
+## Phase 2A Results (e-process) — DONE
 
-Йдемо не в "ще один tracker" і не в rule-based SALT v3. Центральна ідея тепер:
+| Metric | e-process formal (α=0.10, ε=0.5) | Raw P(ifd)>0.5 | Target |
+|---|---:|---:|---:|
+| Median lead time | **11.5 frames** ✅ | — | ≥ 3 |
+| Event recall | 0.062 ❌ | 0.750 ✅ | ≥ 0.60 |
+| FA per 1000 frames | **0.21** ✅ | 171.4 ❌ | ≤ 100 |
+| Seq-level FAR | 0.167 ❌ | — | ≤ 0.10 |
 
-> **SALT-RD — proactive tracking-risk dynamicity controller for real-time UAV single-object tracking.**
+**Key insight:** e-process precision=44% (4/9 TP) vs baseline 1% (48/4682). Algorithm correct. Problem: raw risk score not strong enough to accumulate evidence fast. Need DAM memory to boost false_confirmed signal → e-process will fire sooner and more reliably.
 
-SGLATrack/SALT v3 лишається frozen baseline. Нова наукова робота — легка нейромережа, яка з внутрішніх сигналів трекера, motion/flow/appearance сигналів і offline teacher labels проактивно прогнозує:
-
-- наскільки сцена tracking-dynamic саме для поточного target;
-- tracking-risk до того, як AUC вже впав;
-- false-confirmed: чи трекер впевнено сидить на неправильному об'єкті;
-- recovery readiness: чи є сенс запускати або приймати re-acquisition;
-- чи буде failure найближчим часом;
-- чи треба витрачати повний compute;
-- чи можна безпечно оновлювати template.
-
-Тобто SALT-RD не обіцяє автоматично побити SOTA AUC backbone-ів. Він має дати deployment-важливу властивість: **проактивно оцінити tracking-risk і вирішити, коли довіряти трекеру, коли економити compute, коли заборонити template update, і коли робити re-acquisition.**
-
----
-
-## Наукова позиція
-
-**Thesis:** "Proactive Tracking-Risk Dynamicity for Failure-Aware Real-Time UAV Single-Object Tracking."
-
-**Не thesis:** "A new UAV tracker with best AUC." Це вже щільно закрито MSTFT, MATA, UTPTrack, LGTrack, BDTrack, Mamba-based trackers.
-
-**Ключова емпірична точка:** `uav0000164` — AUC=0.174 при 99% CONFIRMED. APCE бачить гострий peak, але не бачить identity switch. Це і є signature failure mode для статті.
-
-**Що ми повинні показати:**
-
-1. Neural dynamicity head краще за APCE/LSTM/rule thresholds визначає складні динамічні моменти.
-2. Reliability heads ловлять false-confirmed і imminent failure краще за APCE/PSR/entropy.
-3. Policy на основі SALT-RD дає deployment win: lower wrong-reinit, safer template updates, better risk-coverage, and/or lower GFLOPs at bounded AUC loss.
-
----
-
-## Конкуренти 2024-2026 і наша ніша
-
-| Paper | Що закриває | Чому це конкурент | Наша різниця |
-|---|---|---|---|
-| MSTFT 2026 | Mamba backbone, small UAV targets, dynamic template fusion | Сильний AUC benchmark: UAV123 AUC=79.4%, 45 FPS | Ми не замінюємо backbone; беремо response/temporal/motion verification як labels/features для controller |
-| MATA 2026 | Modular async UAV tracking, ego-motion, NT2F, embedded protocol | Найближчий systems reference | MATA валідовує measurement для EKF; SALT-RD вчить dynamicity/reliability policy для compute/recovery/template safety |
-| UTPTrack CVPR 2026 | Unified token pruning SR/DT/ST, 65%+ token pruning | CE/CTEM як novelty більше не працює | SALT-RD може керувати коли застосовувати pruning, а не винаходити pruning |
-| ABTrack 2024/2025 | Adaptive ViT block bypass | Динамічний compute уже є | ABTrack bypass-ить blocks за task difficulty; SALT-RD прогнозує tracking risk/dynamicity і має GT IoU labels |
-| BDTrack 2025 | UAV motion blur + dynamic early exit | Прямий конкурент до "dynamic scene" | BDTrack оптимізує backbone/early exit; SALT-RD робить tracker-agnostic controller і failure calibration |
-| UncL-STARK 2026 | Heatmap uncertainty for depth adaptation | Близький uncertainty-guided compute baseline | Їх uncertainty локалізаційна; наша ключова задача — false-confirmed identity drift + recovery safety |
-| LGTrack 2026 | Dynamic layer selection + occlusion robustness | Реальний lightweight UAV competitor | LGTrack є tracker; SALT-RD є wrapper/controller і може оцінювати LGTrack/SGLATrack/MSTFT |
-| PTDT 2026 | Point-tracking-guided dynamic tokens/template update | Найближчий reference для point consistency | Ми використовуємо point tracking як offline teacher/feature для reliability/dynamicity, не як основний tracker |
-| OOTU 2025 | BBox uncertainty regression | Базова робота для calibration/ECE | OOTU оцінює де bbox; SALT-RD оцінює чи це правильний об'єкт і чи варто діяти |
-| LoRAT 2024 | PEFT/domain adaptation для trackers | Кращий fallback якщо reliability head не дає AUC | Phase 6: domain-adapt backbone, не core novelty Phase 1 |
-
----
-
-## Крок -1 — структурна реорганізація
-
-Не робити `git mv` всього repo в `saltv3/`. Це зламає imports, packaging, paths. Робимо **policy freeze + новий пакет `saltr/` поряд**.
-
-```text
-uav-tracker-detector/
-  src/uav_tracker/             # frozen baseline/SALT v3, мінімальні зміни тільки для telemetry
-  configs/prod/
-  weights/
-  tests/unit/
-  FROZEN.md                    # "Do not modify src/uav_tracker except telemetry/config gates"
-
-  saltr/
-    src/salt_r/
-      collect_features.py      # telemetry + GT IoU + dynamicity labels
-      model.py                 # SALT-RD GRU/TCN heads
-      train.py                 # supervised multi-head training
-      eval.py                  # reliability/dynamicity/policy metrics
-      policy.py                # maps probabilities to tracker actions
-      integrate.py             # wrapper around frozen tracker
-    data/
-    configs/
-
-  papers/
-  HANDOFF_NEXT.md
-  THOUGHTS.md
-```
-
-Config gates замість видалення ablation paths:
-
-```yaml
-enable_ce: false
-enable_dynamic: false          # old LSTM dynamic branch disabled
-enable_velocity_drift: false   # replaced by learned P(false_confirmed)
-enable_salt_rd: false          # off until GO gate
-```
-
----
-
-## Критичні ризики і як їх побороти
-
-### 1. Label leakage / self-teaching
-
-Смертельний ризик для статті: навчити модель повторювати `_decide_state()`, APCE thresholds або `scene_class`.
-
-**Побороти:** labels тільки з GT IoU, future IoU, GT target motion, camera/flow residuals або offline teacher outputs. Жоден target label не походить з TSA state machine.
-
-### 2. "Dynamicity" може перетворитись на стару scene classification
-
-Нам не потрібен клас `STATIC/DYNAMIC/OCCLUDED` як декоративна назва сцени. Нам потрібна **tracking-relevant dynamicity**.
-
-**Побороти:** визначати dynamic labels через те, що впливає на tracking:
-
-- target normalized velocity/acceleration;
-- bbox scale/aspect change;
-- camera ego-motion magnitude;
-- residual target motion after ego-motion compensation;
-- future degradation of IoU under cheap/normal tracker mode.
-
-### 3. False-confirmed дуже рідкісний клас
-
-Наївний BCE дасть 97-99% accuracy при random AUROC.
-
-**Побороти:** AUPRC primary, focal/weighted BCE, hard-negative suite: `uav0000164`, `bike2`, `Gull2`, `Sheep1`, `StreetBasketball1`. Diagnostic suite не входить у train.
-
-### 4. Compute policy може зменшити GFLOPs, але зламати AUC
-
-Dynamicity head легко перетворити на aggressive skip policy.
-
-**Побороти:** training/eval policy має oracle regret:
-
-- full tracker output;
-- cheap/pruned/bypass output;
-- label `needs_full_compute = cheap_iou_drop > 0.03 OR cheap_failure`;
-- report AUC-vs-GFLOPs Pareto, not only average FPS.
-
-### 5. Score-map geometry зараз неповна
-
-APCE/PSR/entropy замало для false-confirmed і dynamicity.
-
-**Побороти:** розширити `TrackState`:
-
-```python
-score_map_stats = {
-    "top1": ...,
-    "top2": ...,
-    "peak_margin": ...,
-    "peak_width": ...,
-    "n_secondary": ...,
-    "peak_distance": ...,
-    "heatmap_mass_topk": ...,
-}
-```
-
-### 6. Split має бути по sequence і по domain
-
-Frame-level split дає leakage. Alphabetical split дає випадкову науку.
-
-**Побороти:** stratified group split by sequence across UAV123 + VisDrone-SOT + DTB70, плюс LODO:
-
-- train: UAV123 + VisDrone + DTB70 train sequences;
-- val: held-out sequences from each dataset;
-- diagnostic: only hard negatives;
-- LODO: train on two datasets, test on third.
-
-### 7. Reproducibility
-
-Hardcoded SGLATrack path і env drift зламають наступну сесію.
-
-**Побороти:** env var для external tracker path, config hash у NPZ, exact tracker checkpoint id, `uav-tracker doctor`.
-
----
-
-## Крок 0 — cleanup + telemetry
-
-Мета: зробити frozen baseline, який стабільно генерує дані для SALT-RD.
-
-1. Додати `FROZEN.md`.
-2. Додати config gates і реально прочитати їх у runtime.
-3. Не видаляти CE/DYNAMIC/VelocityDrift фізично: вони потрібні для ablations.
-4. Розширити `TrackState`:
-   - `score_map_stats`;
-   - `motion_stats`;
-   - `flow_stats`;
-   - `appearance_stats`;
-   - `compute_mode`.
-5. Додати smoke:
-
-```bash
-PYTHONPATH=src .venv/bin/python -m pytest tests/unit/ -q
-PYTHONPATH=src .venv/bin/python -m uav_tracker doctor
-```
-
----
-
-## Фаза 1 — SALT-RD v0 dataset
-
-Canonical path: `saltr/src/salt_r/collect_features.py`.
-
-### Features v0
-
-Target: 24-32 scalar features per frame. Не треба одразу CNN score-map encoder.
-
-```text
-Score map:
-  apce_raw, apce_norm, psr, entropy,
-  peak_margin, peak_width, n_secondary, peak_distance, heatmap_mass_topk
-
-Temporal response:
-  apce_ratio_5, apce_ratio_20, entropy_delta_5,
-  peak_margin_delta_5, confirmed_streak, low_conf_streak
-
-Target dynamics:
-  bbox_cx_velocity, bbox_cy_velocity, bbox_speed_norm,
-  bbox_accel_norm, scale_ratio, aspect_ratio_delta, dist_to_search_border
-
-Camera/flow:
-  global_flow_mag, target_flow_mag, ego_motion_residual,
-  flow_iou, flow_residual, flow_consistency
-
-Appearance:
-  cosine_static_template, cosine_recent_template,
-  embedding_drift_static, embedding_drift_recent
-
-Detector/recovery context, optional:
-  n_candidates, hint_distance_norm, top1_top2_detector_gap
-```
-
-### Labels v0
-
-All labels are GT/teacher-derived, never `_decide_state()`-derived.
-
-```python
-correct[t] = iou[t] >= 0.5
-
-false_confirmed[t] = (
-    iou[t] < 0.2
-    and apce_raw[t] > 100
-)
-
-failure_in_5[t] = (
-    iou[t] >= 0.5
-    and mean(iou[t+1:t+6]) < 0.3
-)
-
-recoverable[t] = (
-    iou[t] < 0.2
-    and max(iou[t+5:t+15]) >= 0.5
-)
-
-target_dynamic[t] = percentile_rank(
-    speed_norm + 0.5 * accel_norm + 0.5 * abs(scale_delta),
-    by_sequence=True,
-) >= 0.75
-
-camera_dynamic[t] = percentile_rank(
-    global_flow_mag + ego_motion_residual,
-    by_sequence=True,
-) >= 0.75
-
-hard_dynamic_scene[t] = (
-    (target_dynamic[t] or camera_dynamic[t])
-    and (peak_margin_low[t] or flow_consistency_low[t] or iou[t+1:t+6].min() < 0.3)
-)
-```
-
-`needs_full_compute[t]` має два режими:
-
-1. **Proper oracle mode:** run full tracker and cheap/pruned mode, label full if cheap mode causes IoU drop or failure.
-2. **Bootstrap mode:** approximate with `hard_dynamic_scene OR failure_in_5` until oracle data exists.
-
-Proper oracle mode потрібен перед будь-якими paper claims про GFLOPs/FPS.
-
-### NPZ schema
-
-```text
-features/{seq}:       float32 (n_frames, n_features)
-feature_names:        list[str]
-feature_units:        list[str]
-labels/{seq}:         int8 (n_frames, n_labels)
-label_names:          ["correct", "false_confirmed", "failure_in_5", "recoverable",
-                       "target_dynamic", "camera_dynamic", "hard_dynamic_scene",
-                       "needs_full_compute"]
-iou_trace/{seq}:      float32 (n_frames,)
-bbox_pred/{seq}:      float32 (n_frames, 4)
-bbox_gt/{seq}:        float32 (n_frames, 4)
-sequence_name/{seq}:  str
-dataset/{seq}:        str
-split/{seq}:          str
-tracker_version:      str
-tracker_config_hash:  str
-created_at:           str
-```
-
----
-
-## Фаза 1 — model/training
-
-Canonical path: `saltr/src/salt_r/model.py`, `train.py`.
-
-### Model v0
-
-Start simple. The contribution is labels + policy + evaluation, not a huge network.
-
-```python
-class SALTRD(nn.Module):
-    # input: (B, T, 24-32)
-    # GRU(input_dim, hidden=64, layers=2, dropout=0.2)
-    # shared temporal state -> separate heads
-    # heads:
-    #   P(false_confirmed)
-    #   P(failure_in_5)
-    #   P(recoverable)
-    #   P(target_dynamic)
-    #   P(camera_dynamic)
-    #   P(hard_dynamic_scene)
-    #   P(needs_full_compute)
-```
-
-Loss:
-
-- weighted BCE or focal BCE per head;
-- higher weight for `false_confirmed`;
-- sequence-balanced sampler;
-- report base rate per label.
-
-Alternatives only after v0:
-
-- TCN if GRU overfits;
-- tiny SSM/Mamba-like temporal block only if it materially improves latency/accuracy;
-- score-map CNN encoder only after scalar telemetry GO/NO-GO.
-
----
-
-## Фаза 1 — evaluation
-
-Canonical path: `saltr/src/salt_r/eval.py`.
-
-### Reliability metrics
-
-- AUROC/AUPRC per head;
-- base rate per head;
-- ECE/Brier/NLL;
-- false-confirmed recall@5% FPR;
-- failure warning lead time;
-- NT2F from MATA;
-- bootstrap 95% CI by sequence.
-
-### Dynamicity metrics
-
-- AUROC/AUPRC for `target_dynamic`, `camera_dynamic`, `hard_dynamic_scene`;
-- confusion matrix by dataset and target-size bin;
-- dynamicity calibration curve;
-- correlation with AUC drops and APCE drops;
-- per-sequence timeline plot: IoU, APCE, P(dynamic), P(false_confirmed), compute decision.
-
-### Policy/deployment metrics
-
-- wrong re-init rate;
-- template corruption rate;
-- risk-coverage curve;
-- abstention gain;
-- AUC-vs-GFLOPs Pareto;
-- FPS on Apple MPS for policy overhead;
-- compute regret: AUC loss at 10/15/20% GFLOPs reduction.
-
----
-
-## GO / NO-GO gate
-
-| Metric | GO | STOP |
-|---|---:|---:|
-| AUPRC false_confirmed | > 0.30 | < 0.15 |
-| AUROC false_confirmed | > 0.65 | < 0.55 |
-| AUROC failure_in_5 | > 0.75 | < 0.65 |
-| AUROC hard_dynamic_scene | > 0.75 | < 0.60 |
-| AUROC needs_full_compute | > 0.70 | < 0.60 |
-| ECE false_confirmed | < 0.12 | > 0.20 |
-| Policy AUC loss at 15% GFLOPs saving | < 0.005 | > 0.020 |
-| Wrong re-init reduction | > 25% | < 5% |
-
-If SALT-RD cannot beat APCE/PSR/entropy baselines on the same labels, stop. Do not tune thresholds until it looks good.
-
----
-
-## Фаза 2 — policy integration
-
-Canonical path: `saltr/src/salt_r/policy.py`, `integrate.py`.
-
-```python
-probs = salt_rd.predict(window)
-
-if probs.false_confirmed > 0.70:
-    action.template_update = "block"
-    action.recovery = "abstain_or_verify"
-    action.compute = "full"
-
-elif probs.hard_dynamic_scene > 0.65:
-    action.compute = "full"
-    action.search = "normal_or_expand_conservatively"
-    action.template_update = "verify"
-
-elif probs.needs_full_compute < 0.25 and probs.failure_in_5 < 0.20:
-    action.compute = "cheap"
-    action.template_update = "allow_if_appearance_stable"
-
-if probs.recoverable > 0.60 and probs.false_confirmed < 0.40:
-    action.recovery = "run_detector_or_matcher"
-```
-
-Policy must be evaluated offline first. Runtime integration only after replay simulation shows bounded regret.
-
----
-
-## Повний фазовий план
-
-```text
-Фаза 0:  Freeze + config gates + telemetry extensions (0.5-1 день)
-Фаза 1a: Collect SALT-RD scalar dataset with GT IoU labels (1-2 дні)
-Фаза 1b: Train/eval SALT-RD multi-head GRU (1-2 дні)
-Фаза 1c: Offline policy replay: risk, recovery, compute, template safety (1-2 дні)
-Фаза 2:  Runtime integration behind enable_salt_rd flag (1-2 дні)
-Фаза 3:  SALT-Match candidate accept/reject dataset for recovery (1 тиждень)
-Фаза 4:  CoTracker3/PTDT-style point consistency offline teacher (1-2 тижні)
-Фаза 5:  DINO/SAM/CoTracker distillation into lightweight features (2-4 тижні)
-Фаза 6:  LoRAT domain adaptation fallback if AUC remains capped (3-6 тижнів)
-```
-
-Priority rule:
-
-- If Phase 1 fails reliability/dynamicity GO gates, do not implement runtime policy.
-- If reliability works but compute policy fails, publish reliability/recovery angle and leave compute as negative/secondary.
-- If both fail, move to LoRAT/domain-adapted backbone and write the negative result honestly.
-
----
-
-## ✅ Реалізовано — Phases 1a→2 + fixes + tests (commits 64f307b…7d9b693)
-
-### Модулі saltr/
-
-| Файл | Статус | Ключові деталі |
-|---|---|---|
-| `collect_features.py` | ✅ | 28 features, GT labels, `_TruncatedSequence`, `root=None` autodetect |
-| `model.py` | ✅ | SALTRD GRU hidden=64 layers=2, ~43k params, 7 ModuleDict heads, sigmoid в head |
-| `train.py` | ✅ | focal BCE, empirical pos_weight, early stop on AUPRC(fc), subclasses model.SALTRD |
-| `eval.py` | ✅ | AUROC/AUPRC/ECE/Brier/NLL/recall@5%FPR, NT2F, bootstrap CI (seq-level), GO/NO-GO |
-| `policy.py` | ✅ | TrackerAction, RiskThresholds, apply_policy (4-priority chain), replay_policy |
-| `integrate.py` | ✅ | SALTRDRunner wraps frozen SALTRunner, FeatureBuffer, run_with_risk |
-| `run_phase1.sh` | ✅ | collect→train→eval→predictions→policy replay (one command) |
-
-### Важливі pipeline fixes (commit bc34a5b)
+## P1-P3 Bug Fixes (all done)
 
 | Bug | Fix |
 |---|---|
-| Double-sigmoid in eval.py | `out[h].detach().cpu().numpy()` + `HEAD_NAMES` + `np.clip`; ECE 0.537→0.320 |
-| IoU key mismatch в policy.py | raw `np.load` + strip `iou_trace/` prefix + warning on missing |
-| `--dry-run` завантажував модель | SALTRunner.from_config() тільки коли `not dry_run` |
-| Predictions export відсутній | `--predictions-output` зберігає `{seq_key: [{head: prob},...]}` JSON |
-| Label-head mapping off-by-one | HEAD_NAMES lookup (не index) для named prediction mapping |
-| train.py дублював SALTRD | підклас model.SALTRD, не окрема архітектура |
+| P1a: ifd10/20 counted already-failed frames | `iou_trace[t] >= 0.5` + `len==horizon` guards in collect_features.py |
+| P1b: lead_time hardcoded to ifd5/6-frame window | Parameterized `label_name`, `horizon` in eval.py |
+| P2a: policy docs didn't mention v2 head gap | NOTE comment added to policy.py |
+| P2b: fake AUROC 0.5 for "correct" label | `model_predicted: false` + note field in eval.py |
+| P2c: recompute_labels_v2() silently accepted v0 | v1 schema validation in collect_features.py |
+| P3: train log said AUPRC(fc) but was composite | Renamed to "validation selection score" in train.py |
 
-### Unit tests (200 passed — commit 7d9b693)
+---
 
-| Файл | Тестів | Що покрито |
+---
+
+## Executive Decision
+
+Ми більше не тиснемо на старий `hard_dynamic_scene_v2` як центральний результат. Він занадто слабкий і погано корелює з реальним IoU degradation. Центральна лінія тепер:
+
+> **SALT-RD v2 is a tracker-trust and intervention controller: it learns when the tracker is confidently wrong, accumulates sequential evidence of failure, and uses distractor/point-consistency memory to decide whether to block template updates, reject recovery, expand search, or escalate to a stronger fallback.**
+
+Практично це означає:
+
+1. **False-confirmed / identity drift** лишається головним ML-сигналом.
+2. **Imminent failure dynamicity** лишається короткогоризиковим сигналом, але його треба перетворити з 1-frame warning на usable alert через e-process.
+3. **DAM4SAM-style memory** має дати нові ознаки, яких APCE/entropy не бачать: target vs distractor identity margin.
+4. **CoTracker3 point consistency** має дати offline teacher-сигнали для того, чи bbox ще тримає той самий об'єкт.
+5. **Compute/FPS claim** не робимо, поки немає full-vs-cheap oracle labels і Pareto-кривої AUC-vs-GFLOPs.
+
+Це не косметика. Це зміна від "класифікуємо сцену" до "керуємо довірою до трекера і intervention policy".
+
+---
+
+## Why Pivot
+
+### Що v1/v2 вже довели
+
+`false_confirmed` та `imminent_failure_dynamic` працюють як реальні сигнали:
+
+| Head | Schema | AUROC | AUPRC | Коментар |
+|---|---|---:|---:|---|
+| `false_confirmed` | v0/v1/v2 | 0.884 | 0.336 | Сильний результат; single-feature baselines майже random/anti-predictive |
+| `failure_in_5` | v0/v1/v2 | 0.853 | 0.011 | Ranking добрий, AUPRC низький через малий base rate |
+| `recoverable` | v0/v1/v2 | 0.893 | 0.046 | Корисний для recovery gating |
+| `imminent_failure_dynamic` (5f) | v1/v2 | 0.902 | 0.323 | Сильний short-horizon signal |
+| `imminent_failure_dynamic_10` | v2 | **0.897** | **0.329** | Майже не деградує! 10-frame horizon |
+| `imminent_failure_dynamic_20` | v2 | **0.889** | **0.339** | 20-frame signal тримається (−1.3pp від 5f) |
+| `failure_in_10` | v2 | 0.827 | 0.017 | AUROC добрий, AUPRC обмежений sparse labels (0.3%) |
+| `failure_in_20` | v2 | 0.785 | 0.022 | Аналогічно, AUPRC обмежений (0.6%) |
+
+Найсильніша емпірична точка:
+
+| Task | GRU | Best simple baseline | Висновок |
+|---|---:|---:|---|
+| false-confirmed | AUROC 0.884 / AUPRC 0.336 | flow consistency AUROC 0.511 | APCE/entropy не ловлять identity drift (+37.9pp) |
+| imminent failure dynamicity | AUROC 0.900 / AUPRC 0.323 | entropy AUROC 0.888 / AUPRC 0.285 | GRU додає ~1.2pp AUROC, 13% rel. AUPRC |
+| 20-frame failure risk | AUROC 0.889 | — | Telemetry несе 20-frame early warning без teacher |
+
+**v2 policy replay (calibrated) vs v0 baseline:**
+
+| Metric | v0 | v1 | **v2** | Δ v2 vs v0 |
+|---|---:|---:|---:|---:|
+| template_corruption_rate | 0.108 | 0.090 | **0.060** | **−44%** |
+| wrong_reinit_rate | 0.273 | 0.269 | **0.183** | **−33%** |
+| abstention_gain | 0.307 | 0.312 | 0.304 | ≈0 |
+
+### Що v2 все ще не вирішив
+
+| Weak spot | Поточний результат | Рішення |
+|---|---:|---|
+| `hard_dynamic_scene_v2` | AUROC 0.592 | Не робити центральним head/gate |
+| `needs_full_compute` | AUROC 0.648, cheap_rate 0.000 | Потрібні oracle labels from full-vs-cheap replay |
+| ECE(`false_confirmed`) | 0.316 після T-scaling (v2), 0.229 (v1) | Teacher features + isotonic/conformal calibration |
+| Lead time for `ifd` | median 1 frame | e-process accumulation (Phase 2A) |
+| `failure_in_10/20` AUPRC | 0.017/0.022 (sparse labels) | Або sampler, або regression target на time-to-failure |
+| false_confirmed на diagnostic | AUROC 0.548 (STOP gate) | Teacher features для hard identity-drift cases |
+
+### Stop Doing
+
+- Не полірувати старий `hard_dynamic_scene_v2` threshold.
+- Не заявляти GFLOPs/FPS win з bootstrap `needs_full_compute`.
+- Не тюнити GO gates під красивий verdict.
+- Не навчати на `_decide_state()`, TSA states, APCE rule labels або scene labels.
+- Не запускати важкі SAM2/DINO/CoTracker моделі в runtime loop як частину edge pipeline, якщо це не окремий fallback режим.
+
+---
+
+## Literature Anchors
+
+Ці роботи визначають новий план:
+
+| Work | Verified source | Що беремо |
 |---|---|---|
-| `test_saltr_collect_features.py` | 3 | flat labels, key collision, _TruncatedSequence |
-| `test_saltr_model.py` | 6 | forward contract, param count, train/eval compat, no double-sigmoid |
-| `test_saltr_eval.py` | 6 | ECE, NT2F, bootstrap CI, GO/NO-GO, predictions schema |
-| `test_saltr_policy.py` | 7 | apply_policy cases, replay_policy real IoU |
-| `test_saltr_integrate.py` | 4 | FeatureBuffer, extract_features shape/NaN |
+| DAM4SAM — A Distractor-Aware Memory for Visual Object Tracking with SAM2, CVPR 2025 | [CVF OpenAccess](https://openaccess.thecvf.com/content/CVPR2025/html/Videnovic_A_Distractor-Aware_Memory_for_Visual_Object_Tracking_with_SAM2_CVPR_2025_paper.html), [GitHub](https://github.com/jovanavidenovic/DAM4SAM) | Позитивна/негативна memory, introspection-based update, explicit distractor handling |
+| Detecting Object Tracking Failure via Sequential Hypothesis Testing, WACV 2026 workshop | [arXiv 2602.12983](https://arxiv.org/abs/2602.12983), [CVF supplemental](https://openaccess.thecvf.com/content/WACV2026W/RWS/supplemental/Munoz_Detecting_Object_Tracking_WACVW_2026_supplemental.pdf) | e-process / anytime-valid sequential evidence for failure alerts with controlled false alerts |
+| CoTracker3 — Simpler and Better Point Tracking by Pseudo-Labelling Real Videos, 2024 | [arXiv 2410.11831](https://arxiv.org/abs/2410.11831), [project](https://cotracker3.github.io/) | Offline point teacher: visibility, forward/backward consistency, point survival, object-level consistency |
+| Real-World Point Tracking with Verifier-Guided Pseudo-Labeling, 2026 | [arXiv 2603.12217](https://arxiv.org/abs/2603.12217) | Verifier idea: teacher reliability scores for pseudo-label quality |
+| UTPTrack, UncL-STARK, ABTrack, BDTrack | local `papers/` + `papers/code/` | Compute baselines; do not claim pruning novelty unless oracle replay beats them |
+
+Наша відмінність від DAM4SAM: ми не будуємо SAM2 tracker. Ми distill-имо ідею **distractor-aware memory** у легкий controller над existing SOT tracker.
+
+Наша відмінність від CoTracker3: CoTracker3 не runtime controller для SGLATrack. Ми використовуємо його як offline teacher, щоб навчити дешеві features/head-и.
+
+Наша відмінність від e-process paper: ми подаємо в sequential test не один handcrafted residual, а multi-head tracker-risk probabilities + memory/point signals.
 
 ---
 
-## 📊 Поточні результати (val split, 49 sequences)
+## Current Repo Facts To Preserve
 
-NPZ: `saltr/data/salt_rd_v0.npz` — 228 seqs, 161k frames (UAV123+VisDrone+DTB70)  
-Checkpoint: `saltr/checkpoints/saltrd_best.pt` — epoch 4 (early stop)
+### Existing implementation
 
-| Head | base% | AUROC | AUPRC | ECE | Brier | R@5FPR |
-|---|---|---|---|---|---|---|
-| **false_confirmed** | 5.5 | **0.884** | **0.331** | 0.320 | 0.162 | 0.445 |
-| **failure_in_5** | 0.1 | **0.863** | 0.010 | 0.244 | 0.069 | 0.333 |
-| recoverable | 0.6 | 0.892 | 0.044 | 0.260 | 0.091 | 0.481 |
-| target_dynamic | 5.6 | 0.769 | 0.162 | 0.375 | 0.192 | 0.264 |
-| camera_dynamic | 24.7 | 0.573 | 0.302 | 0.237 | 0.241 | 0.063 |
-| hard_dynamic_scene | 11.9 | 0.638 | 0.264 | 0.332 | 0.209 | 0.204 |
-| needs_full_compute | 12.0 | 0.641 | 0.266 | 0.334 | 0.211 | 0.211 |
+| Area | Current state |
+|---|---|
+| Frozen tracker | `src/uav_tracker/` has SGLATrack/SALT v3 with telemetry/config gates |
+| SALT-RD package | `saltr/src/salt_r/` |
+| v0 dataset | `saltr/data/salt_rd_v0.npz` — 228 sequences, ~161k frames |
+| v1 labels | `saltr/data/salt_rd_v1_labels.npz` — 10 labels (incl. hard_dynamic_scene_v2, ifd) |
+| v2 labels | `saltr/data/salt_rd_v2_labels.npz` — 14 labels (incl. failure_in_10/20, ifd_10/20) |
+| v0 checkpoint | `saltr/checkpoints/saltrd_best.pt` — 7 heads, epoch 13 |
+| v1 checkpoint | `saltr/checkpoints/v1/saltrd_best.pt` — 9 heads, epoch 3 |
+| v2 checkpoint | `saltr/checkpoints/v2/saltrd_best.pt` — 13 heads, epoch 14 (composite stopping) |
+| Results path | `saltr/results/` — all publishable outputs, schema-tagged filenames |
+| Label utilities | `collect_features.recompute_labels_v1/v2()` — generate from existing NPZ without re-running tracker |
+| Baselines | `saltr/results/baselines_val.json` — feature baselines vs GRU model |
+| Provenance | eval.py embeds git_commit, npz_md5, checkpoint_md5, label_schema, created_at, command |
 
-**NT2F(IoU≥0.5):** mean=0.555, std=0.375, never_failed=17/49  
-**Bootstrap AUPRC(fc) 95%CI:** [0.216, 0.538] (n_seq=19)
+### v2 GO/NO-GO status
 
-**GO/NO-GO: BORDERLINE**
+| Gate | Value | Status |
+|---|---:|---|
+| AUPRC(`false_confirmed`) > 0.30 | 0.336 | ✅ |
+| AUROC(`false_confirmed`) > 0.65 | 0.884 | ✅ |
+| AUROC(`failure_in_5`) > 0.75 | 0.853 | ✅ |
+| AUROC(`imminent_failure_dynamic`) > 0.75 | 0.902 | ✅ |
+| AUPRC(`imminent_failure_dynamic`) > 0.15 | 0.323 | ✅ |
+| AUROC(`needs_full_compute`) > 0.70 | 0.648 | ❌ |
+| ECE(`false_confirmed`) < 0.12 | 0.316 | ❌ |
 
-| Metric | Value | GO threshold | Status |
-|---|---|---|---|
-| AUPRC(fc) | 0.331 | > 0.30 | ✅ |
-| AUROC(fc) | 0.884 | > 0.65 | ✅ |
-| AUROC(fail5) | 0.863 | > 0.75 | ✅ |
-| AUROC(hard_dyn) | 0.638 | > 0.75 | ⚠️ |
-| AUROC(full_cmp) | 0.641 | > 0.70 | ⚠️ |
-| ECE(fc) | 0.320 | < 0.12 | ❌ needs calibration |
+**5/7 gates pass. Blocking: ECE(fc) and needs_full_compute (oracle labels required).**
 
-**Policy replay (val):**
-```
-wrong_reinit_rate:       0.216  ← 21.6% recovery → wrong object
-template_blocked_rate:   0.004  ← conservative at default thresholds
-template_corruption_rate: 0.097 ← target for false_confirmed improvement
-compute_cheap_rate:      0.000  ← needs_full_compute head too weak
-abstention_gain:         0.051  ← blocking update gives +5% IoU
-```
+### Key v2 eval artifacts
 
-**Diagnostic sequences (4 hard seqs: bike2, Gull2, Sheep1, StreetBasketball1):**
-- AUROC(fc)=0.604, AUPRC(fc)=0.279 (base=20.3%), NT2F=0.105 — model weaker on hardest cases
+| Artifact | Path |
+|---|---|
+| val metrics (v2, calibrated) | `saltr/results/eval_val_v2.json` |
+| val predictions (calibrated) | `saltr/results/preds_val_v2.json` |
+| policy replay | `saltr/results/policy_val_v2.json` |
+| diagnostic metrics | `saltr/results/eval_diagnostic_v2.json` |
+| label audit (v1 NPZ) | `saltr/results/label_audit_v1.json` |
+| feature baselines | `saltr/results/baselines_val.json` |
+
+### What this session confirmed
+
+1. **imminent_failure_dynamic_10/20 signal holds**: AUROC 0.897/0.889 at 10/20-frame horizon. Telemetry carries proactive failure signal without teacher features.
+2. **false_confirmed baselines**: GRU AUROC=0.884 vs best baseline 0.511 (+37.9pp). Neural temporal approach is essential — single-feature rules fail completely.
+3. **Policy improvement v0→v2**: template corruption −44%, wrong reinit −33%.
+4. **Diagnostic split (hard sequences)**: false_confirmed AUROC=0.548 (fails STOP gate). Hard identity-drift cases need teacher features.
+5. **Lead-time still 1 frame median**: e-process sequential accumulation (Phase 2A) is the right fix, not longer-horizon labels alone.
+
+Interpretation:
+
+- `false_confirmed` + `imminent_failure_dynamic` are real enough to build interventions around.
+- e-process is the next highest-leverage step that needs zero new tracker runs.
+- Teacher features (DAM memory, CoTracker3 point consistency) are the path to fixing ECE(fc) and diagnostic AUROC(fc).
+- `needs_full_compute` is not ready — do not claim compute savings without oracle.
 
 ---
 
-## Стартовий промпт для наступної coding сесії
+## Session Log — 2026-05-20
 
-> Pipeline complete. NPZ + checkpoint exist. BORDERLINE verdict. Next = calibration → LODO → operating point tuning.
+### Pipeline fixes (all tests green: 33 passed)
+
+| Fix | File | Impact |
+|---|---|---|
+| `n_evaluated`/`n_skipped` + `sys.exit` if 0 | `policy.py` | Policy replay no longer silently misreports |
+| `test_eval_does_not_double_sigmoid` calls `_run_inference` | `test_saltr_model.py` | Regression test covers real eval path |
+| `--datasets` multi-token parser in run_phase1.sh | `run_phase1.sh` | `--datasets uav123 visdrone_sot` now works |
+| GO/NO-GO test asserts exactly BORDERLINE | `test_saltr_eval.py` | Gate won't silently become permissive |
+| `_load_model` reads `head_names` from checkpoint metadata | `eval.py` | v1/v2 checkpoints load correctly |
+| `train.SALTRD.forward` uses `self.heads` keys | `train.py` | v2 forward shape (B, 13) not hardcoded (B, 7) |
+| Predictions saved AFTER calibration | `eval.py` | Exported JSON reflects calibrated probs |
+| Checkpoint saves `_schema_label_names`, not `LABEL_NAMES` | `train.py` | Provenance correct for v1/v2 |
+| Early stopping composite score for v2 | `train.py` | Checkpoint optimises for fc + ifd10 + ifd20 |
+| Schema-tagged result filenames | `run_phase1.sh` | `eval_val_v2.json` not `eval_val.json` |
+
+### New modules / utilities
+
+| File | Purpose |
+|---|---|
+| `saltr/src/salt_r/diagnose_labels.py` | Label contamination audit; reads v1/v2 columns directly |
+| `saltr/src/salt_r/baselines.py` | Feature baseline comparison vs GRU (AUROC/AUPRC/lift table) |
+| `saltr/src/salt_r/eval.py::compute_failure_lead_time` | Lead-time metric for ifd heads |
+| `saltr/src/salt_r/eval.py::calibrate_temperature / apply_temperature` | Per-head temperature scaling |
+| `collect_features.recompute_labels_v1/v2()` | Generate v1/v2 NPZ without re-running tracker |
+
+### Training runs completed
+
+| Schema | Epoch | AUROC(fc) | AUPRC(fc) | AUROC(ifd) | ECE(fc) cal | template_corr |
+|---|---|---:|---:|---:|---:|---:|
+| v0 | 13 | 0.884 | 0.331 | — | 0.264 | 0.108 |
+| v1 | 3 | 0.890 | 0.356 | 0.900 | 0.229 | 0.090 |
+| v2 | 14 | 0.884 | 0.336 | 0.902 / **0.897** / **0.889** | 0.316 | **0.060** |
+
+---
+
+
 
 ```text
-Прочитай HANDOFF_NEXT.md секцію "Поточні результати" та FROZEN.md.
+Frozen SGLATrack/SALT v3
+  |
+  | per-frame telemetry
+  |   APCE / PSR / score-map stats / bbox motion / flow / embeddings
+  v
+SALT-RD Feature Stream
+  |
+  +--> DAM-style Memory Features
+  |      positive target memory
+  |      negative distractor memory
+  |      target-vs-distractor margin
+  |
+  +--> CoTracker3 Teacher Features (offline only)
+  |      point survival
+  |      point visibility
+  |      forward/backward consistency
+  |      point cloud coherence
+  |
+  v
+SALT-RD Temporal Model
+  P(false_confirmed)
+  P(failure_in_5/10/20)
+  P(imminent_failure_dynamic_5/10/20)
+  P(recoverable)
+  P(distractor_risk)
+  P(template_corruption)
+  P(wrong_reinit)
+  P(needs_full_compute) only after oracle replay
+  |
+  v
+e-Process Alert Layer
+  anytime evidence accumulation
+  controlled false alert rate
+  alert tiers: observe / verify / intervene
+  |
+  v
+Policy Interventions
+  block template update
+  reject bad recovery
+  require extra verification
+  expand search region conservatively
+  disable pruning / use full compute
+  trigger SAM2/SAMURAI/Grounded-SAM fallback only on high-risk frames
+```
 
-СТАН:
-- saltr/data/salt_rd_v0.npz — 228 seqs, 161k frames ✓
-- saltr/checkpoints/saltrd_best.pt — trained, early stop epoch 4 ✓
-- eval_val.json — val metrics з fixed pipeline ✓
-- GO/NO-GO: BORDERLINE (ECE=0.320 > GO 0.12, hard_dyn AUROC=0.638 < GO 0.75)
+Runtime target:
 
-ЗАДАЧА 1 — Temperature scaling для ECE
-ECE(fc)=0.320 → target <0.12. Реалізуй у saltr/src/salt_r/eval.py:
+- SALT-RD temporal model: cheap, always-on.
+- DAM-style memory features: cheap, always-on if embeddings are from existing tracker path.
+- e-process: negligible overhead.
+- CoTracker3/SAM2/DINO: offline teacher or rare fallback, not every frame.
 
-  from torch import nn
-  class TemperatureScaler(nn.Module):
-      # Learn T on val split, apply on val/test
-      # Scale logits (before sigmoid) by 1/T
-      # Fit: NLL minimization over val set
-  
-  Після calibration перегенеруй eval_val.json і перевір ECE.
-  НЕ роби calibration на train split.
+---
 
-ЗАДАЧА 2 — LODO eval (обов'язкова для paper)
-  PYTHONPATH=src:saltr/src python saltr/src/salt_r/train.py \
-    --npz saltr/data/salt_rd_v0.npz \
-    --output saltr/checkpoints/lodo_dtb70/
+## New Phase Plan
 
-  Але спочатку потрібен новий NPZ з LODO split:
-  - train: uav123 + visdrone_sot sequences
-  - val: dtb70 sequences  
-  Або: зробити окремий збір тільки для DTB70 і оцінити checkpoint trained on
-  UAV123+VisDrone.
+### Phase 0 — Preserve Current Baseline And Artifacts
 
-ЗАДАЧА 3 — Аналіз weak heads
-  hard_dynamic_scene AUROC=0.638 < 0.75. Перевір:
-  - base rate на train split (чи не < 5% → дуже рідко)
-  - correlation між hard_dynamic_scene labels і actual IoU drops
-  - чи compute_labels правильно рахує hard_dynamic_scene (HANDOFF_NEXT.md §Labels v0)
+**Status: ✅ done.**
 
-ЗАДАЧА 4 — Policy operating point
-  compute_cheap_rate=0.000 означає поточний поріг (needs_full_compute < 0.25) не спрацьовує.
-  needs_full_compute base rate = 12%, AUROC=0.641.
-  Спробуй поріг 0.40 і перевір compute regret (AUC delta при 10% cheap frames).
-  
-  Після calibration: запусти policy replay з оновленими ймовірностями:
-  PYTHONPATH=src:saltr/src python -m salt_r.policy \
-    --probs-json saltr/checkpoints/preds_val.json \
-    --npz saltr/data/salt_rd_v0.npz \
-    --output saltr/checkpoints/policy_val.json
+- Provenance fields (git_commit, npz_md5, checkpoint_md5, label_schema, created_at) in all eval JSONs.
+- `saltr/results/` is the canonical output dir, schema-tagged filenames.
+- Generated JSONs in `saltr/checkpoints/` removed from git tracking.
+- 33 targeted SALT-RD unit tests pass.
 
-ЗАДАЧА 5 — Feature diagnostics (якщо ECE не покращується після calibration)
-  Перед додаванням нових features (v1 additions з papers/README.md):
-  - feature importance: permutation importance або gradient-based
-  - correlation matrix features vs labels
-  - які features мають найбільший signal для false_confirmed
-
-RED LINES (не робити):
-- НЕ тюнити GO thresholds щоб отримати GO verdict
-- НЕ тренувати на діагностичних sequences (bike2, Gull2, Sheep1, StreetBasketball1)
-- НЕ робити calibration на train split
-- НЕ видаляти CE/DYNAMIC/VelocityDrift з src/uav_tracker/ (потрібні для ablations)
+```bash
+PYTHONPATH=src:saltr/src .venv/bin/python -m pytest tests/unit/test_saltr_*.py -q
+PYTHONPATH=src:saltr/src .venv/bin/python -m compileall saltr/src/salt_r
 ```
 
 ---
 
-## Papers у `papers/`, які читати першими
+### Phase 1 — Lock v1/v2 As Baseline, Stop Optimizing Weak Heads
 
-| Local file | Why |
+**Status: ✅ done. v0/v1/v2 trained, evaluated, baselines computed.**
+
+Results locked:
+
+| Artifact | Status |
 |---|---|
-| `papers/MSTFT_2026_Mamba_Based_Spatio_Temporal_Fusion_UAV_Tracking.pdf` | SOTA backbone + response/temporal/motion verification |
-| `papers/MATA_2026_Architecture_and_Evaluation_Protocol_UAV_Tracking.pdf` | NT2F, ego-motion, embedded protocol |
-| `papers/17_UTPTrack_Unified_Token_Pruning.pdf` / `papers/utptrack.pdf` | token pruning competitor |
-| `papers/18_ABTrack_Adaptively_Bypassing_ViT_Blocks.pdf` | adaptive block bypass competitor |
-| `papers/09_BDTrack_Motion_Blur_Robust_Dynamic_Early_Exit_UAV.pdf` | UAV dynamic early exit + motion blur competitor |
-| `papers/10_UncL_STARK_Uncertainty_Guided_Depth_Adaptation.pdf` / `papers/uncl-stark.pdf` | uncertainty-guided compute baseline |
-| `papers/11_LGTrack_Layer_Guided_UAV_Tracking.pdf` | 2026 UAV dynamic layer selection competitor |
-| `papers/15_SMTrack_State_Aware_Mamba_Visual_Tracking.pdf` | temporal state/dynamic scenario competitor |
-| `papers/ptdt.pdf` | point tracking-guided dynamic tokens/template update |
-| `papers/ootu.pdf` | bbox uncertainty calibration baseline |
-| `papers/CoTracker3_2025_Simpler_and_Better_Point_Tracking_by_Pseudo_Labeling_Real_Videos.pdf` | offline point teacher |
-| `papers/LoRAT_2024_Tracking_Meets_LoRA_Faster_Training_Larger_Model_Stronger_Performance.pdf` | Phase 6 domain adaptation fallback |
+| `saltr/results/eval_val_v2.json` | ✅ v2 calibrated val metrics |
+| `saltr/results/preds_val_v2.json` | ✅ v2 calibrated predictions |
+| `saltr/results/policy_val_v2.json` | ✅ v2 policy replay |
+| `saltr/results/baselines_val.json` | ✅ feature baselines vs GRU |
+| `saltr/results/label_audit_v0.json` | ✅ hard_dynamic_scene contamination audit |
+| `saltr/results/label_audit_v1.json` | ✅ v1 label base rates |
+
+---
+
+### Phase 2A — e-Process Alerts Over Existing v1 Probabilities
+
+**Priority:** highest short-term, because it needs no new tracker runs.
+
+Problem:
+
+`P(imminent_failure_dynamic)>0.5` has good recall but median lead-time is only 1 frame. A single-frame threshold is too twitchy and not enough for proactive policy.
+
+Idea:
+
+Wrap risk probabilities in a sequential test that accumulates evidence. We want fewer noisy alerts and better intervention timing:
+
+- `H0`: tracker is still trustworthy / no failure process started.
+- `H1`: tracker has entered failure-risk process.
+
+Inputs:
+
+```text
+p_false_confirmed[t]
+p_imminent_failure_dynamic[t]
+p_failure_in_5[t]
+p_failure_in_10[t]
+p_failure_in_20[t]
+entropy_z[t]
+apce_drop_z[t]
+peak_margin_z[t]
+memory_margin[t]        # added in Phase 2B
+point_consistency[t]    # added in Phase 2C
+```
+
+Initial v1-only score:
+
+```python
+risk_score = (
+    0.45 * p_false_confirmed
+  + 0.35 * p_imminent_failure_dynamic
+  + 0.15 * p_failure_in_5
+  + 0.05 * entropy_z_rank
+)
+```
+
+Implementation file:
+
+```text
+saltr/src/salt_r/eprocess.py
+tests/unit/test_saltr_eprocess.py
+```
+
+Recommended e-process design:
+
+1. Split validation sequences into calibration and alert-eval groups by sequence.
+2. Define null frames from GT:
+   - IoU >= 0.5,
+   - not `failure_in_5/10/20`,
+   - not `false_confirmed`.
+3. Convert risk score to conformal p-value using calibration null distribution:
+
+```python
+p_t = (1 + count(null_scores >= score_t)) / (1 + n_null)
+```
+
+4. Convert p-value to an e-value with a power betting function:
+
+```python
+e_t = epsilon * (p_t ** (epsilon - 1.0))   # epsilon in (0, 1), e.g. 0.5
+```
+
+5. Run two alert modes and report them separately:
+
+**Formal mode** — no decay, no intra-sequence reset unless a new independent tracking episode starts:
+
+```python
+E_t = E_{t-1} * e_t
+alert when max_so_far(E_t) >= 1 / alpha
+```
+
+This is the closest to the WACV e-process framing. Because video frames are correlated and our conformal null is empirical, still validate false alerts by sequence; do not claim a theorem beyond the assumptions we actually satisfy.
+
+**Engineering mode** — decay/reset smoother for deployment usability:
+
+```python
+E_t = max(1.0, decay * E_{t-1} * e_t)
+alert when E_t >= 1 / alpha
+```
+
+This mode may give better UX, but it is empirical. Do not describe it as formally anytime-valid unless we prove the reset/decay construction.
+
+6. Sweep:
+   - `epsilon`: 0.25, 0.5, 0.75
+   - `alpha`: 0.20, 0.10, 0.05
+   - `decay`: 0.95, 0.98, 1.00
+   - reset after re-init / first frame after GT failure.
+
+Metrics:
+
+| Metric | Why |
+|---|---|
+| median lead time before IoU<0.3 | proactive value |
+| recall of failure events | coverage |
+| false alerts per 1000 frames | deployment burden |
+| FAR at sequence level | user-visible nuisance |
+| alert duration | whether alerts are usable or sticky |
+| intervention opportunity rate | how often policy can act before failure |
+
+GO:
+
+| Gate | Target |
+|---|---:|
+| median lead time | >= 3 frames on val |
+| failure-event recall | >= 0.60 |
+| false alerts | <= 100 per 1000 frames or sequence-level FAR <= 0.10 |
+| improves over raw `P(ifd)>0.5` | yes on lead-time/FAR tradeoff |
+
+STOP:
+
+- If e-process only delays alerts without reducing FAR, keep single-frame risk tiers.
+- If median lead time remains 1 frame after 10/20 labels, the issue is label/feature, not alert logic.
+
+Output artifacts:
+
+```text
+saltr/results/eprocess_val_v1.json
+saltr/results/eprocess_threshold_sweep_v1.csv
+saltr/results/timeline_eprocess_<seq>.png
+```
+
+---
+
+### Phase 2B — DAM4SAM-Style Distractor Memory
+
+**Priority:** highest expected gain for false-confirmed and wrong recovery.
+
+Problem:
+
+False-confirmed is not localization uncertainty. The tracker can have a sharp score map and high APCE while sitting on the wrong object. DAM4SAM's key lesson is: tracking needs **memory about distractors**, not only target memory.
+
+We implement a lightweight DAM-style memory, not full SAM2 memory.
+
+New files:
+
+```text
+saltr/src/salt_r/memory.py
+saltr/src/salt_r/memory_features.py
+tests/unit/test_saltr_memory.py
+```
+
+Memory state:
+
+```python
+PositiveMemory:
+  embeddings: recent confident target embeddings
+  bboxes: predicted boxes
+  timestamps
+  quality: low risk + high IoU during offline collection / low risk at runtime
+
+NegativeMemory:
+  embeddings: distractor candidate embeddings
+  bboxes: candidate boxes / secondary peaks / rejected recovery boxes
+  timestamps
+  source: secondary_peak | rejected_recovery | false_confirmed_teacher | detector_candidate
+```
+
+Runtime-safe embedding sources, in priority order:
+
+1. Existing SGLATrack embedding/helper if accessible without extra forward pass.
+2. Current 32x32 crop embedding path already used for cosine guards.
+3. Lightweight MobileNet/ConvNeXt-tiny crop embedding only if overhead < 1 ms/frame on MPS.
+4. DINO/SAM embeddings only offline for teacher features, not always-on runtime.
+
+Memory update rules:
+
+```python
+if p_false_confirmed < 0.20 and p_ifd < 0.30 and apce_norm stable:
+    positive_memory.add(current_target_embedding)
+
+if secondary_peak_is_strong or detector_candidate_rejected or p_false_confirmed high:
+    negative_memory.add(candidate_embedding)
+
+if candidate overlaps current target too much:
+    do not add to negative memory
+
+if memory age > max_age or spatially impossible:
+    decay/remove
+```
+
+Important: offline collection can use GT to label which memories are positive/negative; runtime cannot.
+
+Candidate sources for negative memory:
+
+| Source | How |
+|---|---|
+| score-map secondary peaks | implement real local maxima, not `n_secondary=0` placeholder |
+| detector candidates | YOLO/RT-DETR candidates around search area |
+| recovery rejects | candidates rejected by size/spatial/appearance guard |
+| GT false-confirmed frames offline | predicted bbox crop when IoU<0.2 but confidence high |
+| nearby same-class objects | if detector provides classes |
+
+New scalar features:
+
+```text
+mem_pos_max_sim
+mem_pos_mean_sim
+mem_pos_consensus
+mem_neg_max_sim
+mem_neg_mean_sim
+mem_neg_count_nearby
+mem_target_minus_distractor_margin
+mem_neg_spatial_proximity
+mem_update_age
+mem_memory_entropy
+mem_template_contamination_score
+mem_recovery_candidate_margin
+```
+
+New labels:
+
+```python
+distractor_present[t] = exists candidate c where IoU(c, gt_target) < 0.2 and candidate_score high
+
+template_corruption[t] = would_update_template[t] and IoU(pred_bbox[t], gt_bbox[t]) < 0.5
+
+wrong_reinit[t] = recovery_candidate_accepted[t] and IoU(candidate, gt_bbox[t]) < 0.3
+
+identity_margin_failure[t] = (
+    similarity(pred_crop, negative_memory) >= similarity(pred_crop, positive_memory) - margin
+    and IoU(pred_bbox, gt_bbox) < 0.3
+)
+```
+
+Use cases:
+
+1. Improve `P(false_confirmed)`.
+2. Reject wrong recovery before `tracker.init(winner_bbox)`.
+3. Block template update when predicted target looks closer to distractor memory.
+4. Give e-process a stable identity-drift evidence stream.
+
+GO:
+
+| Gate | Target |
+|---|---:|
+| AUPRC(`false_confirmed`) | >= 0.45 or +25% relative vs v1 |
+| recall@5%FPR(`false_confirmed`) | >= 0.60 |
+| diagnostic AUROC(`false_confirmed`) | >= 0.75 |
+| template corruption rate | -25% relative |
+| wrong re-init rate | -20% relative |
+
+STOP:
+
+- If memory features improve val but not diagnostic split, treat it as overfit.
+- If runtime overhead > 2 ms/frame on MPS and no strong policy gain, keep memory as offline analysis only.
+
+---
+
+### Phase 2C — CoTracker3 Point Consistency Teacher
+
+**Priority:** tied with Phase 2B, but more offline-heavy.
+
+Problem:
+
+APCE/score maps tell us "there is a confident response", not "this response belongs to the same physical object." Point tracks give a stronger identity-consistency signal.
+
+Use CoTracker3 offline to create teacher signals and distill them into SALT-RD features/labels. CoTracker3 should not run in the edge loop.
+
+New files:
+
+```text
+saltr/src/salt_r/teachers/cotracker3_export.py
+saltr/src/salt_r/teachers/point_features.py
+saltr/src/salt_r/recompute_teacher_features.py
+tests/unit/test_saltr_point_features.py
+```
+
+Teacher collection plan:
+
+1. For each sequence, sample points inside the initial GT bbox:
+   - 3x3 grid for small targets,
+   - 4x4 or 5x5 grid for larger targets,
+   - include center + corners + edge midpoints.
+2. Run CoTracker3 offline or online variant over frames.
+3. For each frame, compute point-level statistics relative to:
+   - predicted bbox,
+   - GT bbox during offline labeling,
+   - previous frame point cloud,
+   - current optical-flow estimate.
+4. Save point teacher arrays into sidecar NPZ first; do not bloat the core dataset until validated.
+
+Sidecar schema:
+
+```text
+point_tracks/{seq}:        float32 (T, P, 2)
+point_visibility/{seq}:    float32/bool (T, P)
+point_confidence/{seq}:    float32 (T, P) if available
+point_feature_names:       list[str]
+point_features/{seq}:      float32 (T, F_point)
+teacher_version:           str
+teacher_model:             str
+created_at:                str
+```
+
+Point features:
+
+```text
+pt_visible_ratio
+pt_inside_pred_ratio
+pt_inside_pred_weighted
+pt_inside_gt_ratio                # offline diagnostics only, never runtime feature
+pt_forward_backward_error
+pt_median_motion
+pt_motion_iqr
+pt_affine_residual
+pt_cluster_area_ratio
+pt_cluster_aspect_delta
+pt_flow_agreement
+pt_bbox_center_disagreement
+pt_survival_since_init
+pt_reacquisition_consistency
+pt_split_score                    # point cloud splits into two modes
+```
+
+Teacher labels:
+
+```python
+point_consistency_good[t] = (
+    pt_visible_ratio[t] > 0.6
+    and pt_inside_pred_ratio[t] > 0.6
+    and pt_affine_residual[t] < p75_seq
+)
+
+point_identity_break[t] = (
+    IoU(pred_bbox[t], gt_bbox[t]) < 0.3
+    and pt_inside_pred_ratio[t] < 0.4
+    and pt_visible_ratio[t] > 0.5
+)
+
+point_recoverable[t] = (
+    IoU(pred_bbox[t], gt_bbox[t]) < 0.3
+    and pt_visible_ratio[t] > 0.5
+    and point cloud still spatially coherent
+)
+```
+
+Critical leakage rule:
+
+- `pt_inside_gt_ratio` may be used for label diagnostics only.
+- Student runtime features must not include GT-relative fields.
+- Teacher labels may use GT because training is offline; inference only uses distilled student.
+
+How to use the teacher:
+
+| Mode | Use |
+|---|---|
+| Teacher labels | train additional heads: `point_identity_break`, `point_recoverable`, `point_consistency_good` |
+| Teacher features | optionally add point features to training only, then distill to scalar telemetry/memory features |
+| Diagnostics | explain false-confirmed cases: point cloud follows original target while bbox jumps to distractor |
+
+GO:
+
+| Gate | Target |
+|---|---:|
+| `point_identity_break` AUROC | >= 0.80 |
+| `false_confirmed` AUPRC after point distillation | >= 0.45 or +25% relative |
+| diagnostic false-confirmed AUROC | >= 0.75 |
+| lead time for identity break | >= 3 frames when combined with e-process |
+
+STOP:
+
+- If CoTracker3 fails on small UAV targets due tiny objects, try fewer points + upscaled crops before abandoning.
+- If teacher is noisy, add teacher reliability filtering instead of training on all pseudo-labels.
+
+---
+
+### Phase 2D — SALT-RD v2 Dataset And Model
+
+This phase combines:
+
+- v1 labels,
+- v2 10/20-frame labels,
+- DAM memory features,
+- CoTracker3 teacher features/labels,
+- e-process-ready risk outputs.
+
+Target schema:
+
+```text
+features_v2:
+  v0 scalar features (28)
+  memory features (10-14)
+  optional distilled point-consistency scalar features (6-10)
+
+labels_v2:
+  v1 labels (0-9)
+  failure_in_10
+  failure_in_20
+  imminent_failure_dynamic_10
+  imminent_failure_dynamic_20
+  distractor_present
+  template_corruption
+  wrong_reinit
+  point_identity_break
+  point_consistency_good
+  point_recoverable
+```
+
+Recommended model:
+
+```python
+class SALTRDv2(nn.Module):
+    input_dim = 28 + memory_dim + point_distill_dim
+    trunk = GRU(input_dim, hidden=96, layers=2, dropout=0.2)
+    heads = {
+        "false_confirmed": reliability head,
+        "failure_in_5": risk head,
+        "failure_in_10": risk head,
+        "failure_in_20": risk head,
+        "imminent_failure_dynamic": dynamic risk head,
+        "imminent_failure_dynamic_10": dynamic risk head,
+        "imminent_failure_dynamic_20": dynamic risk head,
+        "recoverable": recovery head,
+        "distractor_present": memory head,
+        "template_corruption": policy head,
+        "wrong_reinit": policy head,
+        "point_identity_break": teacher head,
+        "point_consistency_good": teacher head,
+    }
+```
+
+Training details:
+
+- Sequence-level split only.
+- Diagnostic sequences excluded from train/val.
+- Focal BCE or weighted BCE.
+- Head weights:
+  - high: `false_confirmed`, `wrong_reinit`, `template_corruption`, `point_identity_break`;
+  - medium: `failure_in_10/20`, `imminent_failure_dynamic_10/20`, `recoverable`;
+  - low/aux: `target_dynamic`, `camera_dynamic`, old `hard_dynamic_scene`.
+- Early stopping primary metric:
+  - v2 primary: AUPRC(`false_confirmed`) + AUPRC(`wrong_reinit`) if available.
+  - secondary: median lead-time after e-process on val.
+
+Evaluation:
+
+| Group | Metrics |
+|---|---|
+| Reliability | AUROC, AUPRC, recall@5%FPR, ECE, Brier |
+| Alerting | lead time, FAR, event recall, alert duration |
+| Memory | target-vs-distractor margin distributions, memory ablations |
+| Point teacher | teacher label AUROC/AUPRC, diagnostic timelines |
+| Policy | template corruption, wrong reinit, abstention gain, AUC delta |
+| Generalization | LODO: train two datasets, test third |
+
+GO:
+
+| Gate | Target |
+|---|---:|
+| AUPRC(`false_confirmed`) | >= 0.45 or +25% relative |
+| recall@5%FPR(`false_confirmed`) | >= 0.60 |
+| diagnostic AUROC(`false_confirmed`) | >= 0.75 |
+| median e-process lead time | >= 3 frames |
+| template corruption reduction | >= 25% |
+| wrong re-init reduction | >= 20% |
+| LODO false-confirmed AUROC | >= 0.75 on at least 2/3 target domains |
+
+NO-GO:
+
+- If v2 improves only global val but not diagnostics/LODO, do not call it real improvement.
+- If interventions do not improve actual replay metrics, keep v2 as analysis-only.
+
+---
+
+### Phase 2E — Policy Intervention Replay
+
+This is where we prove "реальне покращення", not just better classification.
+
+New/updated files:
+
+```text
+saltr/src/salt_r/policy.py
+saltr/src/salt_r/policy_sweep.py
+saltr/src/salt_r/interventions.py
+tests/unit/test_saltr_policy_sweep.py
+```
+
+Interventions:
+
+| Intervention | Trigger | Expected benefit |
+|---|---|---|
+| block template update | high `p_false_confirmed` or high memory negative margin | lower template corruption |
+| reject recovery candidate | high `p_wrong_reinit` or negative memory sim > positive sim | lower wrong re-init |
+| verify before re-init | high recovery uncertainty | fewer identity switches |
+| expand search conservatively | e-process alert but not false-confirmed | catch target before full loss |
+| full compute / no pruning | high risk or high uncertainty | avoid cheap-mode failure |
+| fallback to SAMURAI/SAM2/Grounded-SAM only on high risk | repeated alert + low trust | improve hard cases without per-frame cost |
+
+Policy must be evaluated as replay first:
+
+```text
+Inputs:
+  predictions JSON
+  NPZ IoU traces
+  candidate/recovery logs if available
+  template update logs if available
+
+Outputs:
+  policy metrics with confidence intervals
+  intervention timelines
+  threshold sweeps
+```
+
+Threshold sweep:
+
+```text
+p_false_confirmed: 0.40 ... 0.90
+p_wrong_reinit:    0.40 ... 0.90
+eprocess_alpha:    0.20, 0.10, 0.05
+memory_margin:     -0.10, 0.00, 0.10, 0.20
+```
+
+Metrics:
+
+| Metric | Definition |
+|---|---|
+| template corruption rate | allowed template updates when IoU<0.5 |
+| wrong reinit rate | accepted recovery/reinit when IoU<0.3 |
+| abstention gain | IoU improvement from refusing unsafe update/reinit |
+| missed safe update rate | blocked update when IoU>=0.7 |
+| failure event recall | event has alert before IoU<0.3 |
+| lead time | frames between first alert and failure |
+| intervention density | interventions per 1000 frames |
+| AUC delta | tracker AUC with replayed intervention vs baseline |
+
+GO:
+
+- Template corruption rate down by >=25%.
+- Wrong reinit rate down by >=20%.
+- AUC not worse globally; hard diagnostic AUC improves or failure duration decreases.
+- Intervention density acceptable: no permanent "always block" policy.
+
+---
+
+### Phase 3 — Oracle Compute Labels And Real GFLOPs/FPS Claims
+
+Only after Phases 2A-2E show trust/recovery gain.
+
+Problem:
+
+Current `needs_full_compute` is bootstrap. It does not prove compute savings.
+
+Oracle definition:
+
+Run each sequence in at least two modes:
+
+```text
+full mode:
+  SGLATrack/SALT frozen baseline, full tokens/no pruning where appropriate
+
+cheap mode:
+  CE pruning / UTP-like pruning / ABTrack-like bypass / reduced search / reduced detector calls
+```
+
+Oracle label:
+
+```python
+needs_full_compute[t] = (
+    cheap_iou[t:t+k].mean_drop_vs_full > 0.03
+    or cheap_failure_event[t:t+k] and not full_failure_event[t:t+k]
+    or cheap_causes_false_confirmed[t:t+k]
+)
+```
+
+Required outputs:
+
+```text
+saltr/data/salt_rd_compute_oracle.npz
+saltr/results/compute_oracle_eval.json
+saltr/results/auc_vs_gflops_pareto.csv
+```
+
+Compare against:
+
+- always full;
+- always cheap;
+- APCE threshold policy;
+- entropy threshold policy;
+- UncL-STARK-style uncertainty policy if implementable;
+- UTPTrack/ABTrack reported tradeoffs as external references.
+
+GO:
+
+| Gate | Target |
+|---|---:|
+| cheap frame rate | >= 15% |
+| AUC loss | <= 0.005 absolute |
+| or GFLOPs reduction | >= 10% at <=0.005 AUC loss |
+| policy beats APCE/entropy compute baseline | yes |
+
+STOP:
+
+- If cheap mode itself is not meaningfully cheaper on Apple MPS, do not pursue compute claim.
+- If oracle labels are too noisy, publish reliability/recovery only.
+
+---
+
+### Phase 4 — Recovery Fallback Experiments
+
+Lower priority than memory/point/e-process, but important for hard sequences.
+
+Candidates:
+
+| Fallback | Role |
+|---|---|
+| SAMURAI / SAM2 motion-aware tracking | high-risk fallback for class-agnostic object continuation |
+| EfficientTAM | lighter track-anything fallback |
+| Grounded-SAM2 | open-vocabulary re-detection when class mismatch kills YOLO |
+| DINO matching | appearance verification for recovery candidates |
+
+Rule:
+
+Fallback is triggered only by SALT-RD risk/e-process, not every frame.
+
+Evaluate on:
+
+- `uav0000164`
+- `bike2`
+- `Gull2`
+- `Sheep1`
+- `StreetBasketball1`
+- DTB70 natural scenes where YOLO26m VisDrone fails.
+
+GO:
+
+- wrong recovery decreases;
+- hard-sequence AUC/failure duration improves;
+- overhead is bounded because fallback call rate is low.
+
+---
+
+### Phase 5 — LODO And Robustness
+
+This is mandatory before any strong claim.
+
+Splits:
+
+| Experiment | Train | Test |
+|---|---|---|
+| LODO-DTB70 | UAV123 + VisDrone-SOT | DTB70 |
+| LODO-VisDrone | UAV123 + DTB70 | VisDrone-SOT |
+| LODO-UAV123 | VisDrone-SOT + DTB70 | UAV123 |
+
+Diagnostics must remain held out:
+
+```text
+uav0000164
+bike2
+Gull2
+Sheep1
+StreetBasketball1
+```
+
+Report:
+
+- per-dataset AUROC/AUPRC;
+- diagnostic timelines;
+- bootstrap CI by sequence;
+- target-size bins;
+- camera motion bins;
+- distractor density bins.
+
+GO:
+
+- At least 2/3 LODO tests show useful false-confirmed signal.
+- Diagnostic split improves after DAM/point features.
+
+---
+
+### Phase 6 — Backbone Adaptation Fallback
+
+Only if controller interventions still do not improve actual tracking outcomes.
+
+Options:
+
+1. LoRAT-style parameter-efficient adaptation on aerial datasets.
+2. Fine-tune SGLATrack/SUTrack/UTPTrack backbone on UAV123+VisDrone+DTB70-like data.
+3. Replace base tracker with stronger UAV backbone and keep SALT-RD as trust controller.
+
+This is not the main novelty, but may be needed for AUC.
+
+Rule:
+
+- If AUC is capped by base tracker, reliability controller can still be useful.
+- If user goal becomes "beat AUC SOTA", we need tracker adaptation/backbone work, not only SALT-RD.
+
+---
+
+## Concrete Next Coding Tasks
+
+### Task A — Implement e-process module first
+
+Prompt:
+
+```text
+Implement saltr/src/salt_r/eprocess.py.
+
+Inputs:
+  - predictions JSON from eval.py
+  - NPZ labels / iou_trace
+  - head names from JSON
+
+Features:
+  - conformal null calibration by sequence
+  - power e-value transform
+  - sequential accumulation with decay/reset
+  - threshold sweep over alpha/epsilon/decay
+
+Outputs:
+  - alert events per sequence
+  - metrics: lead_time, event_recall, false_alerts_per_1000, sequence_FAR
+  - JSON + CSV sweep artifacts in saltr/results/
+
+Tests:
+  - no alerts on all-null sequence at strict alpha
+  - earlier alert when risk score increases monotonically before failure
+  - reset prevents stale evidence after reinit/failure boundary
+```
+
+Expected value:
+
+- Quick proof whether v1 probabilities can become usable proactive alerts.
+- No retraining required.
+
+---
+
+### Task B — Add DAM-style memory feature collector
+
+Prompt:
+
+```text
+Implement lightweight positive/negative memory features in saltr/src/salt_r/memory.py
+and saltr/src/salt_r/memory_features.py.
+
+Do not integrate into runtime first.
+Add offline collection from existing NPZ + tracker logs if available.
+Start with embeddings already available from SGLATrack/cosine memory path.
+
+Produce:
+  - memory sidecar NPZ
+  - feature_names for memory features
+  - diagnostics for target-vs-distractor similarity margin
+```
+
+Minimum viable implementation:
+
+- positive memory from high-IoU frames offline;
+- negative memory from false-confirmed predicted crops offline;
+- candidate current crop similarity to both;
+- no detector dependency in v1 memory prototype.
+
+Expected value:
+
+- Direct attack on `false_confirmed`.
+- Stronger recovery/template policy.
+
+---
+
+### Task C — CoTracker3 teacher export
+
+Prompt:
+
+```text
+Add saltr/src/salt_r/teachers/cotracker3_export.py.
+
+The script should:
+  - load dataset sequences
+  - sample query points inside initial GT bbox
+  - run CoTracker3 offline or read precomputed tracks
+  - compute point consistency features
+  - write sidecar NPZ with provenance
+
+Do not add CoTracker3 as hard dependency to normal unit tests.
+Gate tests with tiny synthetic arrays for point feature math.
+```
+
+Expected value:
+
+- Offline identity-consistency teacher.
+- Better labels/features for high-confidence wrong-object drift.
+
+---
+
+### Task D — Train SALT-RD v2
+
+Prompt:
+
+```text
+Extend model/train/eval to label_schema v2-memory-point.
+
+Inputs:
+  - base NPZ v1/v2 labels
+  - memory sidecar NPZ
+  - point teacher sidecar NPZ
+
+Heads:
+  false_confirmed
+  failure_in_5/10/20
+  imminent_failure_dynamic_5/10/20
+  recoverable
+  distractor_present
+  template_corruption
+  wrong_reinit
+  point_identity_break
+  point_consistency_good
+
+Primary early-stop:
+  weighted score = AUPRC(false_confirmed) + AUPRC(wrong_reinit) + lead-time proxy
+```
+
+Expected value:
+
+- Real improvement over v1, or clear evidence that student features cannot distill teacher.
+
+---
+
+### Task E — Policy intervention replay with thresholds
+
+Prompt:
+
+```text
+Implement saltr/src/salt_r/policy_sweep.py.
+
+Run threshold sweeps for:
+  - false_confirmed block
+  - wrong_reinit reject
+  - e-process alert
+  - memory margin
+
+Report:
+  template_corruption_rate
+  wrong_reinit_rate
+  missed_safe_update_rate
+  intervention_density
+  AUC delta / failure duration delta
+```
+
+Expected value:
+
+- Converts classification gains into tracking-system gains.
+
+---
+
+## Metrics We Care About Now
+
+Primary:
+
+| Metric | Why |
+|---|---|
+| AUPRC(`false_confirmed`) | rare identity failure |
+| recall@5%FPR(`false_confirmed`) | usable high-precision intervention |
+| diagnostic AUROC/AUPRC | hard cases, not easy val |
+| template corruption reduction | actual deployment win |
+| wrong reinit reduction | actual recovery win |
+| e-process lead time | proactive value |
+| false alerts per 1000 frames | operational usability |
+
+Secondary:
+
+| Metric | Why |
+|---|---|
+| ECE/Brier/NLL | calibration quality |
+| AUC delta after policy | final tracking impact |
+| failure duration | often more meaningful than full-sequence AUC |
+| NT2F | compare with MATA-like protocol |
+| AUC-vs-GFLOPs | only after oracle compute labels |
+
+Demoted:
+
+| Metric | Why demoted |
+|---|---|
+| `hard_dynamic_scene_v2` AUROC | not predictive enough |
+| bootstrap `needs_full_compute` | not real compute oracle |
+| raw FPS/GFLOPs | no value if policy does not preserve tracking |
+
+---
+
+## Paper/Result Shape If This Works
+
+Not the priority right now, but this is the likely end shape:
+
+> We introduce SALT-RD, a lightweight reliability controller for real-time UAV SOT that combines distractor-aware memory, point-consistency distillation, and anytime sequential alerts to detect high-confidence identity drift before unsafe tracker interventions. Unlike APCE/entropy and localization-uncertainty baselines, SALT-RD detects false-confirmed tracking, reduces wrong re-initialization and template corruption, and provides bounded false-alert proactive intervention on UAV123, VisDrone-SOT, and DTB70.
+
+Comparison groups:
+
+- Base tracker: SGLATrack/SALT v3.
+- Confidence baselines: APCE, PSR, entropy, peak margin, flow consistency.
+- Uncertainty baselines: OOTU / UncL-STARK-style heatmap uncertainty where feasible.
+- Memory/teacher references: DAM4SAM and CoTracker3 as inspiration/teacher, not direct edge baselines.
+- Compute baselines: UTPTrack/ABTrack/UncL-STARK if/when oracle compute branch exists.
+
+---
+
+## Red Lines For Claude/Agents
+
+Block changes if they:
+
+- train on `_decide_state()`, `TargetState`, old TSA scene labels, or APCE thresholds as target labels;
+- use diagnostic sequences in train;
+- claim compute/FPS gain from bootstrap `needs_full_compute`;
+- report accuracy without base rate/AUPRC;
+- use frame-level random split;
+- run CoTracker3/SAM2 in every runtime frame and call it edge-ready;
+- overwrite frozen SGLATrack behavior while implementing SALT-RD;
+- tune thresholds after looking at diagnostic split and then report diagnostic as held-out;
+- make `hard_dynamic_scene_v2` central again without intervention improvement;
+- treat localization uncertainty as sufficient for false-confirmed identity drift.
+
+---
+
+## Suggested Directory Layout
+
+```text
+saltr/src/salt_r/
+  eprocess.py
+  memory.py
+  memory_features.py
+  policy_sweep.py
+  interventions.py
+  teachers/
+    __init__.py
+    cotracker3_export.py
+    point_features.py
+  collect_features.py
+  model.py
+  train.py
+  eval.py
+  policy.py
+
+saltr/data/
+  salt_rd_v0.npz
+  salt_rd_v1_labels.npz
+  salt_rd_v2_labels.npz
+  salt_rd_memory_sidecar.npz
+  salt_rd_cotracker3_sidecar.npz
+
+saltr/results/
+  eval_val_v1_calibrated.json
+  preds_val_v1_calibrated.json
+  baselines_val_v1.json
+  eprocess_val_v1.json
+  memory_diagnostics.json
+  point_teacher_diagnostics.json
+  policy_sweep_v2.json
+```
+
+---
+
+## Starting Prompt For Next Coding Session
+
+```text
+Read HANDOFF_NEXT.md section "Current Repo Facts" and saltr/results/eval_val_v2.json.
+
+STATE:
+- v2 trained: 13 heads, epoch 14 (composite stopping AUPRC(fc)+0.5*AUPRC(ifd10)+0.25*AUPRC(ifd20))
+- v2 val: AUROC(fc)=0.884, AUPRC(fc)=0.336, ifd AUROC=0.902, ifd10 AUROC=0.897, ifd20 AUROC=0.889
+- v2 policy: template_corruption=0.060 (−44% vs v0), wrong_reinit=0.183 (−33% vs v0)
+- Lead time: median=1 frame (still reactive, not proactive)
+- ECE(fc)=0.316 and AUROC(nfc)=0.648 still blocking GO gates
+
+CONFIRMED: ifd10/ifd20 signal holds (AUROC 0.897/0.889) — telemetry carries 20-frame early warning.
+DO NOT start Phase 2B/2C yet — start with Phase 2A to convert 1-frame reactive alerts to sequential evidence.
+
+TASK A — Implement e-process sequential alerts (Phase 2A):
+
+Implement saltr/src/salt_r/eprocess.py over existing v2 calibrated predictions.
+
+The e-process accumulates evidence over time:
+  H0: tracker trustworthy / no failure process active
+  H1: tracker entered failure-risk process
+
+Initial composite risk score (no new tracker runs needed):
+  risk_score[t] = 0.45 * p_false_confirmed[t]
+               + 0.35 * p_imminent_failure_dynamic[t]
+               + 0.15 * p_failure_in_5[t]
+               + 0.05 * entropy_z_rank[t]
+
+e-process: multiplicative martingale, run offline first:
+  e[0] = 1.0
+  e[t] = e[t-1] * (1 + lambda * (risk_score[t] - alpha))
+  alert when e[t] >= 1/alpha
+
+See HANDOFF_NEXT.md §Phase 2A for details on parameters and threshold sweep.
+
+Inputs available:
+  saltr/results/preds_val_v2.json   (calibrated predictions, all 13 heads)
+  saltr/data/salt_rd_v2_labels.npz  (IoU traces, ground-truth labels)
+
+Output:
+  saltr/results/eprocess_val_v2.json
+  saltr/results/eprocess_sweep_v2.json
+
+Primary metrics:
+  median lead time (target: >= 3 frames; current 1f baseline from raw threshold)
+  failure event recall at alpha=0.10
+  false alerts per 1000 frames
+  improvement over raw P(ifd)>0.5 threshold
+
+RED LINES:
+- Do NOT optimize hard_dynamic_scene_v2
+- Do NOT claim compute/FPS without oracle compute labels
+- Do NOT calibrate on train split
+- Do NOT tune GO gates to get better verdict
+- Do NOT train on diagnostic sequences (bike2, Gull2, Sheep1, StreetBasketball1, uav0000164)
+```
+
+---
+
+## One-Line Current Phase
+
+**Current phase:** v2 trained and evaluated (ifd10/20 hold at 0.89+). Starting **Phase 2A: e-process sequential alerts** over existing v2 calibrated predictions — zero new tracker runs needed, converts 1-frame reactive threshold into accumulating evidence with controlled false-alarm rate.

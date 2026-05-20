@@ -64,25 +64,25 @@ def test_train_checkpoint_loads_in_eval(tmp_path):
 def test_eval_does_not_double_sigmoid():
     """Probability from _run_inference must equal raw model output — no extra sigmoid."""
     from salt_r.model import SALTRD, HEAD_NAMES
+    from salt_r.eval import _run_inference
 
     model = SALTRD()
     model.eval()
 
-    # Run the model directly to get ground-truth probabilities
-    x = torch.randn(1, 20, 28)
+    features = np.random.randn(20, 28).astype(np.float32)
+
+    # Real eval path — must not apply sigmoid a second time
+    result_dict = _run_inference(model, {"test_seq": features}, window_size=20, device="cpu")
+    fc_idx = HEAD_NAMES.index("false_confirmed")
+    result_fc = float(result_dict["test_seq"][-1, fc_idx])
+
+    # Direct model path: at t=19 the window is the full sequence (no padding)
+    x = torch.tensor(features, dtype=torch.float32).unsqueeze(0)  # (1, 20, 28)
     with torch.no_grad():
-        raw = model(x)  # dict of already-sigmoid values
+        raw = model(x)
     expected_fc = float(raw["false_confirmed"].item())
 
-    # Simulate what _run_inference does: stack via HEAD_NAMES + clip
-    prob_matrix = np.stack(
-        [raw[h].detach().cpu().numpy() for h in HEAD_NAMES], axis=1
-    ).astype(np.float32)
-    prob_matrix = np.clip(prob_matrix, 0.0, 1.0)
-    fc_idx = HEAD_NAMES.index("false_confirmed")
-    result_fc = float(prob_matrix[0, fc_idx])
-
-    assert abs(result_fc - expected_fc) < 1e-6, \
+    assert abs(result_fc - expected_fc) < 1e-5, \
         f"Double sigmoid detected: raw={expected_fc:.6f}, eval={result_fc:.6f}"
 
 
@@ -93,3 +93,102 @@ def test_train_head_names_canonical():
 
     assert list(train_heads) == list(model_heads), \
         f"Diverged head names: model={model_heads}, train={train_heads}"
+
+
+# ---------------------------------------------------------------------------
+# v1 schema — 9-head model forward, train wrapper, and checkpoint roundtrip
+# ---------------------------------------------------------------------------
+
+def test_v1_model_forward_9_heads():
+    """SALTRD with v1 head_names must return 9 heads, not 7."""
+    from salt_r.model import SALTRD, HEAD_NAMES_V1
+
+    m = SALTRD(head_names=HEAD_NAMES_V1)
+    m.eval()
+    x = torch.zeros(2, 20, 28)
+    with torch.no_grad():
+        out = m(x)
+    assert isinstance(out, dict)
+    assert len(out) == len(HEAD_NAMES_V1), \
+        f"Expected {len(HEAD_NAMES_V1)} heads, got {len(out)}: {list(out.keys())}"
+    assert list(out.keys()) == HEAD_NAMES_V1
+
+
+def test_v1_train_wrapper_output_shape():
+    """train.SALTRD with v1 schema must return (B, 9) tensor, not (B, 7)."""
+    from salt_r.model import HEAD_NAMES_V1
+    from salt_r.train import SALTRD as TrainSALTRD
+
+    m = TrainSALTRD(head_names=HEAD_NAMES_V1)
+    m.eval()
+    x = torch.zeros(3, 20, 28)
+    with torch.no_grad():
+        out = m(x)
+    assert out.shape == (3, len(HEAD_NAMES_V1)), \
+        f"Expected (3, {len(HEAD_NAMES_V1)}), got {out.shape}"
+
+
+def test_v1_checkpoint_roundtrip(tmp_path):
+    """v1 checkpoint saved with head_names metadata must reload with 9 heads."""
+    from salt_r.model import SALTRD, HEAD_NAMES_V1, LABEL_NAMES_V1
+    from salt_r.collect_features import FEATURE_NAMES
+    from salt_r.eval import _load_model
+
+    m = SALTRD(head_names=HEAD_NAMES_V1)
+    ckpt_path = str(tmp_path / "v1_test.pt")
+    torch.save(
+        {
+            "model_state_dict": m.state_dict(),
+            "head_names": HEAD_NAMES_V1,
+            "label_names": LABEL_NAMES_V1,
+            "feature_names": FEATURE_NAMES,
+            "epoch": 1,
+        },
+        ckpt_path,
+    )
+
+    loaded = _load_model(ckpt_path, n_features=28, n_labels=len(LABEL_NAMES_V1), device="cpu")
+    assert loaded is not None, "v1 checkpoint failed to load"
+    assert list(loaded.heads.keys()) == HEAD_NAMES_V1, \
+        f"Head names mismatch after load: {list(loaded.heads.keys())}"
+
+    x = torch.zeros(1, 20, 28)
+    with torch.no_grad():
+        out = loaded(x)
+    assert len(out) == len(HEAD_NAMES_V1)
+
+
+def test_v2_checkpoint_label_schema_metadata(tmp_path):
+    """Checkpoint for v2 schema must persist label_schema + LABEL_NAMES_V2, not v0.
+
+    Regression for the P1 bug where train.py saved list(LABEL_NAMES) regardless of
+    label_schema, causing checkpoint provenance to lie about the training schema.
+    """
+    from salt_r.model import SALTRD, HEAD_NAMES_V2, LABEL_NAMES_V2
+    from salt_r.collect_features import FEATURE_NAMES
+    from salt_r.eval import _load_model
+
+    model = SALTRD(head_names=HEAD_NAMES_V2)
+    ckpt_path = str(tmp_path / "v2_meta.pt")
+    import torch
+    torch.save(
+        {
+            "model_state_dict": model.state_dict(),
+            "epoch": 1,
+            "label_names": list(LABEL_NAMES_V2),  # must be schema-correct
+            "label_schema": "v2",
+            "head_names": list(HEAD_NAMES_V2),
+            "feature_names": list(FEATURE_NAMES),
+        },
+        ckpt_path,
+    )
+
+    ckpt = torch.load(ckpt_path, map_location="cpu")
+    assert ckpt["label_schema"] == "v2"
+    assert ckpt["label_names"] == list(LABEL_NAMES_V2), \
+        "Checkpoint label_names must be LABEL_NAMES_V2 for v2 schema"
+    assert len(ckpt["label_names"]) == 14, f"v2 has 14 labels, got {len(ckpt['label_names'])}"
+
+    loaded = _load_model(ckpt_path, n_features=28, n_labels=len(LABEL_NAMES_V2), device="cpu")
+    assert loaded is not None
+    assert list(loaded.heads.keys()) == list(HEAD_NAMES_V2)

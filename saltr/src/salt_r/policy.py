@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -72,6 +73,12 @@ def apply_policy(
 
     This policy is designed for offline replay simulation.
     Runtime integration must validate regret before deployment.
+
+    NOTE: v0-compatible policy — uses false_confirmed, failure_in_5, recoverable,
+    hard_dynamic_scene, needs_full_compute only.  imminent_failure_dynamic_10/20
+    are NOT wired here; policy_val_v2 improvements come from better shared trunk
+    training, not long-horizon heads.  Phase 2A (e-process) will add ifd10/ifd20
+    via sequential alert layer, not directly in this replay policy.
     """
     if thresholds is None:
         thresholds = DEFAULT_THRESHOLDS
@@ -257,18 +264,27 @@ def main() -> None:
         "abstention_gain": [],
     }
 
+    n_evaluated = 0
+    n_skipped = 0
     for seq_name, probs_seq in all_probs.items():
         if seq_name not in iou_data:
             print(f"WARNING: missing IoU trace for {seq_name}; skipping")
+            n_skipped += 1
             continue
         iou_trace = iou_data[seq_name]
 
         metrics = replay_policy(probs_seq, iou_trace, thresholds)
         for k in aggregate:
             aggregate[k].append(metrics[k])
+        n_evaluated += 1
+
+    if n_evaluated == 0:
+        print("ERROR: no sequences had IoU traces — policy metrics are empty")
+        sys.exit(1)
 
     summary = {k: float(np.mean(v)) for k, v in aggregate.items() if v}
-    summary["num_sequences"] = len(all_probs)
+    summary["n_evaluated"] = n_evaluated
+    summary["n_skipped"] = n_skipped
 
     print("\n=== Policy Offline Metrics (mean across sequences) ===")
     for k, v in summary.items():

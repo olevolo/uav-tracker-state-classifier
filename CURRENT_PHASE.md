@@ -1,8 +1,8 @@
 # Current Project Phase Baseline
 
-**Date:** 2026-05-19  
-**Purpose:** baseline snapshot before Claude starts implementation work. Use this file to compare what changed.  
-**Last reviewed:** final `HANDOFF_NEXT.md` and `THOUGHTS.md` review on 2026-05-19.
+**Date:** 2026-05-20  
+**Purpose:** current status snapshot for Codex/staff review of SALT-RD implementation.  
+**Last reviewed:** Phase 2A e-process implemented; 6 P1-P3 bugs fixed; 62 tests green on 2026-05-20.
 
 ## Role For Review
 
@@ -17,7 +17,7 @@ Review focus:
 
 ## Current Phase
 
-The project is in **Phase 1a implementation (data collection) SALT-RD migration phase**.
+The project is in **Phase 2A — e-process sequential alerts implemented; Phase 2B (DAM memory) is next**.
 
 The intended research direction is:
 
@@ -25,24 +25,114 @@ The intended research direction is:
 
 SALT-RD is not meant to be a new tracker backbone. It should be a small neural dynamicity/reliability/recovery controller on top of frozen SGLATrack/SALT v3 that proactively predicts tracking-risk, false-confirmed drift, real tracking failure, recovery readiness, and compute need from GT/teacher-derived labels.
 
-The final reviewed plan is:
+## Current Repo State
+
+- Active branch: `main`.
+- v0/v1/v2 trained and evaluated; all P1/P2 bugs fixed; e-process implemented.
+- `saltr/src/salt_r/` contains: `collect_features.py`, `model.py`, `train.py`, `eval.py`, `policy.py`, `eprocess.py`.
+- `saltr/results/` contains: `eval_val_v2.json`, `preds_val_v2.json`, `policy_val_v2.json`, `eprocess_val_v2.json`, `eprocess_sweep_v2.csv`.
+- `saltr/data/`: `salt_rd_v0.npz` (228 seq, ~161k frames), `salt_rd_v1_labels.npz`, `salt_rd_v2_labels.npz`.
+
+## Current Planning Documents
+
+- `HANDOFF_NEXT.md` is the current final implementation plan.
+
+## Current SALT-RD Status
+
+### v2 Model Results (val split, calibrated)
+
+| Head | AUROC | AUPRC | Comment |
+|---|---:|---:|---|
+| false_confirmed | 0.884 | 0.336 | GRU +37.9pp vs best baseline |
+| imminent_failure_dynamic | 0.902 | 0.323 | Strong short-horizon signal |
+| imminent_failure_dynamic_10 | **0.897** | **0.329** | 10-frame horizon holds |
+| imminent_failure_dynamic_20 | **0.889** | **0.339** | 20-frame horizon holds |
+| failure_in_5 | 0.853 | 0.011 | Ranking good, AUPRC low (sparse) |
+
+**Policy replay (v2 vs v0):** template_corruption −44%, wrong_reinit −33%.
+
+**ECE(false_confirmed)=0.316, AUROC(needs_full_compute)=0.648** — both blocking GO gates.
+
+### e-Process Phase 2A Results (formal mode, alpha=0.10, epsilon=0.5)
+
+| Metric | e-process | Raw P(ifd)>0.5 | Target |
+|---|---:|---:|---:|
+| Median lead time | **11.5 frames** | — | ≥ 3 |
+| Event recall | 0.062 | 0.750 | ≥ 0.60 |
+| FA per 1000 frames | **0.21** | 171 | ≤ 100 |
+| Seq-level FAR | 0.167 | — | ≤ 0.10 |
+
+**Diagnosis:** e-process precision is 44% (4 TP / 9 total alerts) vs baseline 1% (48/4682). Lead time is excellent (11.5f). Bottleneck is **recall** — the formal martingale is too conservative for the current risk score quality. Adding DAM memory features (Phase 2B) should strengthen the signal so e-process accumulates evidence faster.
+
+### Bug Fixes Completed (this session)
+
+| Bug | File | Fix |
+|---|---|---|
+| P1a — ifd10/20 labels counted already-failed frames | collect_features.py | Added `iou_trace[t] >= 0.5` and `len==horizon` guards |
+| P1b — lead_time hardcoded to ifd5 and 6-frame window | eval.py | Parameterized `label_name`, `horizon` |
+| P2a — policy docs didn't mention v2 head gap | policy.py | Added NOTE comment |
+| P2b — fake AUROC 0.5 for "correct" label in tables | eval.py | Added `model_predicted: false` + note field |
+| P2c — recompute_labels_v2() silently accepted v0 input | collect_features.py | Added v1 schema validation |
+| P3 — train log said AUPRC(fc) but it was composite | train.py | Renamed to "validation selection score" |
+
+### Test Suite
+
+62 passed (33 original + 29 eprocess unit tests).
+
+## Staff Review Red Lines (unchanged from HANDOFF_NEXT.md)
+
+- Do not train on `_decide_state()`, TSA states, old scene labels.
+- Do not claim compute/FPS without oracle labels.
+- Do not calibrate on train split.
+- Do not use diagnostic sequences in train.
+- Do not tune GO gates to get a better verdict.
+- Do not make `hard_dynamic_scene_v2` central again.
+- Do not use `pt_inside_gt_ratio` as runtime feature (GT-relative, teacher-only).
+
+## Role For Review
+
+Codex is acting as Staff Computer Vision + AI/ML Architect/Engineer with scientific review responsibilities.
+
+Review focus:
+- scientific validity of SALT-RD;
+- no label leakage or self-teaching;
+- correct sequence-level evaluation protocol;
+- calibrated dynamicity/reliability prediction metrics;
+- engineering reproducibility and clean architecture boundaries.
+
+## Current Phase
+
+The project is in **Phase 1c calibration / policy operating-point validation**.
+
+The intended research direction is:
+
+> Proactive Tracking-Risk Dynamicity for Failure-Aware Real-Time UAV Single Object Tracking.
+
+SALT-RD is not meant to be a new tracker backbone. It should be a small neural dynamicity/reliability/recovery controller on top of frozen SGLATrack/SALT v3 that proactively predicts tracking-risk, false-confirmed drift, real tracking failure, recovery readiness, and compute need from GT/teacher-derived labels.
+
+The current reviewed plan is:
 
 1. Create `saltr/` as the new implementation area.
 2. Add `FROZEN.md` and freeze legacy/current `src/uav_tracker/` after a small, explicit freeze-prep change.
 3. Add config gates, not deletions, for CE / dynamic / velocity-drift behavior.
 4. Add stable score-map statistics to tracker telemetry.
 5. Implement SALT-RD v0 in `saltr/src/salt_r/` only.
-6. Stop after Phase 1 unless GO metrics are reached.
+6. Treat Phase 2 runtime wrapper as scaffold until offline policy replay shows bounded regret.
+7. Next: cleanup, calibration, LODO, and policy operating-point sweep.
 
 ## Current Repo State
 
 - Active branch: `main`.
 - Phase 0 commit: `ecfcb0f` — all Phase 0 items delivered.
-- `saltr/src/salt_r/` exists with collect_features.py, model/train/eval/policy/integrate stubs.
+- SALT-RD implementation commits through `7d9b693` are present on `main`.
+- `saltr/src/salt_r/` exists with implemented `collect_features.py`, `model.py`, `train.py`, `eval.py`, `policy.py`, and `integrate.py`.
 - `FROZEN.md` committed, policy freeze active.
 - Config gates wired: `enable_ce` in sglatrack.py, `enable_velocity_drift` in target_state_assessor.py.
 - `TrackState` extended with `score_map_stats` and 4 other telemetry fields.
-- collect_features.py collection loop: implemented in this session (Phase 1a).
+- `enable_salt_rd` is read by `SALTRDRunner.from_config()` only; frozen `SALTRunner` production path still ignores it.
+- `saltr/data/salt_rd_v0.npz` exists: 228 sequences, ~161k frames.
+- `saltr/checkpoints/saltrd_best.pt` exists: checkpoint metadata epoch 5.
+- `saltr/checkpoints/eval_val.json` contains fixed eval metrics after the double-sigmoid fix.
 
 ## Current Planning Documents
 
@@ -72,12 +162,15 @@ SALT v3 exists as the current experimental runtime:
 
 Last verified in this session:
 
-- `uav-tracker doctor` passed.
-- Unit tests passed: `174 passed, 5 deselected`.
+- SALT-RD targeted tests passed: `26 passed`.
+- `compileall saltr/src/salt_r` passed.
+- `eval.py --predictions-output` works.
+- `policy.py` replay works on val predictions.
+- Earlier full-suite report in latest implementation notes: `200 passed`.
 
 ## Current SALT-RD Status
 
-SALT-RD is in **Phase 1a data-collection implementation** (2026-05-19).
+SALT-RD is in **Phase 1c-Calib / policy operating-point validation** (2026-05-20).
 
 ### Completed
 
@@ -89,18 +182,36 @@ SALT-RD is in **Phase 1a data-collection implementation** (2026-05-19).
 - GT-derived dynamic labels — `_compute_bbox_motion_arrays` uses GT bboxes, not predicted boxes
 - dataset root autodetection — `_get_dataset_loaders` passes `root=None`
 - Papers competitive analysis written to `papers/README.md`
-- `model.py` / `train.py` / `eval.py` / `policy.py` / `integrate.py` — implemented (Phase 1b)
+- `model.py` / `train.py` / `eval.py` implemented and checkpoint-compatible.
+- `policy.py` implemented with `TrackerAction`, thresholds, and replay.
+- `integrate.py` implemented as runtime wrapper/scaffold, not deployment-validated.
+- Fixed eval path: no double-sigmoid, named `HEAD_NAMES` prediction mapping, predictions JSON export.
+- Fixed policy replay IoU key loading (`iou_trace/` prefix stripping).
+- Fixed `--dry-run` so it no longer loads `SALTRunner`.
+- Added SALT-RD unit tests for collect/model/eval/policy/integrate.
 
-### Still blocking before real NPZ collection
+### Current Results
 
-- Verify `--dry-run` succeeds on all 3 datasets with autodetect roots
-- Confirm label base rates after first NPZ: `false_confirmed` expected 1-3%
+- NPZ: `saltr/data/salt_rd_v0.npz` — 228 sequences, ~161k frames.
+- Global `false_confirmed` base rate: ~8.44%.
+- Val split: 49 sequences.
+- `false_confirmed`: AUROC `0.884`, AUPRC `0.331`, ECE `0.320`, recall@5%FPR `0.445`.
+- `failure_in_5`: AUROC `0.863`, but AUPRC only `0.010` due very low base rate.
+- `hard_dynamic_scene`: AUROC `0.638`, below GO.
+- `needs_full_compute`: AUROC `0.641`, below GO.
+- GO/NO-GO: **BORDERLINE**.
+- Policy replay val: `wrong_reinit_rate=0.216`, `template_corruption_rate=0.097`, `compute_cheap_rate=0.000`.
+- Diagnostic split remains weak: `false_confirmed` AUROC around `0.604`, AUPRC around `0.279` with base around `20.3%`.
 
-### Not produced yet
+### Current Blockers / Cleanup Before Paper Metrics
 
-- `saltr/data/salt_rd_features.npz` — collection loop not yet executed
-- trained SALT-RD checkpoint
-- SALT-RD eval report with AUROC/AUPRC/ECE/Brier/NT2F/dynamicity/policy metrics
+- Fix `policy.py` summary accounting: report `n_evaluated` and `n_skipped`, not only `len(all_probs)`.
+- Strengthen `test_eval_does_not_double_sigmoid` to call real `eval._run_inference()`.
+- Fix `run_phase1.sh --datasets` usage/parser mismatch.
+- Move or ignore generated JSON artifacts under `saltr/checkpoints/`; use `saltr/results/` for versioned publishable snapshots.
+- Add calibration. Since model currently returns probabilities, either add `return_logits=True` or calibrate through `logit(p)` before temperature scaling.
+- Run LODO evaluation before any generalization claim.
+- Do not claim compute/FPS win until `needs_full_compute` has oracle labels and a bounded-regret policy sweep.
 
 Existing legacy training code still reflects the old rule/scene-label path:
 
