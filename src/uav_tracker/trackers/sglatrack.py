@@ -443,6 +443,13 @@ class SGLATracker:
             self._load()
 
         self._reset_embedding_cache()
+        # Reset template counters and advisor state so a re-used tracker
+        # (e.g. after recovery re-init) doesn't carry over stale state from a
+        # previous sequence or tracking episode.
+        self._template_update_count = 0
+        self._template_last_update = 0
+        if self._salt_rd_advisor is not None:
+            self._salt_rd_advisor.reset()
         # OpenCV delivers BGR — SGLATrack expects RGB
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         patch, _ = _sample_target(rgb, bbox, _TEMPLATE_FACTOR, _TEMPLATE_SIZE)
@@ -842,8 +849,9 @@ class SGLATracker:
         if self._z_tensor is None:
             return False
 
-        if self._salt_rd_advisor is not None and self._salt_rd_advisor.should_block_template_update():
-            return False
+        # Advisor veto is checked by the caller (salt_runner) before calling this method.
+        # Do not call should_block_template_update() here — it has counter side effects
+        # (increments n_blocked / n_allowed) and would double-count if called again here.
 
         if self._template_update_count >= max_updates:
             return False
