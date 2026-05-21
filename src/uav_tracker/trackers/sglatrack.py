@@ -197,6 +197,156 @@ def _make_hann(device: torch.device) -> torch.Tensor:
     return (h1d.unsqueeze(1) * h1d.unsqueeze(0)).unsqueeze(0).unsqueeze(0).to(device)
 
 
+def _select_candidate_peak_indices(
+    score_map: torch.Tensor,
+    max_candidates: int = 5,
+    nms_radius: int = 1,
+    min_score_ratio: float = 0.05,
+) -> list[int]:
+    """Select spatially distinct score-map peaks with greedy NMS.
+
+    The raw top-2 cells are often adjacent samples from the same response peak.
+    For distractor analysis we need separate candidate modes, so we greedily
+    suppress cells within ``nms_radius`` grid steps of already selected peaks.
+    """
+    flat = score_map.reshape(-1)
+    if flat.numel() == 0 or max_candidates <= 0:
+        return []
+
+    order = torch.argsort(flat, descending=True)
+    top_score = float(flat[order[0]])
+    selected: list[int] = []
+
+    for idx_t in order:
+        idx = int(idx_t.item())
+        score = float(flat[idx])
+        if selected and top_score > 0.0 and score < top_score * min_score_ratio:
+            break
+        row, col = divmod(idx, _FEAT_SZ)
+        too_close = False
+        for prev_idx in selected:
+            prev_row, prev_col = divmod(prev_idx, _FEAT_SZ)
+            if max(abs(row - prev_row), abs(col - prev_col)) <= nms_radius:
+                too_close = True
+                break
+        if too_close:
+            continue
+        selected.append(idx)
+        if len(selected) >= max_candidates:
+            break
+
+    return selected
+
+
+def _candidate_bbox_from_peak(
+    idx: int,
+    score: float,
+    top_score: float,
+    size_map: torch.Tensor,
+    offset_map: torch.Tensor,
+    prev_bbox: BBox,
+    resize_factor: float,
+    rank: int,
+) -> dict:
+    """Decode one score-map peak into frame-space bbox metadata."""
+    row, col = divmod(int(idx), _FEAT_SZ)
+    size_flat = size_map.flatten(2)
+    offset_flat = offset_map.flatten(2)
+
+    gather_idx = torch.tensor([[[idx]]], device=size_map.device, dtype=torch.long)
+    gather_idx = gather_idx.expand(size_flat.shape[0], 2, 1)
+    size = size_flat.gather(dim=2, index=gather_idx).squeeze(-1)[0]
+    offset = offset_flat.gather(dim=2, index=gather_idx).squeeze(-1)[0]
+
+    cx_norm = (float(col) + float(offset[0])) / _FEAT_SZ
+    cy_norm = (float(row) + float(offset[1])) / _FEAT_SZ
+    w_norm = float(size[0])
+    h_norm = float(size[1])
+
+    cx_pred = cx_norm * _SEARCH_SIZE / resize_factor
+    cy_pred = cy_norm * _SEARCH_SIZE / resize_factor
+    w_pred = max(1.0, w_norm * _SEARCH_SIZE / resize_factor)
+    h_pred = max(1.0, h_norm * _SEARCH_SIZE / resize_factor)
+
+    cx_prev = prev_bbox.x + prev_bbox.w / 2
+    cy_prev = prev_bbox.y + prev_bbox.h / 2
+    half = _SEARCH_SIZE / (2 * resize_factor)
+
+    x = cx_prev + cx_pred - half - w_pred / 2
+    y = cy_prev + cy_pred - half - h_pred / 2
+    cx = x + w_pred / 2
+    cy = y + h_pred / 2
+
+    score_ratio = float(score / (top_score + 1e-8)) if top_score > 0 else 0.0
+    grid_center_distance = float((((row - 7.5) ** 2 + (col - 7.5) ** 2) ** 0.5))
+
+    return {
+        "rank": int(rank),
+        "index": int(idx),
+        "row": int(row),
+        "col": int(col),
+        "score": float(score),
+        "score_ratio": score_ratio,
+        "grid_center_distance": grid_center_distance,
+        "bbox": [float(x), float(y), float(w_pred), float(h_pred)],
+        "center": [float(cx), float(cy)],
+    }
+
+
+def _extract_candidate_diagnostics(
+    score_map: torch.Tensor,
+    size_map: torch.Tensor,
+    offset_map: torch.Tensor,
+    prev_bbox: BBox,
+    resize_factor: float,
+    max_candidates: int = 5,
+) -> dict:
+    """Return top-K local candidate boxes and compact distractor diagnostics."""
+    flat = score_map.reshape(-1)
+    if flat.numel() == 0:
+        return {
+            "candidates": [],
+            "n_secondary": 0,
+            "local_top1": 0.0,
+            "local_top2": 0.0,
+            "local_peak_margin": 0.0,
+            "local_top2_ratio": 0.0,
+        }
+
+    peak_indices = _select_candidate_peak_indices(
+        score_map, max_candidates=max_candidates
+    )
+    top_score = float(flat[peak_indices[0]]) if peak_indices else 0.0
+    candidates = [
+        _candidate_bbox_from_peak(
+            idx=idx,
+            score=float(flat[idx]),
+            top_score=top_score,
+            size_map=size_map,
+            offset_map=offset_map,
+            prev_bbox=prev_bbox,
+            resize_factor=resize_factor,
+            rank=rank,
+        )
+        for rank, idx in enumerate(peak_indices)
+    ]
+
+    local_top1 = candidates[0]["score"] if candidates else 0.0
+    local_top2 = candidates[1]["score"] if len(candidates) > 1 else 0.0
+    local_top2_ratio = (
+        candidates[1]["score_ratio"] if len(candidates) > 1 else 0.0
+    )
+
+    return {
+        "candidates": candidates,
+        "n_secondary": max(0, len(candidates) - 1),
+        "local_top1": float(local_top1),
+        "local_top2": float(local_top2),
+        "local_peak_margin": float(local_top1 - local_top2),
+        "local_top2_ratio": float(local_top2_ratio),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Tracker
 # ---------------------------------------------------------------------------
@@ -378,6 +528,18 @@ class SGLATracker:
             probs = f_pos / (f_pos.sum() + 1e-8)
             response_entropy = float(-(probs * (probs + 1e-8).log()).sum())
 
+        pred_boxes = self._model.box_head.cal_bbox(
+            score_map, out["size_map"], out["offset_map"]
+        ).view(-1, 4)                                         # [cx,cy,w,h] normalised
+
+        candidate_diag = _extract_candidate_diagnostics(
+            score_map=score_map,
+            size_map=out["size_map"],
+            offset_map=out["offset_map"],
+            prev_bbox=self._state,
+            resize_factor=resize_factor,
+        )
+
         # Score map geometry for SALT-RD feature extraction
         f_sorted_vals = torch.sort(f, descending=True).values
         _top1 = float(f_sorted_vals[0])
@@ -391,14 +553,15 @@ class SGLATracker:
             "top2": _top2,
             "peak_margin": _top1 - _top2,
             "peak_width": _half_max_count,
-            "n_secondary": 0,  # placeholder: full local-maxima detection in v1
+            "n_secondary": candidate_diag["n_secondary"],
             "peak_distance": float((((_peak_r_sm - 7.5) ** 2 + (_peak_c_sm - 7.5) ** 2) ** 0.5)),
             "heatmap_mass_topk": float(f_sorted_vals[:10].sum()) / _map_sum,
+            "local_top1": candidate_diag["local_top1"],
+            "local_top2": candidate_diag["local_top2"],
+            "local_peak_margin": candidate_diag["local_peak_margin"],
+            "local_top2_ratio": candidate_diag["local_top2_ratio"],
+            "candidates": candidate_diag["candidates"],
         }
-
-        pred_boxes = self._model.box_head.cal_bbox(
-            score_map, out["size_map"], out["offset_map"]
-        ).view(-1, 4)                                         # [cx,cy,w,h] normalised
 
         # Top-3 softmax mass confidence (UncL-STARK, eq. 3)
         # Better calibrated than peak value — higher Pearson correlation with IoU
@@ -438,6 +601,7 @@ class SGLATracker:
             psr=psr,
             response_entropy=response_entropy,
             score_map_stats=_score_map_stats,
+            aux={"score_map_stats": _score_map_stats},
         )
 
     def update_with_state(self, frame: np.ndarray, target_state: int,
@@ -555,6 +719,18 @@ class SGLATracker:
             probs = f_pos / (f_pos.sum() + 1e-8)
             response_entropy = float(-(probs * (probs + 1e-8).log()).sum())
 
+        pred_boxes = self._model.box_head.cal_bbox(
+            score_map, out["size_map"], out["offset_map"]
+        ).view(-1, 4)
+
+        candidate_diag = _extract_candidate_diagnostics(
+            score_map=score_map,
+            size_map=out["size_map"],
+            offset_map=out["offset_map"],
+            prev_bbox=self._state,
+            resize_factor=resize_factor,
+        )
+
         # Score map geometry for SALT-RD feature extraction
         f_sorted_vals = torch.sort(f, descending=True).values
         _top1 = float(f_sorted_vals[0])
@@ -568,14 +744,15 @@ class SGLATracker:
             "top2": _top2,
             "peak_margin": _top1 - _top2,
             "peak_width": _half_max_count,
-            "n_secondary": 0,  # placeholder: full local-maxima detection in v1
+            "n_secondary": candidate_diag["n_secondary"],
             "peak_distance": float((((_peak_r_sm - 7.5) ** 2 + (_peak_c_sm - 7.5) ** 2) ** 0.5)),
             "heatmap_mass_topk": float(f_sorted_vals[:10].sum()) / _map_sum,
+            "local_top1": candidate_diag["local_top1"],
+            "local_top2": candidate_diag["local_top2"],
+            "local_peak_margin": candidate_diag["local_peak_margin"],
+            "local_top2_ratio": candidate_diag["local_top2_ratio"],
+            "candidates": candidate_diag["candidates"],
         }
-
-        pred_boxes = self._model.box_head.cal_bbox(
-            score_map, out["size_map"], out["offset_map"]
-        ).view(-1, 4)
 
         # Top-3 softmax mass confidence (UncL-STARK, eq. 3)
         # Better calibrated than peak value — higher Pearson correlation with IoU
@@ -623,6 +800,7 @@ class SGLATracker:
             psr=psr,
             response_entropy=response_entropy,
             score_map_stats=_score_map_stats,
+            aux={"score_map_stats": _score_map_stats},
         )
 
     def try_update_template(
