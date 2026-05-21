@@ -1105,6 +1105,12 @@ def evaluate(
         for seq_key, feats in features_dict.items():
             if seq_key in eval_memory_features:
                 mem = eval_memory_features[seq_key]
+                if mem.shape[1] != mem_dim:
+                    raise ValueError(
+                        f"Memory sidecar width mismatch for sequence {seq_key!r}: "
+                        f"checkpoint expects {mem_dim} dims but sidecar has {mem.shape[1]}. "
+                        "Re-run memory_features.py with the correct --memory-feature-names selection."
+                    )
                 T = min(feats.shape[0], mem.shape[0])
                 if T < feats.shape[0]:
                     pad = np.zeros((feats.shape[0] - T, mem.shape[1]), dtype=np.float32)

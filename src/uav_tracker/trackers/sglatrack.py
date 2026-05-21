@@ -312,21 +312,27 @@ class SGLATracker:
                 # 1. Global mean-pool over all 256 search tokens
                 self._last_search_global = _search_tokens.mean(0)  # (192,)
 
-                # 2. Score-map-weighted mean: softmax weights from (1,1,16,16) → (256,)
-                _score = out['score_map'].squeeze()          # (16, 16)
-                _weights = _score.reshape(256).softmax(0)    # (256,) normalized
+                # 2. Score-map-weighted mean: post-Hann map so peak matches tracker localisation
+                _score = (out['score_map'] * self._hann).squeeze()  # (16, 16), post-Hann
+                _weights = _score.reshape(256).softmax(0)            # (256,) normalized
                 self._last_search_score_weighted = (_weights.unsqueeze(1) * _search_tokens).sum(0)  # (192,)
 
-                # 3. Mean of tokens in 3×3 neighborhood around score peak
-                _flat_peak = _score.reshape(256).argmax()
+                # 3. Bounded neighborhood mean around score peak (Python ints — no edge duplicates)
+                _flat_peak = int(_score.reshape(256).argmax().item())
                 _pr, _pc = _flat_peak // 16, _flat_peak % 16
-                _rs = torch.clamp(torch.arange(_pr - 1, _pr + 2, device=_score.device), 0, 15)
-                _cs = torch.clamp(torch.arange(_pc - 1, _pc + 2, device=_score.device), 0, 15)
-                _idxs = (_rs.unsqueeze(1) * 16 + _cs.unsqueeze(0)).reshape(-1)
+                _idxs = [r * 16 + c
+                         for r in range(max(0, _pr - 1), min(16, _pr + 2))
+                         for c in range(max(0, _pc - 1), min(16, _pc + 2))]
                 self._last_search_peak_local = _search_tokens[_idxs].mean(0)  # (192,)
 
                 # Template embedding: mean-pool over 64 template tokens
                 self._last_template_embedding = _bfeat[:, :64, :].mean(dim=1).squeeze(0)  # (192,)
+            else:
+                # Reset to None so stale values never silently persist across frames
+                self._last_search_global = None
+                self._last_search_score_weighted = None
+                self._last_search_peak_local = None
+                self._last_template_embedding = None
             # --- end embedding hook ---
 
         # Apply Hann window to score map for smoother localisation
@@ -487,21 +493,27 @@ class SGLATracker:
                 # 1. Global mean-pool over all 256 search tokens
                 self._last_search_global = _search_tokens.mean(0)  # (192,)
 
-                # 2. Score-map-weighted mean: softmax weights from (1,1,16,16) → (256,)
-                _score = out['score_map'].squeeze()          # (16, 16)
-                _weights = _score.reshape(256).softmax(0)    # (256,) normalized
+                # 2. Score-map-weighted mean: post-Hann map so peak matches tracker localisation
+                _score = (out['score_map'] * self._hann).squeeze()  # (16, 16), post-Hann
+                _weights = _score.reshape(256).softmax(0)            # (256,) normalized
                 self._last_search_score_weighted = (_weights.unsqueeze(1) * _search_tokens).sum(0)  # (192,)
 
-                # 3. Mean of tokens in 3×3 neighborhood around score peak
-                _flat_peak = _score.reshape(256).argmax()
+                # 3. Bounded neighborhood mean around score peak (Python ints — no edge duplicates)
+                _flat_peak = int(_score.reshape(256).argmax().item())
                 _pr, _pc = _flat_peak // 16, _flat_peak % 16
-                _rs = torch.clamp(torch.arange(_pr - 1, _pr + 2, device=_score.device), 0, 15)
-                _cs = torch.clamp(torch.arange(_pc - 1, _pc + 2, device=_score.device), 0, 15)
-                _idxs = (_rs.unsqueeze(1) * 16 + _cs.unsqueeze(0)).reshape(-1)
+                _idxs = [r * 16 + c
+                         for r in range(max(0, _pr - 1), min(16, _pr + 2))
+                         for c in range(max(0, _pc - 1), min(16, _pc + 2))]
                 self._last_search_peak_local = _search_tokens[_idxs].mean(0)  # (192,)
 
                 # Template embedding: mean-pool over 64 template tokens
                 self._last_template_embedding = _bfeat[:, :64, :].mean(dim=1).squeeze(0)  # (192,)
+            else:
+                # Reset to None so stale values never silently persist across frames
+                self._last_search_global = None
+                self._last_search_score_weighted = None
+                self._last_search_peak_local = None
+                self._last_template_embedding = None
             # --- end embedding hook ---
 
         score_map = out["score_map"]

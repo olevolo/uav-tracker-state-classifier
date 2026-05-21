@@ -555,6 +555,13 @@ def train(
     if memory_features:
         first_key = next(iter(memory_features))
         memory_dim = memory_features[first_key].shape[1]
+        bad = [k for k, v in memory_features.items() if v.shape[1] != memory_dim]
+        if bad:
+            raise ValueError(
+                f"[train] Memory sidecar has inconsistent widths: expected {memory_dim} "
+                f"but {len(bad)} sequences differ (e.g. {bad[0]}). "
+                "Regenerate the sidecar with a single --memory-feature-names selection."
+            )
     else:
         memory_dim = 0
 
