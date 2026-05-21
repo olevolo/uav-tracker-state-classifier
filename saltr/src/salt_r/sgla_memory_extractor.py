@@ -187,21 +187,30 @@ def extract_sequence(
     # We also need to track _current_frame for mem.compute_features() update_age.
     mem = DistractorAwareMemory(pos_slots=6, neg_slots=6, update_interval=5)
 
+    # P1 guard: preds length must match frame count — truncated preds would
+    # silently allow updates exactly where predictions are missing (conservative
+    # defaults would permit gate to open). Fail early instead.
+    if preds_for_seq is not None and len(preds_for_seq) != T:
+        raise ValueError(
+            f"Preds length mismatch: {len(preds_for_seq)} preds != {T} frames. "
+            "Regenerate preds with the correct split or check alignment."
+        )
+
     # Iterate via SALTRunner.run() — handles frame 0 init internally and
     # applies TSA state machine / CE gates / LOST recovery on frames 1+.
     for t, entry in enumerate(runner.run(seq_obj)):
         if t == 0:
             # Frame 0: tracker.init() was called; _last_search_* are None → zero
             # embedding.  Frame 0 output stays zeros (result already zero-init).
-            # Do NOT add to RAM — zero embedding would corrupt similarities.
-            # First real backbone embedding arrives at frame 1.
+            # Do NOT add search embedding to RAM — zero would corrupt similarities.
+            # Bootstrap: _last_template_embedding is also None at t=0 (init() doesn't
+            # run the backbone forward). Bootstrap happens at t=1 instead.
             mem._current_frame = 0
             continue
 
         # Extract embedding for frame t from runner.tracker (the SGLATracker)
         emb_t = _get_embedding(runner.tracker, embedding_view)
         if (emb_t == 0).all():
-            # None or zero — guard: log only when unexpected (not frame 0)
             logger.debug("embedding is zero at t=%d view=%s", t, embedding_view)
 
         # CAUSAL: compute features using RAM built from frames 0..t-1
@@ -213,7 +222,25 @@ def extract_sequence(
         for out_col, feat_idx in enumerate(feature_indices):
             result[t, out_col] = float(feat_dict[all_names[feat_idx]])
 
-        # Gate check: update RAM with frame t's embedding if conditions pass
+        # P0 bootstrap: at frame 1, add init template embedding to RAM unconditionally.
+        # This ensures RAM has at least one anchor on hard diagnostic sequences where
+        # p_fc is high throughout and the gated search-frame path never opens.
+        # Template embedding is available at frame 1 (first backbone forward).
+        if t == 1:
+            template_tensor = getattr(runner.tracker, "_last_template_embedding", None)
+            if template_tensor is not None:
+                from salt_r.memory import MemoryEntry
+                template_emb = template_tensor.cpu().numpy().astype(np.float32)
+                mem.positive.add(MemoryEntry(
+                    embedding=template_emb.copy(),
+                    frame_idx=0,    # conceptually frame 0 (init appearance)
+                    iou=float("nan"),
+                    apce_norm=1.0,
+                    p_fc=0.0,       # trusted initial appearance — no gate
+                    source="init_template",
+                ))
+
+        # Gate check: update RAM with frame t's search embedding if conditions pass
         p_fc, p_ifd, apce_norm = _get_gate_signals(preds_for_seq, t=t)
         if mem.positive.should_update(
             p_fc=p_fc, p_ifd=p_ifd, apce_norm=apce_norm, current_frame=t
@@ -236,16 +263,16 @@ def _get_gate_signals(
 ) -> tuple:
     """Return (p_fc, p_ifd, apce_norm) gate signals for frame t.
 
-    Falls back to permissive defaults when preds unavailable.
-    apce_norm is not present in preds JSON (it's a tracker telemetry field),
-    so we use 0.0 as fallback — this means the gate degrades to
-    p_fc < 0.20 AND p_ifd < 0.30 only (apce_norm <= 0.4 blocks gate).
-    To avoid silently disabling all updates when apce_norm is unavailable,
-    we use 1.0 as the fallback so the gate is driven purely by preds.
+    Returns conservative defaults (gate blocked) when preds unavailable for
+    frame t — avoids silently adding entries to RAM where predictions are missing.
+    apce_norm is not in preds JSON so is always 1.0 when preds are present
+    (PositiveMemory.should_update requires apce_norm > 0.4; 1.0 always passes
+    that condition, keeping gate driven purely by p_fc/p_ifd).
     """
     if preds_for_seq is None or t >= len(preds_for_seq):
-        # No preds available: use conservative defaults that allow some updates
-        return 0.10, 0.10, 1.0
+        # Conservative: block RAM update when preds are absent or truncated.
+        # p_fc=1.0, p_ifd=1.0 → should_update() returns False.
+        return 1.0, 1.0, 0.0
 
     frame_preds = preds_for_seq[t]
     p_fc = float(frame_preds.get("false_confirmed", 0.5))
@@ -479,6 +506,16 @@ def build_sidecar(args: argparse.Namespace) -> None:
             flush=True,
         )
 
+    # P1 fail-fast: canonical extraction must cover all sequences.
+    # Allow partial output only under --smoke-test or --allow-partial.
+    is_partial_ok = args.smoke_test is not None or getattr(args, "allow_partial", False)
+    if n_skipped > 0 and not is_partial_ok:
+        raise RuntimeError(
+            f"Extraction failed for {n_skipped}/{len(seq_keys)} sequence(s). "
+            "Fix the issues logged above, then re-run. "
+            "Use --allow-partial to save an incomplete sidecar (not for training)."
+        )
+
     # Build metadata
     out["memory_feature_names"] = np.array(_POS_FEATURE_NAMES, dtype=object)
     out["embedding_view"] = np.array(args.embedding_view)
@@ -549,6 +586,13 @@ def _parse_args() -> argparse.Namespace:
         help=(
             "Process only the first N sequences then exit. "
             "Prints per-sequence stats."
+        ),
+    )
+    p.add_argument(
+        "--allow-partial", action="store_true",
+        help=(
+            "Save sidecar even if some sequences were skipped. "
+            "NOT for canonical training runs — use only for debugging."
         ),
     )
     p.add_argument(

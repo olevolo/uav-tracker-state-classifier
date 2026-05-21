@@ -281,14 +281,20 @@ class TestFrame0Zeros:
         )
 
     def test_gate_signals_default_when_no_preds(self):
-        """_get_gate_signals returns sensible defaults when preds unavailable."""
+        """_get_gate_signals returns conservative defaults (gate blocked) when preds unavailable.
+        Truncated or missing preds must NOT silently open the RAM update gate."""
         from salt_r.sgla_memory_extractor import _get_gate_signals
 
         p_fc, p_ifd, apce_norm = _get_gate_signals(None, t=0)
-        # Defaults should allow RAM updates (conservative but not blocking)
-        assert p_fc < 0.20, f"Default p_fc should pass gate (< 0.20), got {p_fc}"
-        assert p_ifd < 0.30, f"Default p_ifd should pass gate (< 0.30), got {p_ifd}"
-        assert apce_norm > 0.40, f"Default apce_norm should pass gate (> 0.40), got {apce_norm}"
+        # Conservative defaults: gate must be BLOCKED, not opened.
+        assert p_fc >= 0.20, f"Default p_fc should BLOCK gate (>= 0.20), got {p_fc}"
+        # apce_norm should also block (< 0.4 threshold in PositiveMemory.should_update)
+        assert apce_norm <= 0.40, f"Default apce_norm should BLOCK gate (<= 0.40), got {apce_norm}"
+
+        # Out-of-range t also returns conservative defaults.
+        preds = [{"false_confirmed": 0.1, "imminent_failure_dynamic": 0.1}]
+        p_fc2, p_ifd2, _ = _get_gate_signals(preds, t=999)
+        assert p_fc2 >= 0.20, f"Out-of-range t should BLOCK gate, got p_fc={p_fc2}"
 
     def test_gate_signals_from_preds_dict(self):
         """_get_gate_signals correctly extracts p_fc and p_ifd from preds dict."""
@@ -337,3 +343,92 @@ def test_sidecar_writes_memory_features_key():
     assert "ram_features/" not in source, (
         "Legacy 'ram_features/' prefix found — must be replaced with 'memory_features/'"
     )
+
+
+# ---------------------------------------------------------------------------
+# P0 bootstrap + P1 preds-length validation
+# ---------------------------------------------------------------------------
+
+
+def test_template_bootstrap_populates_ram():
+    """At frame t=1, init_template embedding should be added unconditionally."""
+    import torch
+    from unittest.mock import MagicMock
+    from salt_r.sgla_memory_extractor import extract_sequence, _pos_feature_indices
+
+    # Build a mock runner that yields 3 frames and sets template embedding at t=1
+    dummy_emb = torch.ones(192, dtype=torch.float32) * 0.5
+    zero_emb = torch.zeros(192, dtype=torch.float32)
+
+    entries = [MagicMock(), MagicMock(), MagicMock()]
+
+    call_count = [0]
+    def fake_run(seq_obj):
+        for entry in entries:
+            # Set embeddings: at t=0 None (after init), at t=1 populated
+            if call_count[0] == 0:
+                runner.tracker._last_search_score_weighted = None
+                runner.tracker._last_template_embedding = None
+            else:
+                runner.tracker._last_search_score_weighted = dummy_emb
+                runner.tracker._last_template_embedding = dummy_emb
+            call_count[0] += 1
+            yield entry
+
+    runner = MagicMock()
+    runner.tracker._last_search_score_weighted = None
+    runner.tracker._last_template_embedding = None
+    runner.run.side_effect = fake_run
+
+    seq_obj = MagicMock()
+    seq_obj.frames = [None, None, None]
+    seq_obj.ground_truth = [MagicMock(), MagicMock(), MagicMock()]
+    seq_obj.name = "test/seq"
+
+    # preds that block gated search updates (high p_fc), so only bootstrap fills RAM
+    preds = [
+        {"false_confirmed": 0.9, "imminent_failure_dynamic": 0.9},
+        {"false_confirmed": 0.9, "imminent_failure_dynamic": 0.9},
+        {"false_confirmed": 0.9, "imminent_failure_dynamic": 0.9},
+    ]
+
+    result = extract_sequence(
+        runner=runner,
+        seq_obj=seq_obj,
+        preds_for_seq=preds,
+        embedding_view="score_weighted",
+        feature_indices=_pos_feature_indices(),
+    )
+
+    assert result.shape == (3, 4), f"Expected (3, 4), got {result.shape}"
+    # frame 0 must be all zeros
+    assert (result[0] == 0).all(), "Frame 0 must be zeros"
+    # frame 2 should have non-zero mem_pos_mean_sim — template bootstrap was added at t=1
+    assert result[2, 1] > 0, (
+        "Frame 2 should have non-zero mem_pos_mean_sim from template bootstrap. "
+        f"Got {result[2]}. RAM bootstrap is likely broken."
+    )
+
+
+def test_preds_length_mismatch_raises():
+    """extract_sequence should raise ValueError when preds length != T."""
+    from unittest.mock import MagicMock
+    from salt_r.sgla_memory_extractor import extract_sequence, _pos_feature_indices
+    import pytest
+
+    runner = MagicMock()
+    seq_obj = MagicMock()
+    seq_obj.frames = [None] * 5
+    seq_obj.ground_truth = [MagicMock()] * 5
+    seq_obj.name = "test/seq"
+
+    preds_wrong_length = [{"false_confirmed": 0.1}] * 3  # 3 != 5
+
+    with pytest.raises(ValueError, match="length mismatch"):
+        extract_sequence(
+            runner=runner,
+            seq_obj=seq_obj,
+            preds_for_seq=preds_wrong_length,
+            embedding_view="score_weighted",
+            feature_indices=_pos_feature_indices(),
+        )

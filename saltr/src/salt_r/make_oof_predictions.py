@@ -485,11 +485,22 @@ def _build_meta(
     val_seqs: List[str],
     diagnostic_seqs: List[str],
     n_folds: int,
+    teacher_checkpoint_path: str = "",
 ) -> dict:
+    import hashlib, os as _os
+    ckpt_md5 = "unavailable"
+    if teacher_checkpoint_path and _os.path.exists(teacher_checkpoint_path):
+        h = hashlib.md5()
+        with open(teacher_checkpoint_path, "rb") as f:
+            for chunk in iter(lambda: f.read(65536), b""):
+                h.update(chunk)
+        ckpt_md5 = h.hexdigest()
     return {
         "train_source": f"oof_{n_folds}fold",
-        "val_source": "v2_retrained_teacher",
-        "diagnostic_source": "v2_retrained_teacher",
+        "val_source": "teacher_no_memory",
+        "diagnostic_source": "teacher_no_memory",
+        "teacher_checkpoint_path": teacher_checkpoint_path,
+        "teacher_checkpoint_md5": ckpt_md5,
         "n_folds": n_folds,
         "n_train_seqs": len(train_seqs),
         "n_val_seqs": len(val_seqs),
@@ -791,7 +802,8 @@ def run_oof_pipeline(
             )
 
         # Prepend metadata key.
-        meta = _build_meta(train_seqs, val_seqs, diagnostic_seqs, n_folds)
+        meta = _build_meta(train_seqs, val_seqs, diagnostic_seqs, n_folds,
+                           teacher_checkpoint_path=teacher_checkpoint)
         final_dict: dict = {"_meta": meta}
         final_dict.update(preds_all)
 
