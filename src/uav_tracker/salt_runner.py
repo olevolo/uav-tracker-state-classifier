@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import logging
 import time
-from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterator, Optional
@@ -97,10 +96,11 @@ class SALTRunner:
     """
 
     tracker: Any                          # SGLATracker
-    tsa: Any | None = None                # TargetStateAssessor
     detector: Any | None = None           # YOLOv8Detector
     appearance_memory: Any | None = None  # CosineAppearanceMemory
     motion_predictor: Any | None = None   # OnlineLSTMMotionPredictor
+    saltrd_controller: Any | None = None  # SALTRDController (optional)
+    evidence_extractor: Any | None = None # EvidenceExtractor (optional)
     seed: int = 42
 
     # Center-freeze disabled by default — oracle showed 0.000 AUC gain and it
@@ -112,54 +112,16 @@ class SALTRunner:
     _trajectory: list = field(default_factory=list, init=False, repr=False)
     _prev_frame: Optional[np.ndarray] = field(default=None, init=False, repr=False)
     _frame_idx: int = field(default=0, init=False, repr=False)
-    # TSA state from the previous frame — used to route tracker compute budget
-    # on the current frame before TSA has run on the current frame's output.
-    # Initialized to CONFIRMED (0) for normal sequences. At run() start, frame-0
-    # GT bbox validity is checked: degenerate bbox (w<=0 or h<=0) sets this to
-    # OCCLUDED so the first real frame uses full compute instead of CE-pruned.
-    _prev_tsa_state_int: int = field(default=0, init=False, repr=False)
-    # SALT-RD policy from the previous frame — used when --use-saltrd-primary is active
-    # to route CE pruning on the next frame (mirrors the TSA state deferred-routing model).
-    _prev_saltrd_policy: "dict | None" = field(default=None, init=False, repr=False)
-    # Whether to use SALT-RD as the primary CE routing source (Stage 3 primary mode).
-    # When True: CE routing follows SALT-RD allow_ce_pruning / force_full_compute.
-    # When False (default): CE routing follows TSA state (backward-compatible).
-    use_saltrd_primary: bool = field(default=False, init=False, repr=False)
+    # Previous SALT-RD action — used to route tracker on the next frame.
+    # Initialized to TrackerAction() (full compute, no recovery) at run() start.
+    _prev_action: Any = field(default=None, init=False, repr=False)
     # Frames remaining before RT-DETR recovery can fire again (prevents loop)
     _lost_cooldown: int = field(default=0, init=False, repr=False)
-    # Consecutive LOST frames counter — RT-DETR only fires after N consecutive LOST
-    _consecutive_lost: int = field(default=0, init=False, repr=False)
-    # Threshold of 5 consecutive LOST frames before recovery fires.  Both genuine
-    # loss (car7 frame 356: IoU=0.951 after recovery) and false-alarm loss
-    # (bike2 frame 107: detector finds wrong cyclist at IoU=0.000) generate
-    # exactly 5-consecutive-LOST streaks — no threshold distinguishes them.
-    # The bike2 regression (−0.023) is a detector quality issue: YOLO26m finds a
-    # different cyclist with cosine_sim=0.921 but wrong position. Fix requires
-    # a better appearance model or post-recovery IoU validation, not a higher count.
-    _RECOVERY_MIN_LOST: int = field(default=5, init=False, repr=False)
-    # Startup warmup: TSA LOST → recovery blocked for first N frames.
-    # Rationale: car13 exhibited 5 false-LOST frames (frames 1–5) due to
-    # optical-flow IoU startup transients before the tracker settled. With APCE
-    # as the primary signal (not flow-IoU), Farneback is valid from frame 1,
-    # but the 10-frame warmup is kept as a conservative safety margin to prevent
-    # spurious recovery on sequences where the tracker needs a few frames to
-    # lock onto a small or fast-moving target.
+    # Consecutive frames where recovery action was requested — fires after N
+    _consecutive_recovery_frames: int = field(default=0, init=False, repr=False)
+    _RECOVERY_MIN_FRAMES: int = field(default=5, init=False, repr=False)
+    # Startup warmup: recovery blocked for first N frames.
     _RECOVERY_WARMUP_FRAMES: int = field(default=10, init=False, repr=False)
-    # OCCLUDED → LOST escalation: if the tracker stays in OCCLUDED for more than
-    # N consecutive frames, treat it as LOST so the recovery pipeline fires.
-    # uav2 is 47% OCCLUDED (APCE 20-80) and the detector is never called without
-    # this because the LOST threshold (apce < 20) is too tight to fire.
-    _consecutive_occluded: int = field(default=0, init=False, repr=False)
-    _OCCLUDED_ESCALATION_FRAMES: int = field(default=25, init=False, repr=False)
-    # APCE from the previous frame — used as proxy for TSA temporal gating
-    _prev_apce: float = field(default=0.0, init=False, repr=False)
-    # Rolling buffer of last 25 APCE values — used by staged OCCLUDED escalation
-    # to require sustained low APCE (not just frame count) before firing recovery.
-    _apce_buffer: deque = field(default_factory=lambda: deque(maxlen=25), init=False, repr=False)
-    # APCE of the most recent frame that was escalated from OCCLUDED→LOST.
-    # Used for APCE-trend gating: if the current frame's APCE has risen ≥15%
-    # above this value, the tracker is self-recovering and escalation is skipped.
-    _prev_escalated_apce: float = field(default=0.0, init=False, repr=False)
     # Last confirmed bbox — used to reject size-inconsistent recovery detections
     _last_good_bbox: Optional[BBox] = field(default=None, init=False, repr=False)
     # Temporal voting accumulator for recovery (prevents single-frame false re-inits)
@@ -189,21 +151,9 @@ class SALTRunner:
         from uav_tracker.registry import TRACKERS, DETECTORS
         from uav_tracker.ml.appearance_memory.cosine_memory import CosineAppearanceMemory
         from uav_tracker.ml.motion_predictor.lstm_predictor import OnlineLSTMMotionPredictor
-        from uav_tracker.ml.tsa.target_state_assessor import TargetStateAssessor
 
         tracker_name = cfg.get("tracker", {}).get("name", "sglatrack")
         tracker = TRACKERS.build(tracker_name, enable_ce=cfg.get("enable_ce", True))
-
-        tsa = TargetStateAssessor(
-            device=cfg.get("tsa", {}).get("device", "auto"),
-            adapt_interval=cfg.get("tsa", {}).get("adapt_interval", 20),
-            buffer_size=cfg.get("tsa", {}).get("buffer_size", 100),
-            motion_threshold=cfg.get("tsa", {}).get("motion_residual_threshold", 0.5),
-            drift_threshold=cfg.get("tsa", {}).get("drift_threshold", 0.35),
-            adapt_enabled=cfg.get("tsa", {}).get("adapt_enabled", True),
-            weights_path=cfg.get("tsa", {}).get("weights_path"),
-            enable_velocity_drift=cfg.get("enable_velocity_drift", True),
-        )
 
         det_cfg = cfg.get("detector", {})
         det_name = det_cfg.get("name")
@@ -234,12 +184,26 @@ class SALTRunner:
         else:
             motion_pred = None
 
+        # Optional SALT-RD controller — constructed only when config provides a path
+        saltrd_controller = None
+        evidence_extractor = None
+        saltrd_cfg = cfg.get("saltrd", {})
+        if saltrd_cfg.get("enabled", False):
+            try:
+                from salt_r.controller import SALTRDController
+                from salt_r.evidence import EvidenceExtractor
+                saltrd_controller = SALTRDController()
+                evidence_extractor = EvidenceExtractor()
+            except ImportError:
+                _logger.warning("SALT-RD controller not available — running without it")
+
         runner = cls(
             tracker=tracker,
-            tsa=tsa,
             detector=detector,
             appearance_memory=memory,
             motion_predictor=motion_pred,
+            saltrd_controller=saltrd_controller,
+            evidence_extractor=evidence_extractor,
             seed=cfg.get("seed", 42),
         )
 
@@ -271,16 +235,11 @@ class SALTRunner:
         self._prev_frame = frames[0]
         self._frame_idx = 0
 
-        # BUG-14 fix: validate frame-0 GT bbox quality.
-        # If the initial GT bbox is degenerate (w<=0 or h<=0), override the
-        # default CONFIRMED compute routing for frame 1 to OCCLUDED so that
-        # CE token pruning is not applied when initialization quality is poor.
+        # Log warning for degenerate GT bbox at frame 0 (informational only).
         if gt[0].w <= 0 or gt[0].h <= 0:
-            from uav_tracker.ml.tsa.target_state import TargetState
-            self._prev_tsa_state_int = TargetState.OCCLUDED.value
             _logger.warning(
                 "SALTRunner: degenerate GT bbox at frame 0 "
-                "(w=%.1f h=%.1f) — routing frame 1 as OCCLUDED",
+                "(w=%.1f h=%.1f) — tracker init may be unreliable",
                 gt[0].w, gt[0].h,
             )
 
@@ -291,8 +250,6 @@ class SALTRunner:
         except Exception:
             self._ref_embedding = None
 
-        _state_counts: dict = {}
-
         yield TelemetryEntry(
             frame_idx=0,
             bbox=gt[0],
@@ -300,16 +257,21 @@ class SALTRunner:
             tier=1,
             switched=False,
             aux={
-                "target_state": "CONFIRMED",
-                "tsa_confidence": 1.0,
-                # SALT-RD telemetry — empty for init frame
+                # SALT-RD telemetry for init frame
+                "saltrd_action_compute": "full",
+                "saltrd_action_search": "keep",
+                "saltrd_action_template": "keep_current",
+                "saltrd_action_recovery": "none",
+                "saltrd_action_confidence": 1.0,
+                "saltrd_changed_bbox": False,
+                "saltrd_safety_fallback": False,
+                "saltrd_reason": "init_frame",
                 "score_map_stats": {},
                 "apce_raw": 0.0,
                 "psr_raw": 0.0,
                 "entropy_raw": 0.0,
             },
         )
-        _state_counts["CONFIRMED"] = _state_counts.get("CONFIRMED", 0) + 1
 
         for idx, frame in enumerate(frames[1:], start=1):
             self._frame_idx = idx
@@ -325,33 +287,27 @@ class SALTRunner:
                 timings_ms={"total": (time.perf_counter() - t0) * 1000},
                 aux=entry.aux,
             )
-            sname = entry.aux.get("target_state", "UNKNOWN")
-            _state_counts[sname] = _state_counts.get(sname, 0) + 1
             self._prev_frame = frame
             yield entry
-
-        total = sum(_state_counts.values())
-        _logger.warning(
-            "TSA state distribution (%d frames): %s",
-            total,
-            {k: f"{v}({100 * v // total}%)" for k, v in sorted(_state_counts.items())},
-        )
 
     def _step(self, frame: np.ndarray) -> TelemetryEntry:
         """Process one frame. Returns a TelemetryEntry (frame_idx not set).
 
-        Two-step deferred consistency model
-        ------------------------------------
-        1. Run tracker using the *previous* frame's TSA state for compute routing.
-        2. Run TSA on the *current* tracker output to validate it:
-               consistency = IoU(tracker_pred_current, flow_warp(prev_bbox))
-           This correctly detects drift/loss: a slow UAV that the tracker has
-           abandoned will show low IoU here, whereas the old model (IoU of prev
-           vs warp(prev)) just measured motion magnitude and nearly always ≥ 0.9.
-        3. Cache TSA state for next frame's routing decision.
-        4. If LOST: attempt detector-based recovery and re-init in this frame.
+        SALT-RD controller loop
+        -----------------------
+        1. Run tracker using previous frame's action for compute routing.
+        2. Feed tracker telemetry into EvidenceExtractor -> EvidenceFrame.
+        3. Run SALTRDController.step(evidence) -> SALTRDDecision.
+        4. Cache action for next frame routing.
+        5. Execute recovery if decision.action.recovery in (REINIT, SCORE_CANDIDATES)
+           and detector is available.
+        6. Execute template update if decision.action.template == UPDATE.
+
+        If saltrd_controller is None: use TrackerAction() (full compute, no recovery)
+        as the default, and call tracker.update_with_action(frame, TrackerAction())
+        which falls back to tracker.update(frame).
         """
-        from uav_tracker.ml.tsa.target_state import TargetState
+        from salt_r.actions import TrackerAction, TemplateAction, RecoveryAction
 
         # ---- Motion predictor: LSTM hint ----
         lstm_pred: BBox | None = None
@@ -372,156 +328,87 @@ class SALTRunner:
             except Exception:
                 drift = 0.0
 
-        # ---- Step 1: run tracker (uses previous-frame TSA state for budget) ----
-        # When SALT-RD primary mode is active, the SALT-RD policy from the previous
-        # frame overrides TSA for CE routing. This mirrors the TSA deferred-routing
-        # model: policy computed on frame N routes compute on frame N+1.
-        _routing_state_int: int = self._prev_tsa_state_int
-        if self.use_saltrd_primary and self._prev_saltrd_policy is not None:
-            from uav_tracker.ml.tsa.target_state import TargetState as _TS
-            if self._prev_saltrd_policy['force_full_compute']:
-                # Force full compute: use non-CONFIRMED state so CE keep_rate→1.0
-                _routing_state_int = _TS.OCCLUDED.value
-            elif self._prev_saltrd_policy['allow_ce_pruning']:
-                # TRUSTED_TRACKING: allow CE pruning
-                _routing_state_int = _TS.CONFIRMED.value
-            # else: keep TSA routing as fallback for intermediate states
+        # ---- Step 1: run tracker using previous-frame action ----
+        prev_action = self._prev_action if self._prev_action is not None else TrackerAction()
 
         t_tracker = time.perf_counter()
-        try:
-            track_state: TrackState = self.tracker.update_with_state(
-                frame, _routing_state_int,
-                consecutive_occluded=self._consecutive_occluded,
-                prev_apce=self._prev_apce,
-            )
-        except AttributeError:
-            track_state = self.tracker.update(frame)
+        track_state: TrackState = self.tracker.update_with_action(frame, prev_action)
         tracker_ms = (time.perf_counter() - t_tracker) * 1000
-
-        # SALT-RD advisory p_fc (0.0 if no advisor attached)
-        _advisor = getattr(self.tracker, '_salt_rd_advisor', None)
-        _advisory_p_fc: float = _advisor.last_p_fc if _advisor is not None else 0.0
-
-        # SALT-RD per-frame telemetry flags (updated below as events occur)
-        _template_attempted: bool = False
-        _template_updated: bool = False
-        _reinit_vetoed: bool = False
-        _recovery_hint_used: bool = False
-        _recovery_hint_bbox_log: "list | None" = None
-
-        # Stage 3: Get SALT-RD primary state when advisor attached
-        _saltrd_policy: dict | None = None
-        _saltrd_state = None
-        if _advisor is not None:
-            _tsa_int = self._prev_tsa_state_int
-            _saltrd_policy = _advisor.stage3_policy(_tsa_int)
-            _saltrd_state = _saltrd_policy['state']
 
         # Extract score-map quality metrics (populated by SGLATracker; 0.0 for others)
         apce = getattr(track_state, 'apce', 0.0)
         psr = getattr(track_state, 'psr', 0.0)
         response_entropy = getattr(track_state, 'response_entropy', 0.0)
 
-        # Center-freeze (Stage 3 / Phase 5)
-        # Disabled by default (_enable_center_freeze=False): oracle showed 0.000 AUC gain
-        # and unconditional activation causes regression on standard sequences
-        # (car13: -0.396, truck1: -0.156 when p_fc >= 0.60 fires on correct frames).
-        # Still call update_center_freeze() so telemetry state stays consistent.
-        _freeze_active: bool = False
-        _freeze_bbox_hint: tuple | None = None
-        if _advisor is not None:
-            _cf_active = _advisor.update_center_freeze(
-                track_state.bbox, getattr(track_state, 'apce', 0.0)
-            )
-            if self._enable_center_freeze:
-                _freeze_active = _cf_active
-                _freeze_bbox_hint = _advisor.center_freeze_bbox
-        if _freeze_active and _freeze_bbox_hint is not None:
-            cx_fr, cy_fr, bw_fr, bh_fr = _freeze_bbox_hint
-            self.tracker.override_search_center(cx_fr, cy_fr, bw_fr, bh_fr)
-            # Note: output bbox is still the tracker's output, not the frozen bbox.
-            # The freeze affects next-frame search center, not current output bbox.
+        # SALT-RD advisory p_fc (0.0 if no advisor attached) -- kept for risk logging
+        _advisor = getattr(self.tracker, '_salt_rd_advisor', None)
+        _advisory_p_fc: float = _advisor.last_p_fc if _advisor is not None else 0.0
 
-        # Proactive early recovery: update hint from current position/APCE after advisor ran
-        if _advisor is not None:
-            _advisor.update_recovery_hint(track_state.bbox, apce)
+        # ---- Step 2+3: SALT-RD controller ----
+        # Build EvidenceFrame and run controller if available; else use safe NOOP action.
+        decision = None
+        if self.saltrd_controller is not None and self.evidence_extractor is not None:
+            # Build 28-dim feature vector from tracker telemetry
+            current_bbox = track_state.bbox
+            bbox_tuple = (current_bbox.x, current_bbox.y, current_bbox.w, current_bbox.h)
+            score_map_stats = getattr(track_state, 'score_map_stats', {}) or {}
 
-        # prev_bbox for flow warp: last confirmed position before this frame
-        prev_bbox: BBox = self._trajectory[-1] if self._trajectory else track_state.bbox
+            # Populate available base features (flow features 22-27 stay zero)
+            import numpy as _np
+            features = _np.zeros(28, dtype=_np.float32)
+            features[0] = apce
+            features[1] = apce / (apce + 1.0)   # apce_norm: bounded [0,1)
+            features[2] = psr
+            features[3] = response_entropy
+            features[4] = float(score_map_stats.get('peak_margin', 0.0))
+            features[5] = float(score_map_stats.get('peak_width', 0.0))
+            features[6] = float(score_map_stats.get('n_secondary', 0.0))
+            features[7] = float(score_map_stats.get('peak_distance', 0.0))
+            features[8] = float(score_map_stats.get('heatmap_mass_topk', 0.0))
 
-        # ---- Step 2: TSA — assess current tracker output for consistency ----
-        state_int = TargetState.CONFIRMED.value
-        tsa_confidence = 1.0
-        state_name = "CONFIRMED"
-
-        # TSA temporal gating: on consecutive stable frames, skip full TSA assessment.
-        # Use previous-frame APCE as proxy — if high, current frame is almost certainly
-        # CONFIRMED too. Also guard with current-frame APCE to avoid gating transitions
-        # to OCCLUDED (low current APCE even when previous was high).
-        # Reduces optical flow computation by ~40% on easy sequences.
-        _skip_tsa = (
-            self._prev_tsa_state_int == TargetState.CONFIRMED.value
-            and self._prev_apce > 120.0   # strong previous peak → likely stable
-            and apce > 120.0              # current peak also high → not transitioning
-            and self._frame_idx > 5       # always run full TSA for first few frames
-        )
-
-        t_tsa = time.perf_counter()
-        if self.tsa and not _skip_tsa:
+            candidates_raw = score_map_stats.get('candidates', []) or []
             try:
-                assessment = self.tsa.assess(
-                    frame=frame,
-                    prev_frame=self._prev_frame,
-                    tracker_pred_bbox=track_state.bbox,
-                    prev_bbox=prev_bbox,
-                    tracker_confidence=track_state.confidence,
-                    lstm_pred_bbox=lstm_pred,
-                    appearance_drift=drift,
-                    apce=apce,
-                    psr=psr,
-                    response_entropy=response_entropy,
+                evidence_frame = self.evidence_extractor.step(
+                    base_features=features,
+                    bbox=bbox_tuple,
+                    score_map_stats=score_map_stats,
+                    candidates=candidates_raw,
                 )
-                state_int = int(assessment.state)
-                tsa_confidence = float(assessment.confidence)
-                state_name = assessment.state.name
+                decision = self.saltrd_controller.step(evidence_frame)
             except Exception as exc:
-                _logger.debug("TSA assess failed: %s", exc)
-        elif _skip_tsa:
-            # Reuse previous CONFIRMED state — no Farneback needed
-            state_int = TargetState.CONFIRMED.value
-            tsa_confidence = 1.0
-            state_name = "CONFIRMED"
-        tsa_ms = (time.perf_counter() - t_tsa) * 1000
+                _logger.debug("SALT-RD controller step failed: %s", exc)
+                decision = None
 
-        # Log per-component timing every 100 frames
-        if self._frame_idx % 100 == 0:
-            _logger.warning(
-                "Timing frame %d: tracker=%.1fms tsa=%.1fms",
-                self._frame_idx, tracker_ms, tsa_ms,
+        # Use safe NOOP if controller unavailable or failed
+        if decision is None:
+            from salt_r.controller import SALTRDDecision
+            decision = SALTRDDecision(
+                action=TrackerAction(),
+                safety_fallback_applied=True,
+                reason="no_controller",
             )
-        self._prev_tsa_state_int = state_int
-        self._prev_apce = apce  # store for next frame's TSA temporal gating
-        # Store SALT-RD policy for next frame's CE routing (primary mode)
-        self._prev_saltrd_policy = _saltrd_policy
 
-        # Guard 1: remember last good bbox for size-consistency filtering
-        if state_int in (TargetState.CONFIRMED.value, TargetState.DYNAMIC.value):
+        # ---- Step 4: cache action for next frame ----
+        self._prev_action = decision.action
+
+        # ---- Per-frame telemetry flags ----
+        _template_attempted: bool = False
+        _template_updated: bool = False
+        _reinit_vetoed: bool = False
+        _saltrd_changed_bbox: bool = False
+
+        # ---- Guard 1: remember last good bbox for size-consistency filtering ----
+        # Use confidence threshold as proxy for "confirmed" (no TSA state required)
+        if track_state.confidence >= 0.14:
             self._last_good_bbox = track_state.bbox
 
-        # Guard 3: EMA update of reference embedding on stable CONFIRMED frames every 50.
-        # SALT-RD gate: skip EMA when p_fc >= 0.30 — ref_embedding stays frozen if
-        # model suspects false-confirmed risk (prevents cosine guard from drifting to
-        # match the wrong target, which was the root cause of the car7 regression).
-        if (state_int == TargetState.CONFIRMED.value
-                and track_state.confidence >= 0.014   # top-3 softmax scale (~0.016 typical)
+        # ---- Guard 3: EMA update of reference embedding on stable frames every 50 ----
+        if (track_state.confidence >= 0.014
                 and self._frame_idx % 50 == 0
-                and self._ref_embedding is not None
-                and _advisory_p_fc < 0.30):
+                and self._ref_embedding is not None):
             try:
                 new_emb = _get_embed_helper()._extract_embedding(frame, track_state.bbox)
-                # EMA: 80% old + 20% new — slow drift to handle legitimate appearance change
                 self._ref_embedding = 0.80 * self._ref_embedding + 0.20 * new_emb
-                # Re-normalise
                 norm = np.linalg.norm(self._ref_embedding) + 1e-8
                 self._ref_embedding = self._ref_embedding / norm
             except Exception:
@@ -529,114 +416,85 @@ class SALTRunner:
 
         if self._frame_idx % 50 == 0:
             _logger.warning(
-                "Frame %d: apce=%.1f psr=%.1f entropy=%.3f state=%s conf=%.3f",
-                self._frame_idx, apce, psr, response_entropy, state_name, track_state.confidence,
+                "Frame %d: apce=%.1f psr=%.1f entropy=%.3f conf=%.3f tracker=%.1fms",
+                self._frame_idx, apce, psr, response_entropy,
+                track_state.confidence, tracker_ms,
             )
 
-        # OCCLUDED escalation: if OCCLUDED persists > N frames, treat as LOST so
-        # the recovery pipeline fires. Without this, uav2's 47% OCCLUDED frames
-        # run indefinitely with no detector call (LOST threshold apce < 20 is too
-        # tight — uav2 APCE sits at 20-80, always OCCLUDED, never LOST).
-        #
-        # Staged criterion: require both sustained frame count AND sustained low APCE
-        # (mean of the last 25 APCE values < 0.75 * occluded_threshold).  This
-        # prevents false escalation on sequences like car7 where APCE dips for 25
-        # frames but the mean remains above threshold (tracker not genuinely lost).
-        if state_int == TargetState.OCCLUDED.value:
-            self._apce_buffer.append(apce)
-            self._consecutive_occluded += 1
-            _count_met = self._consecutive_occluded >= self._OCCLUDED_ESCALATION_FRAMES
-            _apce_occluded_thr = getattr(self.tsa, '_apce_calibrator', None)
-            _occ_thr = _apce_occluded_thr.thresholds()[1] if _apce_occluded_thr else 80.0
-            _mean_low = (
-                len(self._apce_buffer) >= 25
-                and float(np.mean(list(self._apce_buffer))) < _occ_thr * 0.75
-            )
-            if _count_met and _mean_low:
-                # APCE-trend gating: if APCE is rising ≥15% above the previous
-                # escalated frame's APCE, the tracker is self-recovering — skip
-                # escalation this frame so _consecutive_lost does not increment and
-                # the recovery pipeline is not triggered prematurely (bike2 fix).
-                _apce_trend_rising = (
-                    self._prev_escalated_apce > 0.0
-                    and apce >= self._prev_escalated_apce * 1.15
-                )
-                if _apce_trend_rising:
-                    _logger.debug(
-                        "SALT: APCE-trend gate blocked OCCLUDED→LOST at frame %d "
-                        "(apce=%.1f prev_esc=%.1f)",
-                        self._frame_idx, apce, self._prev_escalated_apce,
-                    )
-                else:
-                    _logger.debug(
-                        "SALT: escalating OCCLUDED→LOST after %d frames (mean_apce=%.1f thr=%.1f)",
-                        self._consecutive_occluded,
-                        float(np.mean(list(self._apce_buffer))),
-                        _occ_thr * 0.75,
-                    )
-                    state_int = TargetState.LOST.value
-                    state_name = "LOST"
-                    self._prev_escalated_apce = apce
-                    # Clear any cooldown on the first escalation frame so the recovery
-                    # pipeline can fire immediately after _RECOVERY_MIN_LOST LOST frames.
-                    # (Cooldown may have been set by a prior LOST→detector-fail event;
-                    # re-opening the window here is intentional for the OCCLUDED path.)
-                    if self._consecutive_occluded == self._OCCLUDED_ESCALATION_FRAMES:
-                        self._lost_cooldown = 0
-                    # Do NOT reset _consecutive_occluded: keep it elevated so every
-                    # subsequent OCCLUDED frame also escalates to LOST until recovery
-                    # succeeds. This lets _consecutive_lost accumulate to _RECOVERY_MIN_LOST.
+        # ---- Track consecutive recovery-requested frames ----
+        _recovery_action = decision.action.recovery
+        if _recovery_action in (RecoveryAction.REINIT, RecoveryAction.SCORE_CANDIDATES):
+            self._consecutive_recovery_frames += 1
         else:
-            self._consecutive_occluded = 0  # reset on any non-OCCLUDED frame
-            self._apce_buffer.clear()
-            self._prev_escalated_apce = 0.0
-
-        # Track consecutive LOST frames; reset on any non-LOST state
-        if state_int == TargetState.LOST.value:
-            self._consecutive_lost += 1
-        else:
-            self._consecutive_lost = 0
+            self._consecutive_recovery_frames = 0
         if self._lost_cooldown > 0:
             self._lost_cooldown -= 1
 
-        # ---- Step 4: Recovery — only after N consecutive LOST frames ----
-        _genuine_loss = (self._consecutive_lost >= self._RECOVERY_MIN_LOST)
+        # prev_bbox for recovery hint
+        prev_bbox: BBox = self._trajectory[-1] if self._trajectory else track_state.bbox
+
+        # ---- Step 5: Recovery -- only when controller requests it ----
+        _genuine_recovery_request = (
+            self._consecutive_recovery_frames >= self._RECOVERY_MIN_FRAMES
+        )
         _past_warmup = (self._frame_idx >= self._RECOVERY_WARMUP_FRAMES)
-        if (_genuine_loss
+        if (_genuine_recovery_request
                 and _past_warmup
                 and self.detector is not None
                 and self._lost_cooldown == 0):
-            # Consume SALT-RD proactive recovery hint if available.
-            # The hint was saved at the first frame where p_fc rose above 0.45 with
-            # falling APCE_ratio5 — before TSA declared LOST. Logged for telemetry.
-            _recovery_hint: "tuple[float,float,float,float] | None" = None
-            if _advisor is not None:
-                _recovery_hint = _advisor.consume_recovery_hint()
-            if _recovery_hint is not None:
-                _recovery_hint_used = True
-                _recovery_hint_bbox_log = list(_recovery_hint)
-                _logger.debug(
-                    "SALT-RD recovery hint: frame=%d hint_cx=%.1f hint_cy=%.1f",
-                    self._frame_idx, _recovery_hint[0], _recovery_hint[1],
-                )
             try:
-                # Bug 2 fix: use the tracker's frozen _state (last CONFIRMED position)
-                # as the detector hint, not the drifted trajectory tail (prev_bbox).
-                # After OCCLUDED→LOST escalation, prev_bbox keeps receiving drifted
-                # track_state.bbox values, so it no longer points at the frozen centre.
                 _frozen_hint = getattr(self.tracker, '_state', None) or prev_bbox
                 _logger.warning(
-                    "SALT recovery: frame=%d hint=(%s) consecutive_lost=%d consecutive_occluded=%d",
+                    "SALT recovery: frame=%d hint=(%s) consecutive_recovery=%d",
                     self._frame_idx,
-                    f"{_frozen_hint.x:.0f},{_frozen_hint.y:.0f} {_frozen_hint.w:.0f}×{_frozen_hint.h:.0f}"
+                    f"{_frozen_hint.x:.0f},{_frozen_hint.y:.0f} {_frozen_hint.w:.0f}x{_frozen_hint.h:.0f}"
                     if _frozen_hint else "None",
-                    self._consecutive_lost,
-                    self._consecutive_occluded,
+                    self._consecutive_recovery_frames,
                 )
 
-                detections = self.detector.detect(frame, hint_bbox=_frozen_hint)
+                # Constrained recovery: use advisor crop if available
+                _use_constrained_recovery: bool = False
+                _recovery_crop: "tuple[float, float, float, float] | None" = None
+
+                # Use controller's spatial hint if available (from learned reinit candidate)
+                _recovery_hint = decision.action.detector_hint or decision.action.bbox_hint
+                if _recovery_hint is not None:
+                    _recovery_crop = _recovery_hint
+                    _use_constrained_recovery = True
+
+                if _use_constrained_recovery and _recovery_crop is not None:
+                    _rx, _ry, _rw, _rh = _recovery_crop
+                    _rx_i, _ry_i = int(_rx), int(_ry)
+                    _rw_i, _rh_i = max(1, int(_rw)), max(1, int(_rh))
+                    cropped_frame = frame[_ry_i:_ry_i + _rh_i, _rx_i:_rx_i + _rw_i]
+                    if cropped_frame.size > 0:
+                        crop_detections = self.detector.detect(cropped_frame, hint_bbox=None)
+
+                        class _OffsetDet:
+                            __slots__ = ("bbox", "confidence", "class_id")
+                            def __init__(self, d: Any, dx: int, dy: int) -> None:
+                                self.bbox = BBox(x=d.bbox.x + dx, y=d.bbox.y + dy,
+                                                 w=d.bbox.w, h=d.bbox.h)
+                                self.confidence = float(
+                                    getattr(d, "confidence", None) or getattr(d, "score", 0.0)
+                                )
+                                self.class_id = getattr(d, "class_id", None)
+
+                        full_frame_detections = [
+                            _OffsetDet(_det, _rx_i, _ry_i) for _det in crop_detections
+                        ]
+                        if full_frame_detections:
+                            detections = full_frame_detections
+                        else:
+                            detections = self.detector.detect(frame, hint_bbox=_frozen_hint)
+                            _use_constrained_recovery = False
+                    else:
+                        detections = self.detector.detect(frame, hint_bbox=_frozen_hint)
+                        _use_constrained_recovery = False
+                else:
+                    detections = self.detector.detect(frame, hint_bbox=_frozen_hint)
+
                 if detections:
-                    # Guard 4: class filter — keep only detections matching the target class
                     if self._target_class is not None:
                         class_filtered = [
                             d for d in detections
@@ -644,22 +502,18 @@ class SALTRunner:
                         ]
                         if class_filtered:
                             detections = class_filtered
-                        # else: fall back to all detections (no class match found)
 
-                    n_lost = self._consecutive_lost + self._consecutive_occluded
-                    best = self._best_detection(detections, frame, self._last_good_bbox,
-                                                n_lost=n_lost)
+                    n_lost = self._consecutive_recovery_frames
+                    best = self._best_detection(detections, frame, self._last_good_bbox, n_lost=n_lost)
                     _logger.warning(
                         "SALT recovery: %d detections after class-filter, best=%s accepted=%s",
                         len(detections),
-                        f"({best.bbox.x:.0f},{best.bbox.y:.0f} {best.bbox.w:.0f}×{best.bbox.h:.0f})"
+                        f"({best.bbox.x:.0f},{best.bbox.y:.0f} {best.bbox.w:.0f}x{best.bbox.h:.0f})"
                         if best else "None",
                         best is not None,
                     )
-                    # Guard 2: accumulate votes; only re-init after spatial consensus
                     if best is not None:
                         self._recovery_votes.append((best.bbox, self._last_recovery_sim))
-                        # Guard 4: remember class of the best candidate for future filtering
                         if self._target_class is None:
                             self._target_class = getattr(best, 'class_id', None)
 
@@ -667,91 +521,59 @@ class SALTRunner:
                         winner, winner_sim = self._pick_voted_detection(self._recovery_votes)
                         self._recovery_votes = []
                         if winner is not None:
-                            # Guard 5: velocity-based trajectory prediction check.
-                            # Use last 5 non-LOST trajectory entries to estimate where
-                            # the target SHOULD be. If the winner is significantly closer
-                            # to that prediction than to _last_good_bbox, accept as usual.
-                            # Otherwise require cosine_sim >= 0.70 to accept.
                             _w_cx = winner.x + winner.w / 2
                             _w_cy = winner.y + winner.h / 2
 
-                            # Compute predicted center from last 5 non-LOST entries
-                            _traj_confirmed = [
-                                b for b in self._trajectory[-10:]
-                                if b is not None
-                            ]
+                            _traj_confirmed = [b for b in self._trajectory[-10:] if b is not None]
                             if len(_traj_confirmed) >= 5:
-                                # Fit linear velocity: mean of last 4 displacements
                                 _pts = _traj_confirmed[-5:]
                                 _disps_x = [
-                                    (_pts[i + 1].x + _pts[i + 1].w / 2)
-                                    - (_pts[i].x + _pts[i].w / 2)
+                                    (_pts[i + 1].x + _pts[i + 1].w / 2) - (_pts[i].x + _pts[i].w / 2)
                                     for i in range(4)
                                 ]
                                 _disps_y = [
-                                    (_pts[i + 1].y + _pts[i + 1].h / 2)
-                                    - (_pts[i].y + _pts[i].h / 2)
+                                    (_pts[i + 1].y + _pts[i + 1].h / 2) - (_pts[i].y + _pts[i].h / 2)
                                     for i in range(4)
                                 ]
                                 _vx = float(np.mean(_disps_x))
                                 _vy = float(np.mean(_disps_y))
-                                _n_lost = max(1, self._consecutive_lost)
+                                _n_lost = max(1, self._consecutive_recovery_frames)
                                 _last_pt = _traj_confirmed[-1]
                                 _pred_cx = _last_pt.x + _last_pt.w / 2 + _vx * _n_lost
                                 _pred_cy = _last_pt.y + _last_pt.h / 2 + _vy * _n_lost
                             else:
-                                # Not enough history — use _last_good_bbox center
                                 _ref = self._last_good_bbox if self._last_good_bbox else (
                                     self._trajectory[-1] if self._trajectory else winner
                                 )
                                 _pred_cx = _ref.x + _ref.w / 2
                                 _pred_cy = _ref.y + _ref.h / 2
 
-                            _dist_to_pred = (
-                                (_w_cx - _pred_cx) ** 2 + (_w_cy - _pred_cy) ** 2
-                            ) ** 0.5
-
-                            # Distance from winner to last good bbox center
+                            _dist_to_pred = ((_w_cx - _pred_cx) ** 2 + (_w_cy - _pred_cy) ** 2) ** 0.5
                             _lgb = self._last_good_bbox if self._last_good_bbox else (
                                 self._trajectory[-1] if self._trajectory else winner
                             )
                             _lgb_cx = _lgb.x + _lgb.w / 2
                             _lgb_cy = _lgb.y + _lgb.h / 2
-                            _dist_to_lgb = (
-                                (_w_cx - _lgb_cx) ** 2 + (_w_cy - _lgb_cy) ** 2
-                            ) ** 0.5
-
+                            _dist_to_lgb = ((_w_cx - _lgb_cx) ** 2 + (_w_cy - _lgb_cy) ** 2) ** 0.5
                             _closer_to_pred = _dist_to_pred < _dist_to_lgb * 0.7
                             _high_sim = winner_sim >= 0.70
 
                             _logger.warning(
                                 "SALT Guard5: winner=(%s) pred=(%.0f,%.0f) "
-                                "dist_pred=%.1f dist_lgb=%.1f closer=%s "
-                                "cosine_sim=%.3f high_sim=%s",
-                                f"{winner.x:.0f},{winner.y:.0f} {winner.w:.0f}×{winner.h:.0f}",
-                                _pred_cx, _pred_cy,
-                                _dist_to_pred, _dist_to_lgb, _closer_to_pred,
-                                winner_sim, _high_sim,
+                                "dist_pred=%.1f dist_lgb=%.1f closer=%s cosine_sim=%.3f high_sim=%s",
+                                f"{winner.x:.0f},{winner.y:.0f} {winner.w:.0f}x{winner.h:.0f}",
+                                _pred_cx, _pred_cy, _dist_to_pred, _dist_to_lgb,
+                                _closer_to_pred, winner_sim, _high_sim,
                             )
 
                             if not _closer_to_pred and not _high_sim:
                                 _logger.warning(
                                     "SALT Guard5: REJECTED recovery "
-                                    "(dist_pred=%.1f >= 0.7×dist_lgb=%.1f "
-                                    "and cosine_sim=%.3f < 0.70)",
+                                    "(dist_pred=%.1f >= 0.7xdist_lgb=%.1f and cosine_sim=%.3f < 0.70)",
                                     _dist_to_pred, _dist_to_lgb * 0.7, winner_sim,
                                 )
                                 self._lost_cooldown = 40
-                                self._prev_tsa_state_int = TargetState.OCCLUDED.value
-                            elif _advisor is not None and _advisor.should_block_reinit():
-                                # SALT-RD: p_fc >= fc_block_reinit — tracker likely false-confirmed, skip reinit
-                                _logger.debug(
-                                    "SALT-RD advisory: blocking reinit at frame %d (p_fc=%.3f)",
-                                    self._frame_idx, _advisory_p_fc,
-                                )
                                 _reinit_vetoed = True
-                                self._lost_cooldown = 25
-                                self._prev_tsa_state_int = TargetState.OCCLUDED.value
                             else:
                                 self.tracker.init(frame, winner)
                                 track_state = TrackState(
@@ -761,11 +583,11 @@ class SALTRunner:
                                 )
                                 if self.motion_predictor:
                                     self.motion_predictor.reset()
-                                self._prev_tsa_state_int = TargetState.CONFIRMED.value
-                                self._prev_saltrd_policy = _saltrd_policy  # keep for next frame routing
                                 self._lost_cooldown = 0
-                                self._consecutive_lost = 0  # reset after successful recovery
-                                self._consecutive_occluded = 0  # reset so escalation restarts cleanly
+                                self._consecutive_recovery_frames = 0
+                                _saltrd_changed_bbox = True
+                                if self.evidence_extractor is not None:
+                                    self.evidence_extractor.notify_reinit()
                                 self._trajectory.append(track_state.bbox)
                                 if len(self._trajectory) > 200:
                                     self._trajectory = self._trajectory[-200:]
@@ -776,29 +598,32 @@ class SALTRunner:
                                     tier=3,
                                     switched=True,
                                     aux={
-                                        "target_state": state_name,
-                                        "tsa_confidence": tsa_confidence,
+                                        "saltrd_action_compute": decision.action.compute.value,
+                                        "saltrd_action_search": decision.action.search.value,
+                                        "saltrd_action_template": decision.action.template.value,
+                                        "saltrd_action_recovery": decision.action.recovery.value,
+                                        "saltrd_action_confidence": decision.model_confidence,
+                                        "saltrd_changed_bbox": True,
+                                        "saltrd_safety_fallback": decision.safety_fallback_applied,
+                                        "saltrd_reason": decision.reason,
                                         "recovered": True,
-                                        # SALT-RD telemetry — empty for init frame
                                         "score_map_stats": {},
                                         "apce_raw": 0.0,
                                         "psr_raw": 0.0,
                                         "entropy_raw": 0.0,
+                                        "lstm_pred": (
+                                            [lstm_pred.x, lstm_pred.y, lstm_pred.w, lstm_pred.h]
+                                            if lstm_pred else None
+                                        ),
+                                        "appearance_drift": round(drift, 4),
                                     },
                                 )
                         else:
-                            # Votes accumulated but no spatial consensus — back off
                             self._lost_cooldown = 25
-                            self._prev_tsa_state_int = TargetState.OCCLUDED.value
-                    # else: still accumulating votes — continue as LOST this frame
                     elif best is None:
-                        # No good candidate — back off for 25 frames, route as OCCLUDED
                         self._lost_cooldown = 25
-                        self._prev_tsa_state_int = TargetState.OCCLUDED.value
                 else:
-                    # Detector found nothing — back off for 10 frames
                     self._lost_cooldown = 10
-                    self._prev_tsa_state_int = TargetState.OCCLUDED.value
             except Exception as exc:
                 _logger.debug("SALT recovery failed: %s", exc)
                 self._lost_cooldown = 10
@@ -807,36 +632,23 @@ class SALTRunner:
         if len(self._trajectory) > 200:
             self._trajectory = self._trajectory[-200:]
 
-        # ---- Appearance memory: store if confirmed (or distractor-risk at lower threshold) ----
-        # DISTRACTOR_RISK must also store so the memory tracks appearance drift
-        # and doesn't get stuck in a one-way trap where drift stays high forever.
-        _should_store = (
-            self.appearance_memory and (
-                (state_int == TargetState.CONFIRMED.value and track_state.confidence >= 0.6)
-                or (state_int == TargetState.DISTRACTOR_RISK.value and track_state.confidence >= 0.4)
-            )
-        )
-        if _should_store:
+        # ---- Appearance memory: store on confident frames ----
+        if self.appearance_memory and track_state.confidence >= 0.6:
             try:
                 ctx = FrameContext(frame=frame, frame_idx=self._frame_idx)
                 self.appearance_memory.store(ctx, track_state)
             except Exception:
                 pass
 
-        # ---- Motion predictor: online update ----
-        if self.motion_predictor and state_int in (TargetState.CONFIRMED.value, TargetState.DYNAMIC.value):
+        # ---- Motion predictor: online update on confident frames ----
+        if self.motion_predictor and track_state.confidence >= 0.14:
             try:
                 self.motion_predictor.update(track_state.bbox)
             except Exception:
                 pass
 
-        # Dynamic template update — gated by SALTRDAdvisor 5-gate temporal guard.
-        # Previous p_fc<0.60 gate caused car7 0.570→0.321 regression: distractor appeared
-        # before GRU accumulated evidence. New 5-gate guard catches rising edge and
-        # score-map competition at t=1–2, before damage occurs.
-        if (_advisor is not None
-                and not _advisor.should_block_template_update()
-                and state_int == TargetState.CONFIRMED.value):
+        # ---- Step 6: Template update -- gated by controller action ----
+        if decision.action.template == TemplateAction.UPDATE:
             _sw = getattr(self.tracker, '_last_search_score_weighted', None)
             _te = getattr(self.tracker, '_last_template_embedding', None)
             if _sw is not None and _te is not None:
@@ -849,50 +661,39 @@ class SALTRunner:
                 apce_threshold=150.0, psr_threshold=500.0,
                 min_interval=100, cosine_threshold=0.80, max_updates=3,
             )
+            if _template_updated and self.evidence_extractor is not None:
+                self.evidence_extractor.notify_template_updated()
 
-
-        # Build aux dict; attach extended SALT-RD telemetry when an advisor is present
+        # ---- Build telemetry aux dict ----
         _aux: dict[str, Any] = {
-            "target_state": state_name,
-            "tsa_confidence": tsa_confidence,
+            # SALT-RD controller fields
+            "saltrd_action_compute": decision.action.compute.value,
+            "saltrd_action_search": decision.action.search.value,
+            "saltrd_action_template": decision.action.template.value,
+            "saltrd_action_recovery": decision.action.recovery.value,
+            "saltrd_action_confidence": decision.model_confidence,
+            "saltrd_changed_bbox": _saltrd_changed_bbox,
+            "saltrd_safety_fallback": decision.safety_fallback_applied,
+            "saltrd_reason": decision.reason,
+            # Raw tracker metrics
+            "apce_raw": apce,
+            "psr_raw": psr,
+            "entropy_raw": response_entropy,
+            "score_map_stats": getattr(track_state, "score_map_stats", {}),
+            # Auxiliary signals
             "lstm_pred": (
                 [lstm_pred.x, lstm_pred.y, lstm_pred.w, lstm_pred.h]
                 if lstm_pred else None
             ),
             "appearance_drift": round(drift, 4),
-            # SALT-RD telemetry — zero/empty-defaulted, does not change tracker behaviour
-            "score_map_stats": getattr(track_state, "score_map_stats", {}),
-            "apce_raw": getattr(track_state, "apce", 0.0),
-            "psr_raw": getattr(track_state, "psr", 0.0),
-            "entropy_raw": getattr(track_state, "response_entropy", 0.0),
+            # Template update
+            "template_update_attempted": _template_attempted,
+            "template_updated": _template_updated,
+            "reinit_vetoed": _reinit_vetoed,
         }
+        # Advisory p_fc for risk logging (read-only, not used for control)
         if _advisor is not None:
             _aux["salt_rd_p_fc"] = _advisory_p_fc
-            _aux["salt_rd_p_ifd10"] = 0.0  # placeholder: p_ifd10 not yet computed
-            _aux["salt_rd_template_attempted"] = _template_attempted
-            _aux["salt_rd_template_updated"] = _template_updated
-            _aux["salt_rd_reinit_vetoed"] = _reinit_vetoed
-            _aux["saltrd_recovery_hint_used"] = _recovery_hint_used
-            if _recovery_hint_bbox_log is not None:
-                _aux["saltrd_recovery_hint_bbox"] = _recovery_hint_bbox_log
-            # Action audit telemetry fields (hard_bench Phase 1+2)
-            _aux["template_update_attempted"] = _template_attempted
-            _aux["template_update_blocked"] = (_template_attempted and not _template_updated and not _advisor.should_block_template_update() is False)
-            _aux["template_update_allowed"] = _template_attempted and not _aux["template_update_blocked"]
-            _aux["template_updated"] = _template_updated
-            _aux["template_gate_reason"] = _advisor._last_gate_reason
-            _aux["reinit_vetoed"] = _reinit_vetoed
-            _aux["search_expanded_by_risk"] = False  # placeholder for Phase 5
-            # Center-freeze telemetry (Stage 3 / Phase 5)
-            _aux["center_freeze_active"] = _freeze_active
-            _aux["center_freeze_bbox"] = list(_freeze_bbox_hint) if _freeze_bbox_hint else None
-            # Stage 3: SALT-RD primary state telemetry
-            if _saltrd_policy is not None:
-                _aux["saltrd_state"] = _saltrd_policy['state'].value
-                _aux["saltrd_allow_ce"] = _saltrd_policy['allow_ce_pruning']
-                _aux["saltrd_force_full"] = _saltrd_policy['force_full_compute']
-                if self.use_saltrd_primary:
-                    _aux["saltrd_routing_state"] = _routing_state_int
 
         return TelemetryEntry(
             frame_idx=self._frame_idx,
@@ -1095,25 +896,22 @@ class SALTRunner:
         self._trajectory = []
         self._prev_frame = None
         self._frame_idx = 0
-        self._prev_tsa_state_int = 0  # CONFIRMED
-        self._prev_saltrd_policy = None
+        self._prev_action = None
         self._lost_cooldown = 0
-        self._consecutive_lost = 0
-        self._consecutive_occluded = 0
-        self._prev_apce = 0.0
-        self._apce_buffer.clear()
-        self._prev_escalated_apce = 0.0
+        self._consecutive_recovery_frames = 0
         self._last_good_bbox = None
         self._recovery_votes = []
         self._ref_embedding = None
         self._target_class = None
         self._last_recovery_sim = 0.0
-        if self.tsa:
-            self.tsa.reset()
         if self.appearance_memory:
             self.appearance_memory.reset()
         if self.motion_predictor:
             self.motion_predictor.reset()
+        if self.saltrd_controller is not None:
+            self.saltrd_controller.reset()
+        if self.evidence_extractor is not None:
+            self.evidence_extractor.reset()
         # Reset tracker template counters and advisor rolling buffers so they
         # do not leak between sequences.  tracker.reset() calls advisor.reset()
         # internally, so this is the single authoritative reset point.
@@ -1122,7 +920,7 @@ class SALTRunner:
         elapsed_ms = (time.perf_counter() - t0) * 1000
         if elapsed_ms > 50:
             _logger.warning(
-                "_reset() took %.1fms (> 50ms threshold) — slow component in TSA/memory/predictor reset",
+                "_reset() took %.1fms (> 50ms threshold) -- slow component in reset",
                 elapsed_ms,
             )
 

@@ -1,62 +1,157 @@
-"""SALT-RD feature schema definitions and helpers.
+"""SALT-RD feature schema definitions and helpers — v3 no-flow production.
 
-The 28-dim feature vector has a fixed layout defined in collect_features.FEATURE_NAMES.
-Production schema v1 (saltrd_v2_online_no_flow) zeroes flow features (indices 22-27)
-because online inference cannot compute Farneback optical flow at runtime without
+The 28-dim feature vector has a fixed layout defined below.  Production schema
+v3 (saltrd_v3_no_tsa_no_flow) zeroes flow features (indices 22-27) because
+online inference cannot compute Farneback optical flow at runtime without
 significant latency overhead, and offline flow extraction creates train/inference
 distribution mismatch.
 
-Flow features remain available for offline analysis and teacher channels only.
+Flow features remain reserved/zero in production; indices are kept so that v2
+checkpoints trained on the same 28-dim layout remain backward-compatible.
+
+No imports from TSA or tracker state modules.  No thresholds of any kind.
 """
 from __future__ import annotations
-from typing import Sequence
+
+from typing import Any
+
 import numpy as np
 
-# Production v1: no runtime flow. Indices 22-27 reserved/zero.
-FLOW_FEATURE_INDICES: list[int] = [22, 23, 24, 25, 26, 27]
-FLOW_FEATURE_NAMES: list[str] = [
-    "global_flow_mag",
-    "target_flow_mag",
-    "ego_motion_residual",
-    "flow_iou",
-    "flow_residual",
-    "flow_consistency",
+# ---------------------------------------------------------------------------
+# Schema version
+# ---------------------------------------------------------------------------
+
+FEATURE_SCHEMA_VERSION: str = "saltrd_v3_no_tsa_no_flow"
+
+# ---------------------------------------------------------------------------
+# Feature names — 28 total, fixed order
+# ---------------------------------------------------------------------------
+
+BASE_FEATURE_NAMES: list[str] = [
+    # 0-8  numeric evidence
+    "apce",                   # 0
+    "apce_norm",              # 1
+    "psr",                    # 2
+    "response_entropy",       # 3
+    "peak_margin",            # 4
+    "peak_width",             # 5
+    "n_secondary",            # 6
+    "peak_distance",          # 7
+    "heatmap_mass_topk",      # 8
+    # 9-12  rolling evidence
+    "apce_ratio_5",           # 9
+    "apce_ratio_20",          # 10
+    "entropy_delta_5",        # 11
+    "peak_margin_delta_5",    # 12
+    # 13-14  v2 parity only
+    "high_apce_streak_legacy",  # 13
+    "low_apce_streak_legacy",   # 14
+    # 15-21  numeric evidence (motion / geometry)
+    "bbox_vx",                # 15
+    "bbox_vy",                # 16
+    "bbox_speed",             # 17
+    "bbox_accel",             # 18
+    "bbox_scale_ratio",       # 19
+    "bbox_aspect_delta",      # 20
+    "dist_to_border",         # 21
+    # 22-27  flow features — zero in production
+    "global_flow_mag",        # 22
+    "target_flow_mag",        # 23
+    "ego_motion_residual",    # 24
+    "flow_iou",               # 25
+    "flow_residual",          # 26
+    "flow_consistency",       # 27
 ]
 
-SCHEMA_DROP_INDICES: dict[str, list[int]] = {
-    "saltrd_v2_online_no_flow": FLOW_FEATURE_INDICES,
-    "legacy_v2": [],                     # no zeroing (original v2_corrected/v2_retrained)
-}
+assert len(BASE_FEATURE_NAMES) == 28, "BASE_FEATURE_NAMES must have exactly 28 entries"
 
-PRODUCTION_SCHEMA = "saltrd_v2_online_no_flow"
+# ---------------------------------------------------------------------------
+# Flow / production-zero indices
+# ---------------------------------------------------------------------------
+
+FLOW_FEATURE_INDICES: tuple[int, ...] = (22, 23, 24, 25, 26, 27)
+
+# Alias: these are the only indices zeroed in production v3
+PRODUCTION_ZERO_FEATURE_INDICES: tuple[int, ...] = FLOW_FEATURE_INDICES
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
 
 
-def get_drop_indices(schema: str) -> list[int]:
-    """Return feature indices to zero for the given schema name."""
-    return SCHEMA_DROP_INDICES.get(schema, [])
+def feature_names(schema: str = FEATURE_SCHEMA_VERSION) -> list[str]:
+    """Return the ordered list of feature names for *schema*.
 
-
-def apply_feature_schema(
-    features: np.ndarray,
-    schema_or_indices: str | Sequence[int],
-) -> np.ndarray:
-    """Zero out features that are not part of the given production schema.
+    Currently only one schema (``FEATURE_SCHEMA_VERSION``) is defined; the
+    argument is accepted for forward-compatibility.
 
     Args:
-        features: (..., 28) float32 array - any number of leading dimensions.
-        schema_or_indices: schema name (str) or explicit list of int indices.
+        schema: Schema version string (default: production v3).
 
     Returns:
-        Copy of features with zeroed columns (does NOT modify in-place).
+        List of 28 feature name strings.
     """
-    if isinstance(schema_or_indices, str):
-        indices = get_drop_indices(schema_or_indices)
-    else:
-        indices = list(schema_or_indices)
+    # Only one schema defined; accept any string for forward-compat but always
+    # return the canonical v3 names (the layout has not changed since v2).
+    return list(BASE_FEATURE_NAMES)
 
-    if not indices:
-        return features
 
-    out = features.copy()
-    out[..., indices] = 0.0
+def zero_production_features(x: np.ndarray) -> np.ndarray:
+    """Return a copy of *x* with flow feature columns zeroed.
+
+    Zeroes the columns at ``PRODUCTION_ZERO_FEATURE_INDICES`` (22-27).
+    The input array is **never** mutated.
+
+    Args:
+        x: Float array with last dimension == 28.  Any number of leading
+           dimensions is supported (e.g. shape ``(28,)`` or ``(N, 28)``).
+
+    Returns:
+        Copy of *x* with flow indices zeroed.
+    """
+    out = x.copy()
+    out[..., list(PRODUCTION_ZERO_FEATURE_INDICES)] = 0.0
     return out
+
+
+def validate_feature_matrix(x: np.ndarray, expected_dim: int = 28) -> None:
+    """Validate that *x* has the expected feature dimension.
+
+    Accepts both 1-D vectors of shape ``(expected_dim,)`` and 2-D matrices of
+    shape ``(N, expected_dim)``.
+
+    Args:
+        x: Array to validate.
+        expected_dim: Expected number of features (default: 28).
+
+    Raises:
+        ValueError: If the last dimension of *x* does not equal *expected_dim*,
+                    or if *x* has more than 2 dimensions.
+    """
+    if x.ndim not in (1, 2):
+        raise ValueError(
+            f"Feature array must be 1-D or 2-D, got ndim={x.ndim}"
+        )
+    actual = x.shape[-1]
+    if actual != expected_dim:
+        raise ValueError(
+            f"Expected feature dimension {expected_dim}, got {actual}"
+        )
+
+
+def schema_metadata() -> dict[str, Any]:
+    """Return a metadata dict describing the active production schema.
+
+    Returns:
+        Dictionary with keys:
+        - ``"feature_schema"``  : schema version string
+        - ``"n_features"``      : total number of features (28)
+        - ``"zero_indices"``    : tuple of indices zeroed in production
+        - ``"names"``           : ordered list of feature names
+    """
+    return {
+        "feature_schema": FEATURE_SCHEMA_VERSION,
+        "n_features": len(BASE_FEATURE_NAMES),
+        "zero_indices": PRODUCTION_ZERO_FEATURE_INDICES,
+        "names": list(BASE_FEATURE_NAMES),
+    }

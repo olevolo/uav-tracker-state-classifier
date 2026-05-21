@@ -1,11 +1,14 @@
-"""Unit tests for Phase 5 proactive recovery hint and Phase 8 TSA→SALT-RD adapter.
+"""Unit tests for Phase 5 proactive recovery hint.
 
 Tests:
   - update_recovery_hint() fires when p_fc > 0.45 AND apce_ratio5 < 0.85
   - update_recovery_hint() does NOT fire when only one condition holds
   - consume_recovery_hint() returns correct values and clears the hint
   - Hint expires after max_age frames
-  - saltrd_state_to_tsa_state() maps all 5 SALTRDState values correctly
+
+Note: Phase 8 TSA→SALT-RD adapter tests (saltrd_state_to_tsa_state) have been
+moved to archive/tsa_removed/test_saltr_phase5_phase8_tsa_tests.py because the
+TSA module (uav_tracker.ml.tsa) was removed in the SALT-RD Phase 4 cleanup.
 """
 from __future__ import annotations
 
@@ -191,47 +194,3 @@ def test_recovery_hint_expires_after_max_age():
     assert expired is False, "Hint should expire after max_age frames"
     assert advisor._recovery_hint_active is False
 
-
-# ---------------------------------------------------------------------------
-# Test 7: saltrd_state_to_tsa_state maps all 5 SALTRDState values
-# ---------------------------------------------------------------------------
-
-def test_saltrd_state_to_tsa_state_all_states():
-    """saltrd_state_to_tsa_state() maps all 5 SALTRDState values without error."""
-    try:
-        from salt_r.advisor import SALTRDState
-    except ImportError:
-        pytest.skip("salt_r not available")
-
-    from uav_tracker.ml.tsa.saltrd_adapter import saltrd_state_to_tsa_state
-    from uav_tracker.ml.tsa.target_state import TargetState
-
-    mapping = {
-        SALTRDState.TRUSTED_TRACKING:      TargetState.CONFIRMED.value,
-        SALTRDState.LOW_EVIDENCE_TRACKING: TargetState.CONFIRMED.value,
-        SALTRDState.FALSE_CONFIRMED_RISK:  TargetState.OCCLUDED.value,
-        SALTRDState.PROACTIVE_DYNAMIC_RISK: TargetState.DYNAMIC.value,
-        SALTRDState.REACQUIRE_NEEDED:      TargetState.LOST.value,
-    }
-
-    for saltrd_s, expected_tsa in mapping.items():
-        result = saltrd_state_to_tsa_state(saltrd_s)
-        assert result == expected_tsa, (
-            f"SALTRDState.{saltrd_s.name} → expected {expected_tsa}, got {result}"
-        )
-
-
-# ---------------------------------------------------------------------------
-# Test 8: saltrd_state_to_tsa_state returns safe default for unknown state
-# ---------------------------------------------------------------------------
-
-def test_saltrd_state_to_tsa_state_unknown_returns_confirmed():
-    """saltrd_state_to_tsa_state() returns CONFIRMED (0) for unknown input."""
-    from uav_tracker.ml.tsa.saltrd_adapter import saltrd_state_to_tsa_state
-    from uav_tracker.ml.tsa.target_state import TargetState
-
-    # Pass a non-SALTRDState object — should return safe default CONFIRMED
-    result = saltrd_state_to_tsa_state("not_a_state")
-    assert result == TargetState.CONFIRMED.value, (
-        f"Unknown state should map to CONFIRMED ({TargetState.CONFIRMED.value}), got {result}"
-    )

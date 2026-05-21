@@ -23,8 +23,13 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from typing import TYPE_CHECKING
+
 from uav_tracker.registry import TRACKERS
 from uav_tracker.types import BBox, FrameContext, TrackState
+
+if TYPE_CHECKING:
+    from salt_r.actions import TrackerAction, ComputeAction, SearchAction
 
 logger = logging.getLogger(__name__)
 
@@ -41,7 +46,8 @@ _N_Z = 64              # 8×8 template tokens
 _N_X = 256             # 16×16 search tokens
 _START_LAYER = 5       # SGLA routes from layer 6 onward
 
-# Maps TargetState int → search_factor used for crop extraction in update_with_state()
+# Maps target state int → search_factor used for crop extraction in update_with_state()
+# (legacy API — new code uses update_with_action() instead)
 # SEARCH_SIZE stays 256px — search_factor expansion was tested (5.5× OCCLUDED, 6.0× LOST)
 # but caused localization precision loss on small UAV targets: the target appears smaller
 # in the 256px crop as factor increases, reducing center-offset map resolution.
@@ -57,7 +63,7 @@ _DEFAULT_SEARCH = 4.0
 _IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 _IMAGENET_STD  = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
-# Maps TargetState → (sgla_exit_layer, ce_keep_ratios)
+# Maps target state int → (sgla_exit_layer, ce_keep_ratios)
 # exit_layer: passed as template_token_num hint to SGLA MLP
 # ce_keep_ratios: [layer3, layer6, layer9] token keep fractions
 _STATE_COMPUTE_MAP = {
@@ -75,7 +81,7 @@ _STATE_COMPUTE_MAP = {
 #       (was using block i+1's weights — distribution mismatch)
 #   Q4: CTEM uses center 4×4 template tokens; CE unchanged but benefits from Q1/Q2
 # With these three fixes, CE at kr=0.50 gives MEAN=0.616 (+0.006 vs baseline 0.610).
-# Before fixes, CE at 0.50 gave MEAN=0.551 (TSA feedback loop from wrong scoring).
+# Before fixes, CE at 0.50 gave MEAN=0.551 (wrong scoring → feedback loop regression).
 _DEFAULT_COMPUTE = (11, [1.0, 1.0, 1.0])  # fallback: full computation
 
 
@@ -616,18 +622,19 @@ class SGLATracker:
     def update_with_state(self, frame: np.ndarray, target_state: int,
                           consecutive_occluded: int = 0,
                           prev_apce: float = 0.0) -> TrackState:
-        """Update tracker with TSA-conditioned CE token pruning and expanded search.
+        """Deprecated: Update tracker with state-conditioned CE token pruning.
 
-        For CONFIRMED state: ce_keep_ratio=0.5 → prune 50% search tokens at CE layers,
-            BUT only when prev_apce >= 100 (tracker confident last frame). If prev_apce < 100
-            the tracker was in a low-SNR state (re-acquisition, distractor confusion) and
-            needs full tokens to catch the marginal re-acquisition signal. This fixes the
-            truck1 regression: a single failed re-acquisition at frame 418 was caused by CE
-            pruning the marginal peak of the correct target passing through the search window.
-        For all other states: full computation (ce_keep_ratio=1.0).
+        DEPRECATED — use update_with_action() instead. This method accepts a
+        plain integer state code (0=CONFIRMED, 3=OCCLUDED, 4=LOST, etc.) that
+        was previously produced by TargetStateAssessor. TSA has been removed;
+        the production control loop now uses update_with_action() and
+        SALTRDController exclusively.
+
+        This stub is kept to avoid breaking any external callers. It continues
+        to function but will be removed in a future cleanup pass.
 
         Args:
-            consecutive_occluded: number of consecutive OCCLUDED frames so far.
+            consecutive_occluded: number of consecutive occluded frames so far.
             prev_apce: APCE from the previous frame (0.0 = unknown/startup).
                 CE pruning is disabled for CONFIRMED when prev_apce < 100.
         """
@@ -820,6 +827,42 @@ class SGLATracker:
             fh, fw = frame.shape[:2]
             self._salt_rd_advisor.step(ts, fh, fw, search_embedding=_emb)
         return ts
+
+    def update_with_action(self, frame: np.ndarray, action: "TrackerAction") -> "TrackState":
+        """Update tracker for one frame using a SALT-RD TrackerAction.
+
+        No thresholds. Template updates are handled by the runner based on
+        action.template. CE pruning is not yet validated; only ComputeAction.FULL
+        is used. Search center overrides (CENTER_ON_REINIT_HINT, FREEZE) are
+        wired before calling update(). Recovery is handled entirely by the runner.
+        """
+        from salt_r.actions import ComputeAction, SearchAction
+
+        # CE pruning not yet validated — keep FULL for now, warn for others
+        if action.compute != ComputeAction.FULL:
+            import warnings
+            warnings.warn(
+                f"CE pruning ({action.compute.value}) not validated; using FULL compute",
+                stacklevel=2,
+            )
+
+        # Wire search action BEFORE calling update()
+        if action.search == SearchAction.CENTER_ON_REINIT_HINT and action.bbox_hint is not None:
+            bh = action.bbox_hint  # (x, y, w, h)
+            cx = bh[0] + bh[2] / 2
+            cy = bh[1] + bh[3] / 2
+            self.override_search_center(cx, cy, bh[2], bh[3])
+        elif action.search == SearchAction.FREEZE:
+            # Freeze at last known position
+            last = self._state
+            if last is not None:
+                cx = last.x + last.w / 2
+                cy = last.y + last.h / 2
+                self.override_search_center(cx, cy, last.w, last.h)
+        # SearchAction.KEEP and SearchAction.EXPAND: let tracker use its default search
+
+        # Run standard update
+        return self.update(frame)
 
     def try_update_template(
         self,

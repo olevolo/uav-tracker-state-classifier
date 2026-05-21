@@ -103,9 +103,6 @@ APPEARANCE_MEMORIES: "Registry[Any]" = Registry("appearance_memory")
 MOTION_PREDICTORS: "Registry[Any]" = Registry("motion_predictor")
 ML_WARMERS: "Registry[Any]" = Registry("ml_warmer")
 
-# SALT — TSA registry
-TSA_ASSESSORS: "Registry[Any]" = Registry("tsa_assessor")
-
 
 __all__ = [
     "Registry",
@@ -119,5 +116,4 @@ __all__ = [
     "APPEARANCE_MEMORIES",
     "MOTION_PREDICTORS",
     "ML_WARMERS",
-    "TSA_ASSESSORS",
 ]
