@@ -29,10 +29,10 @@ motion_predictor:
   name: lstm_online
   enabled: false  # confirmed zero AUC benefit
 
-# SALT-RD learned controller — set checkpoint to enable live policy inference
+# SALT-RD learned controller
 saltrd:
-  enabled: false
-  checkpoint: null   # set to saltr/checkpoints/policy_reinit_v1/saltrd_policy_best.pt
+  enabled: true
+  checkpoint: saltr/checkpoints/policy_reinit_v1/saltrd_policy_best.pt
 
 dataset: uav123
 seed: 42
