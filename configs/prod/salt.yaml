@@ -1,11 +1,4 @@
-# SALT — Scene-Adaptive Learning Tracker
-# Full pipeline: SGLATrack + TSA routing + YOLOv8n recovery
-
-# SALT-RD phase gates — set to false to disable for ablation
-enable_ce: false
-enable_dynamic: false        # alias: motion_predictor.enabled already handles this
-enable_velocity_drift: false
-enable_salt_rd: false
+# SALT — SGLATrack + SALT-RD learned controller
 
 tracker:
   name: sglatrack
@@ -17,32 +10,15 @@ tracker:
   #   Q4: CTEM uses center 4×4 template (was mean of all 64)
   # CE at kr=0.50 gives MEAN=0.616 (+0.006 vs no-pruning 0.610).
   ce_loc: [3]
-  ce_keep_ratio_by_state:
-    CONFIRMED:       [0.5, 0.5, 0.5]   # 50% search tokens kept at layer 3
-    LOW_RES:         [1.0, 1.0, 1.0]
-    DYNAMIC:         [1.0, 1.0, 1.0]
-    OCCLUDED:        [1.0, 1.0, 1.0]
-    DISTRACTOR_RISK: [1.0, 1.0, 1.0]
-    LOST:            null               # detector takes over
-
-tsa:
-  device: auto
-  adapt_interval: 20
-  adapt_enabled: false
-  buffer_size: 100
-  motion_residual_threshold: 0.5
-  drift_threshold: 0.35
-  # Supervised MLP head trained on UAV123 with real SGLATrack features.
-  # Set to null to fall back to rule-based APCE histogram confidence.
-  weights_path: weights/tsa_head_uav123.pth
+  ce_keep_ratio: 0.50   # single value — no state-based routing
 
 detector:
   name: yolo26m_visdrone   # VisDrone fine-tuned YOLO26m — UAV-specific, 55% mAP@0.5
-  conf_threshold: 0.25     # low threshold for recovery — we filter by appearance anyway
+  conf_threshold: 0.25     # low threshold for recovery — filtered by controller action
 
 appearance_memory:
   name: cosine_memory
-  enabled: true  # needed for ref embedding in recovery guard (Guard 3)
+  enabled: true
   max_templates: 20
   forgetting_factor: 0.95
   store_interval: 10
@@ -51,9 +27,12 @@ appearance_memory:
 
 motion_predictor:
   name: lstm_online
-  enabled: false  # causes false DYNAMIC labels, zero AUC benefit
-  hidden_size: 32
-  seq_len: 10
+  enabled: false  # confirmed zero AUC benefit
+
+# SALT-RD learned controller — set checkpoint to enable live policy inference
+saltrd:
+  enabled: false
+  checkpoint: null   # set to saltr/checkpoints/policy_reinit_v1/saltrd_policy_best.pt
 
 dataset: uav123
 seed: 42

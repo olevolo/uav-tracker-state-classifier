@@ -192,8 +192,18 @@ class SALTRunner:
             try:
                 from salt_r.controller import SALTRDController
                 from salt_r.evidence import EvidenceExtractor
-                saltrd_controller = SALTRDController()
+                from salt_r.policy_model import SALTRDPolicyNet
+                checkpoint_path = saltrd_cfg.get("checkpoint")
+                policy_net = SALTRDPolicyNet.load(checkpoint_path) if checkpoint_path else None
+                if checkpoint_path and policy_net is None:
+                    _logger.warning("SALT-RD: checkpoint path set but load returned None")
+                saltrd_controller = SALTRDController(policy_net=policy_net)
                 evidence_extractor = EvidenceExtractor()
+                _logger.info(
+                    "SALT-RD controller active — checkpoint=%s  model=%s",
+                    checkpoint_path or "none",
+                    "loaded" if policy_net is not None else "NOOP fallback",
+                )
             except ImportError:
                 _logger.warning("SALT-RD controller not available — running without it")
 
