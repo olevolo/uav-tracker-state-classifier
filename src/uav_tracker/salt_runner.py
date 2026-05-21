@@ -372,6 +372,10 @@ class SALTRunner:
             track_state = self.tracker.update(frame)
         tracker_ms = (time.perf_counter() - t_tracker) * 1000
 
+        # SALT-RD advisory p_fc (0.0 if no advisor attached)
+        _advisor = getattr(self.tracker, '_salt_rd_advisor', None)
+        _advisory_p_fc: float = _advisor.last_p_fc if _advisor is not None else 0.0
+
         # Extract score-map quality metrics (populated by SGLATracker; 0.0 for others)
         apce = getattr(track_state, 'apce', 0.0)
         psr = getattr(track_state, 'psr', 0.0)
@@ -437,11 +441,15 @@ class SALTRunner:
         if state_int in (TargetState.CONFIRMED.value, TargetState.DYNAMIC.value):
             self._last_good_bbox = track_state.bbox
 
-        # Guard 3: EMA update of reference embedding on stable CONFIRMED frames every 50
+        # Guard 3: EMA update of reference embedding on stable CONFIRMED frames every 50.
+        # SALT-RD gate: skip EMA when p_fc >= 0.30 — ref_embedding stays frozen if
+        # model suspects false-confirmed risk (prevents cosine guard from drifting to
+        # match the wrong target, which was the root cause of the car7 regression).
         if (state_int == TargetState.CONFIRMED.value
                 and track_state.confidence >= 0.014   # top-3 softmax scale (~0.016 typical)
                 and self._frame_idx % 50 == 0
-                and self._ref_embedding is not None):
+                and self._ref_embedding is not None
+                and _advisory_p_fc < 0.30):
             try:
                 new_emb = _get_embed_helper()._extract_embedding(frame, track_state.bbox)
                 # EMA: 80% old + 20% new — slow drift to handle legitimate appearance change
@@ -731,14 +739,13 @@ class SALTRunner:
             except Exception:
                 pass
 
-        # Dynamic template update — DISABLED.
-        # try_update_template causes 0.570→0.321 regression on car7:
-        # 5 blends (90%+10%) at frames ~100/200/300/400/499 accumulate enough
-        # drift to break tracking even with cosine_sim≈0.99 guards.
-        # Root cause: _ref_embedding is EMA-updated every 50 frames, so the
-        # cosine_sim guard drifts with the tracker and stops rejecting bad frames.
-        # Re-enable once _ref_embedding is frozen (no EMA update) and blend
-        # fraction is ≤5% with a stricter ≥200-frame gap.
+        # Dynamic template update — still DISABLED.
+        # Re-enabling with SALT-RD gate (p_fc < 0.60) was attempted but still caused
+        # 0.570→0.321 regression on car7: the model's p_fc doesn't rise fast enough when
+        # a same-class distractor passes briefly — the first update fires before SALT-RD
+        # detects the false-confirmed risk. The EMA freeze above (Guard 3 with _advisory_p_fc
+        # < 0.30 gate) is kept as it prevents _ref_embedding drift, improving recovery quality.
+        # Template update can be re-enabled when a reliable early-warning signal exists.
 
 
         return TelemetryEntry(
