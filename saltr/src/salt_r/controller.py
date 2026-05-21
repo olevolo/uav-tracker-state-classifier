@@ -21,12 +21,21 @@ class SALTRDDecision:
 class SALTRDController:
     """
     Runtime controller. Takes EvidenceFrame, returns SALTRDDecision.
-    No TSA. No thresholds. No TargetState.
+    No TSA. No TargetState.
+
+    reinit_confidence_threshold: if > 0, fire REINIT when p(REINIT) >= threshold
+    regardless of argmax. Aligns live inference with rollout_policy.py simulation.
     """
 
-    def __init__(self, policy_net=None, feature_schema: str = FEATURE_SCHEMA_VERSION):
+    def __init__(
+        self,
+        policy_net=None,
+        feature_schema: str = FEATURE_SCHEMA_VERSION,
+        reinit_confidence_threshold: float = 0.0,
+    ):
         self._policy_net = policy_net
         self._feature_schema = feature_schema
+        self._reinit_confidence_threshold = reinit_confidence_threshold
         self._frame_idx = 0
 
     def reset(self) -> None:
@@ -81,6 +90,23 @@ class SALTRDController:
         search = self._decode_enum(action_logits.get("search"), SearchAction, SearchAction.KEEP)
         template = self._decode_enum(action_logits.get("template"), TemplateAction, TemplateAction.KEEP_CURRENT)
         recovery = self._decode_enum(action_logits.get("recovery"), RecoveryAction, RecoveryAction.NONE)
+
+        # Confidence threshold override: align with rollout_policy.py simulation.
+        # If p(REINIT) >= reinit_confidence_threshold, fire REINIT regardless of argmax.
+        # This is a model-output gate, not a tracking heuristic.
+        if self._reinit_confidence_threshold > 0.0:
+            rec_logits = action_logits.get("recovery")
+            if rec_logits is not None:
+                try:
+                    import torch
+                    import torch.nn.functional as F
+                    t = rec_logits if isinstance(rec_logits, torch.Tensor) else torch.tensor(rec_logits)
+                    rec_probs = F.softmax(t.detach().cpu().float().flatten(), dim=0)
+                    reinit_prob = rec_probs[2].item()  # index 2 = REINIT
+                    if reinit_prob >= self._reinit_confidence_threshold:
+                        recovery = RecoveryAction.REINIT
+                except Exception:
+                    pass  # fall back to argmax result
 
         # Candidate selection: pick highest-scored candidate if reinit is requested
         selected_candidate = None

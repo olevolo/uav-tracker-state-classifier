@@ -194,10 +194,14 @@ class SALTRunner:
                 from salt_r.evidence import EvidenceExtractor
                 from salt_r.policy_model import SALTRDPolicyNet
                 checkpoint_path = saltrd_cfg.get("checkpoint")
+                reinit_threshold = float(saltrd_cfg.get("reinit_threshold", 0.0))
                 policy_net = SALTRDPolicyNet.load(checkpoint_path) if checkpoint_path else None
                 if checkpoint_path and policy_net is None:
                     _logger.warning("SALT-RD: checkpoint path set but load returned None")
-                saltrd_controller = SALTRDController(policy_net=policy_net)
+                saltrd_controller = SALTRDController(
+                    policy_net=policy_net,
+                    reinit_confidence_threshold=reinit_threshold,
+                )
                 evidence_extractor = EvidenceExtractor()
                 _logger.info(
                     "SALT-RD controller active — checkpoint=%s  model=%s",

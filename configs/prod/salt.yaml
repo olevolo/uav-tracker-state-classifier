@@ -33,6 +33,9 @@ motion_predictor:
 saltrd:
   enabled: true
   checkpoint: saltr/checkpoints/policy_reinit_v1/saltrd_policy_best.pt
+  # Fire REINIT when p(REINIT) >= threshold — aligns live controller with
+  # rollout_policy.py simulation (oracle hard_delta +0.215 at T=0.85).
+  reinit_threshold: 0.85
 
 dataset: uav123
 seed: 42
