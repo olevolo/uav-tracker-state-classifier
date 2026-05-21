@@ -429,6 +429,110 @@ Evals: `saltr/results/eval_lodo_no_{uav123,dtb70,visdrone_sot}.json`
 
 **Template updates not actually firing:** `apce_threshold=220.0` in `salt_runner.try_update_template()` is never met (typical confirmed APCE=100–180). 5-gate guard is infrastructure-ready — threshold tuning delegated to architect. Zero AUC delta confirmed on full-length truck1/uav2.
 
+**⚠️ Architect investigation (session 9) — template update root cause fully diagnosed:**
+
+Lowering `apce_threshold=150`, `psr_threshold=500`, `min_interval=100` causes updates to fire.
+Tested 2-gate guard (Gate 1 p_fc≥0.60 + Gate 4 smap competition) as alternative to 5-gate.
+
+| Config | car7 AUC | Why |
+|---|---:|---|
+| 5-gate + apce=150 (committed) | **0.570** ✅ | Gate 3 (trusted_streak) blocks all updates |
+| 2-gate + apce=150 | 0.342 ❌ | Update at frame 237 (p_fc=0.599, smap=clean) passes |
+| no advisory | **0.570** ✅ | Template updates disabled = same result |
+
+**Real reason 5-gate works for v2_retrained:** Gate 3 (streak_required=5, fc_block_trusted=0.30) is
+**permanently closed** because v2_retrained's p_fc on car7 = 0.45–0.60 even on correct frames.
+Trusted streak never reaches 5 → zero updates fire → same as disabled.
+
+**Root cause is model calibration, not gate design.** v2_retrained calibrates car7 as
+LOW_EVIDENCE (p_fc 0.40–0.55) throughout. Any gate permitting updates at p_fc < 0.60 risks
+updating with ambiguous frames. Safe threshold for updates requires model with p_fc < 0.20 on
+clean frames. That is **v2.4+ work** after better calibration.
+
+**Diagnosis timeline (session 9):**
+1. `apce_threshold=220` → 0 calls to try_update_template (dead zone confirmed)
+2. `apce_threshold=150` + 5-gate → interval=200 blocks first 200 frames; all 5-gate-allowed frames
+   had frame_idx < 100 (warmup period with p_fc=0.0)
+3. `apce_threshold=150` + 5-gate + `min_interval=100` → updates fire at frame 100, 237 (p_fc~0.53)
+   but NOT via 5-gate — Gate 3 (streak=0) blocks them in the outer salt_runner check
+4. Outer check `not advisor.should_block_template_update()` at salt_runner line 754 is the real gate
+5. 2-gate removes Gate 3 → p_fc=0.599 frame passes outer check → update fires → regression
+
+**Conclusion: keep 5-gate + apce=150 + min_interval=100 as committed. Zero updates fire for
+v2_retrained (Gate 3 permanently closed). Infrastructure ready for v2.4+ model.**
+
+**Architect follow-up — entropy / threshold / calibration decision:**
+
+Entropy implementation itself is not obviously broken: both `update()` and `update_with_state()`
+compute response entropy the same way, after Hann window, using L1-normalised response-map mass
+(not softmax). However, entropy shows strong dataset shift and must not be used as a simple global
+threshold:
+
+| Split | entropy as high-risk signal for false_confirmed |
+|---|---:|
+| train | AUROC=0.744 |
+| val | AUROC=0.777 |
+| diagnostic | AUROC=0.364 (inverted) |
+
+For car7 specifically, entropy is useful as an update-safety signal: correct frames have mean
+entropy ≈2.72, bad IoU<0.2 frames ≈3.74. But correct car13 frames already sit around ≈3.20, so a
+global entropy threshold would over-block clean/easy sequences. Keep entropy as a learned feature,
+not as a hand threshold.
+
+Potential feature-parity issue to fix before any v2.4 training: online `SALTRDAdvisor.step()`
+updates rolling buffers before computing `apce_ratio_5/20`, `entropy_delta_5`, and
+`peak_margin_delta_5`, while offline `collect_features.py` computes those against previous frames
+only. This can shift live `p_fc` calibration. Build a shared feature builder or add a parity test:
+offline NPZ features must match online advisor features for the same sequence.
+
+Empirical `fc_block_trusted` shift is allowed only as a diagnostic, not as the final template-update
+solution. Current v2_retrained p_fc percentiles from `preds_all_v2_retrained.json` + IoU labels:
+
+| Frames | mean p_fc | p20 | p50 | p90 |
+|---|---:|---:|---:|---:|
+| all IoU>0.7 | 0.406 | 0.253 | 0.421 | 0.600 |
+| all IoU<0.2 | 0.571 | 0.489 | 0.592 | 0.682 |
+| building1 correct | 0.425 | 0.402 | 0.428 | 0.456 |
+| car13 correct | 0.544 | 0.520 | 0.553 | 0.578 |
+| car7 correct | 0.472 | 0.397 | 0.475 | 0.588 |
+| car7 bad | 0.553 | 0.529 | 0.548 | 0.614 |
+
+Implication: `fc_block_trusted=0.30` is too strict, but raising it to e.g. 0.38 is not a clean fix:
+car13 still will not become trusted, and car7 correct/risky frames overlap heavily. If testing a
+threshold shift, sweep `fc_block_trusted ∈ [0.35, 0.55]` and gate by: car7 AUC, update count,
+template corruption, car13/building1 no-regression. Do not commit a threshold-only fix.
+
+Temperature scaling is useful for probability calibration/ECE, but it cannot create discrimination
+where p_fc ranks overlap. Also note the math: for `sigmoid(logit / T)`, `T > 1` moves probabilities
+toward 0.5, while `T < 1` sharpens them away from 0.5. Since clean car13 and risky car7 can both sit
+around p_fc≈0.55, temperature scaling is not a template-update unlock mechanism. If calibrating
+runtime gates, prefer affine Platt calibration (`sigmoid(a*logit + b)`) only after feature parity is
+fixed.
+
+Correct v2.4 direction: add a separate `safe_to_update` head. `false_confirmed` answers “is the
+tracker on the wrong object now?”; template update needs “will updating the template now poison the
+future trajectory?”. A simple label
+`safe = iou>0.70 AND n_secondary==0 AND apce>150` is insufficient because it can mark the car7
+failure frame as safe. Use counterfactual replay labels instead:
+
+```python
+candidate_update = apce > 150 and psr > 500 and interval_ok
+
+safe_to_update = (
+    candidate_update
+    and iou_t > 0.70
+    and min_iou_next_20_without_update > 0.60
+    and update_replay_delta_auc_next_50 >= -0.01
+    and entropy_not_high_or_rising
+    and local_top2_ratio_low
+)
+```
+
+The update replay should actually simulate a template update at candidate frames and measure the
+next 20/50 frames vs no-update baseline. The car7 frame 237 case must become an explicit negative
+example. Gate actual updates using `safe_to_update > 0.80` for a 5-frame streak, plus
+`p_false_confirmed`/`p_ifd10` upper bounds.
+
 **Threshold sweep** (fc_block on val, per dataset):
 - Global optimum: **0.60** (current setting, no change needed)
 - VisDrone: 0.66 would drop msu 0.172→0.020 but coverage 0.742→0.330
@@ -711,7 +815,7 @@ At frame t=1, `_last_template_embedding` is unconditionally added to RAM as `sou
 | v2.3 eval diagnostic | `saltr/results/eval_diagnostic_v2_3_point.json` | ✅ AUROC=0.546 — KILL |
 | Threshold sweep (per-frame) | `saltr/results/shadow_mode_val_sweep.json` | ✅ fc_block=0.60 optimal globally |
 | Shadow mode 5-gate advisory | `saltr/results/shadow_mode_val_v2_retrained_5gate.json` | ✅ wrir=0, msu=0.081 → GO |
-| Full UAV123 benchmark (running) | `saltr/results/bench_uav123_full_{baseline,advisory}.log` | ⏳ baseline vs 5-gate advisory |
+| Full UAV123 benchmark | `saltr/results/bench_uav123_full_{baseline,advisory}.log` | ✅ baseline=0.673, advisory=0.673, delta=0.000 |
 
 ---
 
@@ -803,8 +907,11 @@ Phase 7: TSA → SALT-RD transition
 11. ✅ advisor.py + sglatrack.py wired — SALTRDAdvisor, step/veto/reset
 12. ✅ LODO generalization: all 3 held-out datasets pass gate (0.939/0.608/0.802 >> 0.598)
 13. ✅ Template update 5-gate temporal guard: car7 regression fixed, reinit veto added (Stage 2 complete)
-14. ⏳ Template update actually firing: apce>220 threshold never met in practice — threshold tuning for architect
-15. ⏳ Full UAV123 benchmark (123 seqs, no cap): running, logs in saltr/results/bench_uav123_full_*.log
+14. ✅ Template update investigation (session 9): apce=150 + 2-gate → regression confirmed; 5-gate works
+    via Gate 3 permanently blocking v2_retrained (p_fc 0.45–0.60, streak never reaches 5); model
+    calibration issue — v2.4+ task
+15. ⏳ Full UAV123 benchmark result: advisory vs baseline (logs running)
+15. ✅ Full UAV123 benchmark (123 seqs, no cap): baseline=0.673, advisory=0.673 → Delta 0.000 — Gate 3 diagnosis confirmed
 16. ⏳ TSA-to-SALT-RD migration: Shadow → Advisory/Veto → Primary Learned Controller
 ```
 
@@ -830,32 +937,54 @@ STATE:
     saltr/results/bench_uav123_full_advisory.log
   Check these first — if advisory >= 0.720, template update infrastructure is validated.
 
-COMPLETED THIS SESSION (session 8):
+COMPLETED THIS SESSION (session 8–9):
 1. 5-gate temporal guard for template updates — car7 regression fixed (0.321→0.570)
 2. Reinit veto — advisor.should_block_reinit() wired into salt_runner Guard5
 3. Stage 2 architecturally complete: template veto + reinit veto + EMA freeze
 4. Threshold sweep: fc_block=0.60 confirmed globally optimal, no change needed
 5. fast_bench: --max-frames, --all-sequences, --advisory-fc-block added
-6. Template updates not actually firing (apce>220 threshold never met) — FOR ARCHITECT
+6. Template update investigation (session 9):
+   - apce_threshold lowered 220→150, min_interval 200→100 (committed)
+   - 2-gate tested: Gate 1 (p_fc≥0.60) + Gate 4 (smap competition) — REJECTED
+   - Result: 2-gate allows update at frame 237 (p_fc=0.599, smap=clean) → car7=0.342
+   - Root cause: v2_retrained p_fc = 0.45–0.60 on clean car7 frames (LOW_EVIDENCE)
+   - 5-gate works because Gate 3 (trusted_streak<5, fc_block_trusted=0.30) is permanently
+     closed for v2_retrained — zero updates fire, same as disabled template update
+   - Entropy checked: implementation is consistent, but entropy is dataset-shifted
+     (val fc AUROC=0.777, diagnostic fc AUROC=0.364 inverted). Keep as learned feature,
+     not hand threshold.
+   - Empirical `fc_block_trusted` shift is diagnostic-only: p_fc correct/risky frames overlap
+     too much (`car7` correct p50=0.475, bad p50=0.548; `car13` correct p50=0.553).
+   - Temperature scaling can improve ECE but cannot unlock safe template updates when ranking
+     overlap is this strong.
+   - Conclusion: keep 5-gate as-is; actual template updates require v2.4 `safe_to_update`
+     head trained from counterfactual update replay labels.
 
 OPEN ITEMS:
-- apce_threshold in salt_runner.try_update_template(): currently 220 (unreachable)
-  Architect to decide: lower to 150? 5-gate guard is in place to prevent car7 regression.
-- Full UAV123 benchmark result: check logs above
+- Full UAV123 benchmark result (123 seqs, no cap): check bench_uav123_full_{baseline,advisory}.log
+- Before v2.4: fix online/offline feature parity in `SALTRDAdvisor.step()` rolling
+  ratios/deltas; train/eval must match live inference.
+- Template update for v2.4+: add `safe_to_update` head. Do not unlock template updates by
+  threshold-shifting `p_fc` alone. Label from counterfactual replay: simulate candidate
+  template updates and mark harmful updates (e.g. car7 frame 237) as negative.
 - Per-dataset fc_block: UAV123=0.60, DTB70=0.62, VisDrone=0.66 (see threshold sweep)
   fast_bench --advisory-fc-block supports per-dataset tuning without code changes
 
-KEY INFRASTRUCTURE (all in place):
+KEY INFRASTRUCTURE (all in place, committed):
 - SALTRDAdvisor: advisor.py, 5-gate guard, notify_template_updated(), should_block_reinit()
 - sglatrack.py: set_salt_rd_advisor(), advisor.step() in update_with_state(), veto in try_update_template()
-- salt_runner.py: template update call (gated by 5-gate), reinit veto, EMA freeze
+- salt_runner.py: template update call (apce=150, min_interval=100, gated by 5-gate outer check),
+  reinit veto, EMA freeze (p_fc<0.30)
 - fast_bench.py: --advisory, --advisory-fc-block, --max-frames, --all-sequences
 
 LIVE ADVISORY CHECKPOINT: saltr/checkpoints/v2_corrected/saltrd_best.pt (28-dim, v2_retrained)
 
 RED LINES (permanent):
 - v2_retrained = strict baseline (diag 0.598, val 0.885)
-- Template update thresholds (apce>220): ARCHITECT DECISION
+- Template update: DO NOT change 5-gate gates or thresholds for v2_retrained — Gate 3 is the safe lock
+  Wait for v2.4 `safe_to_update` counterfactual head before enabling actual template updates
+- Do not use global entropy threshold for update safety; entropy is useful but shifts/inverts on diagnostic
+- Do not use temperature scaling or `fc_block_trusted` threshold shift as final template-update fix
 - v2.3 LK point = KILLED
 - CoTracker3 = DROPPED
 - Neg memory: never include
