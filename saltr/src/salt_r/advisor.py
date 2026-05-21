@@ -171,6 +171,19 @@ class SALTRDAdvisor:
         # Outputs
         self._last_p_fc: float = 0.0
 
+        # Template safety — 5-gate temporal guard
+        self._p_fc_history:   deque[float]              = deque(maxlen=5)
+        self._smap_history:   deque[tuple[float, float]] = deque(maxlen=5)  # (n_sec, top2_ratio)
+        self._trusted_streak: int   = 0      # consecutive frames with p_fc < fc_block_trusted
+        self._last_tmpl_frame: int  = -100   # cooldown reference
+
+        self.fc_block_trusted: float = 0.30   # strict gate for streak requirement
+        self.fc_block_reinit:  float = 0.70   # reinit veto threshold (more conservative than template update)
+        self.tmpl_cooldown:    int   = 15     # min frames between updates (~0.5s at 30fps)
+        self.streak_required:  int   = 5      # consecutive TRUSTED_TRACKING frames needed
+        self.delta_block:      float = 0.08   # p_fc rise over 3 frames (rising edge)
+        self.smap_top2_block:  float = 0.72   # competing secondary peak ratio threshold
+
         # Monitoring
         self.n_blocked: int = 0
         self.n_allowed: int = 0
@@ -193,6 +206,10 @@ class SALTRDAdvisor:
         self._current_frame = 0
         self._window.clear()
         self._last_p_fc = 0.0
+        self._p_fc_history.clear()
+        self._smap_history.clear()
+        self._trusted_streak = 0
+        self._last_tmpl_frame = -100
 
     def step(
         self,
@@ -353,20 +370,78 @@ class SALTRDAdvisor:
 
         if len(self._window) < self._window_size:
             self._last_p_fc = 0.0
+            self._p_fc_history.append(0.0)
+            top2_ratio = float(sms.get("local_top2_ratio", 0.0))
+            self._smap_history.append((n_sec, top2_ratio))
+            self._trusted_streak += 1  # treat warmup frames as trusted
             return 0.0
 
         window = np.stack(list(self._window), axis=0)  # (window_size, total_dim)
         probs = self._model.predict_single(window, device=self.device)
         self._last_p_fc = float(probs.get("false_confirmed", 0.0))
+
+        # Update temporal safety buffers (after p_fc computed)
+        self._p_fc_history.append(self._last_p_fc)
+        top2_ratio = float(sms.get("local_top2_ratio", 0.0))
+        self._smap_history.append((n_sec, top2_ratio))
+        if self._last_p_fc < self.fc_block_trusted:
+            self._trusted_streak += 1
+        else:
+            self._trusted_streak = 0
+
         return self._last_p_fc
 
+    def notify_template_updated(self, frame_idx: int) -> None:
+        """Call after any successful template update to reset safety context."""
+        self._last_tmpl_frame = frame_idx
+        self._trusted_streak  = 0   # evidence from before the update is stale
+
     def should_block_template_update(self) -> bool:
-        """Return True if template update should be vetoed."""
+        """5-gate template safety check. ALL gates must pass to allow update.
+
+        Gate 1 — absolute p_fc >= fc_block (0.60): GRU already confident, hard block.
+        Gate 2 — rising edge: p_fc rising fast over 3 frames (catches distractor onset
+                  before GRU window accumulates full evidence).
+        Gate 3 — trusted streak: need streak_required (5) consecutive TRUSTED frames
+                  (p_fc < 0.30) since last uncertainty or update. Rejects any update
+                  during or immediately after an uncertain period.
+        Gate 4 — score map competition: n_secondary >= 1 AND strong secondary peak in
+                  last 3 frames. Direct spatial signal — fires the frame distractor appears.
+        Gate 5 — post-update cooldown: tmpl_cooldown (15) frames after any update.
+        """
+        # Gate 1 — absolute p_fc
         if self._last_p_fc >= self.fc_block:
             self.n_blocked += 1
             return True
+
+        # Gate 2 — rising edge: delta over last 3 frames
+        hist = list(self._p_fc_history)
+        if len(hist) >= 3 and (hist[-1] - hist[-3]) > self.delta_block:
+            self.n_blocked += 1
+            return True
+
+        # Gate 3 — trusted streak requirement
+        if self._trusted_streak < self.streak_required:
+            self.n_blocked += 1
+            return True
+
+        # Gate 4 — score map competition (n_secondary + strong top2_ratio)
+        for n_sec, top2r in list(self._smap_history)[-3:]:
+            if n_sec >= 1 and top2r >= self.smap_top2_block:
+                self.n_blocked += 1
+                return True
+
+        # Gate 5 — post-update cooldown
+        if (self._current_frame - self._last_tmpl_frame) < self.tmpl_cooldown:
+            self.n_blocked += 1
+            return True
+
         self.n_allowed += 1
         return False
+
+    def should_block_reinit(self) -> bool:
+        """Block reinit when p_fc is high — tracker is false-confirmed, not lost."""
+        return self._last_p_fc >= self.fc_block_reinit
 
     @property
     def last_p_fc(self) -> float:

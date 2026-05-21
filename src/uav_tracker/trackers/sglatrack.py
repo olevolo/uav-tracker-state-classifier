@@ -867,6 +867,8 @@ class SGLATracker:
         self._z_tensor = z_new
         self._template_last_update = frame_idx
         self._template_update_count += 1
+        if self._salt_rd_advisor is not None:
+            self._salt_rd_advisor.notify_template_updated(frame_idx)
         logger.debug(
             "SGLATracker: template snapshot #%d at frame %d "
             "(apce=%.1f psr=%.1f cosine=%.3f)",

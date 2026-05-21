@@ -662,6 +662,14 @@ class SALTRunner:
                                 )
                                 self._lost_cooldown = 40
                                 self._prev_tsa_state_int = TargetState.OCCLUDED.value
+                            elif _advisor is not None and _advisor.should_block_reinit():
+                                # SALT-RD: p_fc >= fc_block_reinit — tracker likely false-confirmed, skip reinit
+                                _logger.debug(
+                                    "SALT-RD advisory: blocking reinit at frame %d (p_fc=%.3f)",
+                                    self._frame_idx, _advisory_p_fc,
+                                )
+                                self._lost_cooldown = 25
+                                self._prev_tsa_state_int = TargetState.OCCLUDED.value
                             else:
                                 self.tracker.init(frame, winner)
                                 track_state = TrackState(
@@ -739,13 +747,24 @@ class SALTRunner:
             except Exception:
                 pass
 
-        # Dynamic template update — still DISABLED.
-        # Re-enabling with SALT-RD gate (p_fc < 0.60) was attempted but still caused
-        # 0.570→0.321 regression on car7: the model's p_fc doesn't rise fast enough when
-        # a same-class distractor passes briefly — the first update fires before SALT-RD
-        # detects the false-confirmed risk. The EMA freeze above (Guard 3 with _advisory_p_fc
-        # < 0.30 gate) is kept as it prevents _ref_embedding drift, improving recovery quality.
-        # Template update can be re-enabled when a reliable early-warning signal exists.
+        # Dynamic template update — gated by SALTRDAdvisor 5-gate temporal guard.
+        # Previous p_fc<0.60 gate caused car7 0.570→0.321 regression: distractor appeared
+        # before GRU accumulated evidence. New 5-gate guard catches rising edge and
+        # score-map competition at t=1–2, before damage occurs.
+        if (_advisor is not None
+                and not _advisor.should_block_template_update()
+                and state_int == TargetState.CONFIRMED.value):
+            _sw = getattr(self.tracker, '_last_search_score_weighted', None)
+            _te = getattr(self.tracker, '_last_template_embedding', None)
+            if _sw is not None and _te is not None:
+                _cosine = float(_cosine_sim(_sw.cpu().numpy(), _te.cpu().numpy()))
+            else:
+                _cosine = 1.0
+            self.tracker.try_update_template(
+                frame, track_state.bbox, apce, psr, self._frame_idx, _cosine,
+                apce_threshold=150.0, psr_threshold=500.0,
+                min_interval=100, cosine_threshold=0.80, max_updates=3,
+            )
 
 
         return TelemetryEntry(
