@@ -613,3 +613,693 @@ recovery signal.
 | TSA module tree | OK — deleted |
 | `registry.py` | OK |
 | Unit tests | OK — 46/46 pass |
+
+---
+
+## Review — 2026-05-22 Pass 5 (10-min cycle)
+
+### [OK] `saltr/data` restored — Phase 0 blocker resolved
+
+`saltr/data/` is now a real directory containing `salt_rd_v2_labels.npz` (17.6 MB),
+restored from `saltr/tmp/oof/fold_00.npz`. The circular symlink that blocked oracle
+rerun and training is gone.
+
+Caveat: fold_00 may not include all 18 hard sequences. 4 sequences (bike2, Gull2,
+Sheep1, StreetBasketball1) were absent from the prior oracle audit. They may live in
+val/diagnostic splits of other folds. Verification needed before starting Phase 6.
+
+### [OK] `oracle_action_audit_full.json` — reinit oracle confirmed clean
+
+224 sequences audited. Reinit oracle: +0.083 hard (14 seqs), +0.025 full, **zero
+harmful sequences**. All other actions (search_expand, template_update, center_freeze)
+confirmed KILL. The signal is clean and the ceiling is above the +0.010 full-set gate.
+
+Per-sequence the biggest gains are uav6 (+0.229), uav5 (+0.179), uav4 (+0.164) —
+exactly the sequences where Phase 8 TSA routing also moved AUC. This validates the
+causal path.
+
+### [OK] Training Run 0 in progress — epoch 5 best, metrics ahead of target
+
+`production_no_flow/saltrd_best.pt` at epoch 5:
+- Val fc AUROC: **0.885**, AUPRC: **0.363** — already exceeds the prior ablation
+  target (0.883 / 0.350). Good sign; training to 60 epochs should hold or improve.
+- `drop_feature_indices`: [22,23,24,25,26,27] — correctly saved.
+
+### [BUG-4] `feature_schema` string not saved in checkpoint
+
+`train.py` saves `drop_feature_indices` but not `feature_schema`. Checkpoint inspection
+shows `feature_schema: NOT SET`. SUPER_PLAN Section B and D require:
+```json
+"feature_schema": "saltrd_v3_no_tsa_no_flow"
+```
+Without this, any code that validates checkpoint schema by name will fail or silently
+skip validation. Proposal: add one line to `train.py` checkpoint save block.
+
+### [WRONG DIRECTION-6] `phase4_recommendation.next` says "rule-based reinit"
+
+`oracle_action_audit_full.json` line:
+```json
+"next": "Implement conservative rule-based reinit (Phase 5)"
+```
+This is the oracle script's auto-generated recommendation, not the plan. SUPER_PLAN
+explicitly forbids rule-based reinit. The correct next step is Phase 5 oracle label
+generation followed by Phase 6 learned policy training. Do not implement rule-based
+reinit under any name.
+
+### [BUG-3] `image_shape` still not passed — `dist_to_border` (index 21) still zero
+
+No change since Pass 4. `dist_to_border` remains zero at runtime. Low urgency but
+should be proposed before Phase 6 training begins, so the feature is non-zero in the
+rollout distribution that generates training feedback.
+
+---
+
+### Updated state summary
+
+| Component | Status |
+|---|---|
+| `actions.py` | OK |
+| `feature_schema.py` | OK |
+| `evidence.py` | OK — BUG-3 (dist_to_border zero, minor) |
+| `controller.py` | OK |
+| `salt_runner._step()` | OK — controller-driven, TSA-free |
+| Feature vector completeness | OK — 27/28 (index 21 zero, BUG-3) |
+| `sglatrack.update_with_action()` | WRONG DIRECTION-5 — stub |
+| `sglatrack.update_with_state()` | Deprecated, tolerated |
+| TSA module tree | OK — deleted |
+| `registry.py` | OK |
+| `saltr/data` | OK — restored |
+| Oracle audit | OK — confirmed reinit, zero harmful |
+| Training Run 0 | IN PROGRESS — epoch 5, metrics on target |
+| Checkpoint `feature_schema` | BUG-4 — NOT SET, proposal pending |
+| Rule-based reinit risk | WRONG DIRECTION-6 — oracle script says rule-based; ignore |
+| Unit tests | OK — 46/46 pass |
+
+---
+
+## Review — 2026-05-22 Pass 6
+
+### [OK] WRONG DIRECTION-5 resolved — `update_with_action()` is now fully wired
+
+`sglatrack.py` `update_with_action()` now dispatches:
+- `CENTER_ON_REINIT_HINT` + `bbox_hint` → `override_search_center(cx, cy, w, h)`
+- `FREEZE` → `override_search_center()` on `self._state` (last known position)
+- `KEEP` / `EXPAND` → default tracker search (EXPAND is KILL per plan, so no-op is correct)
+- Import of `salt_r.actions` is lazy inside the method body → coupling issue resolved
+
+Template action dispatch is intentionally absent from `update_with_action()` — it is
+handled entirely in the runner. Recovery is handled entirely in the runner. This matches
+the plan architecture. 9 action API tests pass.
+
+### [OK] Training Run 0 complete — checkpoint metrics on target
+
+`production_no_flow/saltrd_best.pt` (epoch 5, best val):
+- Val fc AUROC: **0.8854**, AUPRC: **0.3611** (eval) — exceeds prior ablation target
+- `drop_feature_indices` [22–27] correctly saved
+- Early stopping at epoch 13 (val AUPRC peaked epoch ~5–6 then declined)
+
+Note: commit message states "best val AUPRC = 0.3775" but checkpoint inspection and
+eval both show 0.3634 / 0.3611. One-off documentation discrepancy; checkpoint and eval
+results are authoritative.
+
+### [BUG-4] `feature_schema` still NOT SET in checkpoint (unchanged)
+
+No fix landed in commit 02783af or 5b4b686. Train.py saves `drop_feature_indices` but
+not `feature_schema = "saltrd_v3_no_tsa_no_flow"`. Runtime schema validation has a
+blind spot. Proposal from Pass 5 still stands.
+
+### [BLOCKER-NEW] 4 hard diagnostic sequences absent from ALL 5 OOF folds — data pipeline root cause identified
+
+All 5 folds (fold_00 through fold_04) are missing `uav123/bike2`, `dtb70/Gull2`,
+`dtb70/Sheep1`, `dtb70/StreetBasketball1`. Root cause confirmed in
+`saltr/src/salt_r/collect_features.py` lines 172–179:
+
+```python
+DIAGNOSTIC_SEQUENCES = frozenset({
+    "uav0000164",
+    "bike2",          # UAV123: identity-loss hard case
+    "Gull2",          # DTB70: hard case
+    "Sheep1",         # DTB70: hard case
+    "StreetBasketball1",  # DTB70: hard case
+})
+```
+
+These sequences are permanently assigned to the "diagnostic" split and are **excluded
+from OOF fold rotation by design**. They exist only in the original full-dataset NPZ
+(the pre-symlink `salt_rd_v2_labels.npz`) which was lost when the circular symlink was
+introduced and only fold_00 was restored.
+
+Consequence: oracle audit ran on 220 sequences (224 minus 4 diagnostic); oracle reinit
+ceiling is +0.083 on 14 non-diagnostic hard sequences. The 4 diagnostic sequences
+(hardest identity/distractor cases) contribute zero to training loss and zero to oracle
+calibration. A learned policy trained on fold_00 has no opportunity to learn reinit for
+distractor scenes.
+
+**Two recovery paths:**
+
+Option A — Restore original NPZ from backup/raw extraction:
+```bash
+# Find if original full NPZ exists elsewhere
+find . -name "salt_rd_v2*.npz" -not -path "*/oof/*" 2>/dev/null
+find . -name "v2_corrected*.npz" -o -name "v2_labels*.npz" 2>/dev/null | grep -v oof
+```
+
+Option B — Re-extract diagnostic sequences from raw video:
+```bash
+# collect_features.py can extract individual sequences if raw data is available
+PYTHONPATH=src:saltr/src .venv/bin/python saltr/src/salt_r/collect_features.py \
+  --sequences uav123/bike2 dtb70/Gull2 dtb70/Sheep1 dtb70/StreetBasketball1 \
+  --output saltr/data/diagnostic_sequences.npz
+# Then merge with salt_rd_v2_labels.npz
+```
+
+This is a BLOCKER for Phase 5 (oracle reinit labels) — training without these sequences
+will produce a model blind to the hardest recovery scenarios.
+
+### [BUG-5] Diagnostic AUROC 0.911 is not comparable to prior ablation 0.697
+
+`eval_diagnostic_production_no_flow.json`: fc AUROC = **0.911**. Prior ablation target
+was **0.697**. The delta is +0.214 AUROC, which cannot be explained by model improvement
+alone. Root cause: fold_00 "diagnostic" split (37 sequences) does NOT include the 4
+hardest DIAGNOSTIC_SEQUENCES — they are absent from the NPZ entirely. The diagnostic
+split in fold_00 is a weaker, non-canonical subset. The 0.697 result was measured on
+the true diagnostic split that included bike2/Gull2/Sheep1/StreetBasketball1.
+
+**Do not use 0.911 as a benchmark claim.** Any paper result must be measured on the
+canonical diagnostic split with all 4 hard sequences present.
+
+---
+
+### Updated state summary
+
+| Component | Status |
+|---|---|
+| `actions.py` | OK |
+| `feature_schema.py` | OK |
+| `evidence.py` | OK — BUG-3 (dist_to_border, minor) |
+| `controller.py` | OK |
+| `salt_runner._step()` | OK — controller-driven, TSA-free |
+| `sglatrack.update_with_action()` | OK — SearchAction wired, lazy import |
+| TSA module tree | OK — deleted and archived |
+| Training Run 0 | OK — complete, val AUROC 0.885 / AUPRC 0.361 |
+| Checkpoint `feature_schema` | BUG-4 — NOT SET |
+| Diagnostic AUROC 0.911 | BUG-5 — inflated, non-canonical split |
+| 4 missing hard sequences | BLOCKER — absent from all 5 folds, data restore needed |
+| Oracle ceiling | PARTIAL — +0.083 on 14/18 seqs, must rerun after data restore |
+| Unit tests | OK — 46+ passing |
+
+---
+
+## Review — 2026-05-22 Pass 7
+
+### [OK] Phase 5–9 pipeline committed (commit e6d8db8)
+
+New scripts: `oracle_actions.py`, `policy_model.py`, `train_policy.py`,
+`calibrate_policy.py`, `rollout_policy.py`. 449 tests passing (22 new).
+
+### [OK] BUG-4 resolved in policy checkpoint
+
+`saltr/checkpoints/policy_reinit_v1/saltrd_policy_best.pt` contains
+`feature_schema: saltrd_v3_no_tsa_no_flow`. The policy training script saves schema
+correctly. Note: the production_no_flow risk checkpoint (train.py) still does NOT save
+`feature_schema` — that is a separate issue in `train.py`, not fixed here.
+
+### [OK] Oracle labels generated — GO signal confirmed
+
+`reinit_oracle_dataset.npz`: 155,375 frames, 3,845 reinit positives = **2.47%** base
+rate. Exceeds the SUPER_PLAN stop condition threshold of 0.5%. GO on training.
+
+Splits:
+- training ("diagnostic"): 125,463 frames, 2,843 reinit positives (2.27%)
+- validation ("val"): 29,912 frames, 1,002 reinit positives (3.35%)
+
+### [BUG-7] `train_policy.py` split name fix applied in working tree
+
+Original code used `split="train"` but oracle NPZ only has "diagnostic" and "val"
+splits. Fixed to `split="diagnostic"` in the working tree. Not yet committed. Training
+is proceeding correctly with this fix.
+
+### [BLOCKER-TRAINING] Policy epoch 3: reinit_recall=0.005 — near-zero, monitoring required
+
+Checkpoint progression:
+| Epoch | macro_F1 | reinit_recall | reject_prec | val_loss |
+|---:|---:|---:|---:|---:|
+| 1 | 0.2452 | 0.0000 | 0.9620 | 0.1664 |
+| 3 | 0.2477 | 0.0050 | 0.9621 | 0.1509 |
+
+Training continues to epoch 80 (patience=10). Class weights are correctly set:
+`w_reinit ≈ 40` (inverse frequency, capped at 50), `w_reject ≈ 0.025`.
+
+The model IS learning (recall went from 0 to 0.005), but very slowly. The
+reinit recall gate is **>= 0.40** per SUPER_PLAN. Monitor epoch 10–20 for trajectory.
+
+**Decision rule:** if reinit_recall < 0.05 at epoch 10, training is failing to
+overcome the imbalance and interventions are needed (see BUG-8 remediation below).
+If recall >= 0.10 by epoch 20, on track.
+
+### [BUG-8] Oracle label skew: 97% reject — candidate quality problem on hard sequences
+
+Oracle dataset class distribution:
+- REINIT: 2.47% (3,845 frames)
+- REJECT_REINIT: 97.01% (150,724 frames)
+- NONE: 0.52% (~806 frames)
+
+Nearly every frame evaluated for recovery is labeled REJECT_REINIT because available
+candidates (score-map / detector) are not close enough to the target to produce positive
+utility. Hard sequences (uav3, uav4, uav5, uav6, uav7) all have **negative max_utility**:
+
+| Sequence | Max utility | Oracle audit gain | Root cause |
+|---|---:|---:|---|
+| uav123/uav3 | -0.050 | +0.088 | no adequate detector candidates |
+| uav123/uav4 | -0.042 | +0.164 | no adequate detector candidates |
+| uav123/uav5 | +0.037 | +0.179 | minimal candidate coverage |
+| uav123/uav6 | -0.045 | +0.229 | no adequate detector candidates |
+| uav123/uav7 | -0.049 | +0.067 | no adequate detector candidates |
+
+**Interpretation:** the oracle audit uses "reinit to GT bbox" (oracle-best). The oracle
+label dataset uses "reinit to best available candidate bbox." For uav3-7, no available
+candidate is close enough to GT to produce positive utility — so these sequences
+contribute ZERO reinit-positive labels. A policy trained on this dataset will learn to
+reinit in easy cases (car7, truck2, person sequences) but will never fire on the hardest
+UAV identity-loss scenes.
+
+**Required fix (after monitoring current training run):**
+1. Improve detector candidate recall on uav-class sequences (detector fine-tune or
+   score-map top-k candidates instead of detector-only)
+2. OR re-generate oracle labels including score-map derived candidates, not only detector
+3. OR use the oracle audit GT bbox as the reinit target in labels (upper-bound training signal)
+
+This is the most important open issue for reaching the +0.10 hard AUC gate.
+
+---
+
+### Updated state summary
+
+| Component | Status |
+|---|---|
+| Phase 1–4 architecture | OK — TSA-free, controller-driven |
+| Phase 5 oracle labels | OK — generated, 2.47% base rate |
+| Phase 6 policy model | OK — SALTRDPolicyNet with GRU, action heads |
+| train_policy.py split fix | BUG-7 — in working tree, needs commit |
+| Policy training | IN PROGRESS — epoch 3/80, reinit_recall=0.005 |
+| Reinit recall on hard seqs | BUG-8 — uav3-7 have zero candidate-based labels (point tracker needed) |
+| Candidate quality (uav class) | BUG-8 — YOLO misses small UAVs; point-tracker candidates are the fix |
+| `feature_schema` in risk ckpt | BUG-4 — still NOT SET in production_no_flow/saltrd_best.pt |
+| 4 diagnostic hold-out seqs | OK — intentional by design; evaluate separately as blind test |
+| Unit tests | OK — 449 passing |
+
+---
+
+## Correction — Pass 7 diagnostic sequences framing
+
+The BLOCKER tag applied to the 4 missing sequences (bike2, Gull2, Sheep1,
+StreetBasketball1) was **wrong framing**. HANDOFF_NEXT.md confirms these are
+intentional diagnostic hold-outs excluded from fold rotation by design. Correct approach:
+
+- **Train** on 220 sequences (canonical folds)
+- **Evaluate separately** on the 4 diagnostic hold-outs as a blind generalization test
+- **Do not include** them in training decisions or oracle labeling
+- **Do not block** training because they are absent from folds
+
+The "BLOCKER" in the previous pass was tunnel vision. These sequences are the hardest
+stress test, not a missing data problem.
+
+### Broader picture from HANDOFF_NEXT.md
+
+The candidate quality problem on uav3-7 (zero YOLO candidates close to target) is
+already the known open problem from prior sessions. The HANDOFF documents the solution
+direction:
+
+> Next work should move to **external/teacher candidate verification**:
+> CoTracker3/TAPIR point consistency + candidate-aware DINO/DAM-style memory
+
+Relevant papers in `papers/`:
+- `05_CoTracker3_Pseudo_Labeling_Real_Videos.pdf` — point tracking with temporal consistency; can track the target point even when bbox is uncertain
+- `06_DINO_Tracker_Taming_DINO_for_Self_Supervised_Point_Tracking.pdf` — frozen DINO features for identity-consistent point tracking
+- `04_Verifier_Guided_Pseudo_Labeling_Point_Tracking.pdf` — verification framework for point tracking labels
+
+These point-tracking approaches generate candidates that are temporally consistent
+(unlike one-shot YOLO detections) and could fill the candidate gap for uav3-7.
+
+The current BUG-8 (near-zero YOLO candidates for UAV targets) is a valid issue that
+will limit AUC gain on the hardest sequences. But it is not a blocker for training —
+the current oracle labels cover 220 sequences with real positive signal. A model trained
+on these will generalize to uav-class scenes as a first test, and point-tracker
+candidates can be added in a second iteration.
+
+### BUG-8 Revised: approach, not blocker
+
+The correct framing:
+1. **Current training run** (Run 1): train on 220-sequence oracle labels using YOLO candidates. This will achieve recall on "easy" reinit cases (car, person, group scenes).
+2. **Evaluate on uav hard set**: run rollout on uav2-uav8, expect partial gain.
+3. **Gap analysis**: if hard UAV sequences show zero bbox changes → confirm candidate quality is the bottleneck.
+4. **Next iteration** (Run 2): add CoTracker3/score-map candidates to oracle labels, retrain. Expect gain on uav3-7.
+
+This two-run strategy is cleaner than blocking on candidate quality before any training signal.
+
+---
+
+## Dead Code Audit — 2026-05-22
+
+Full dead-code scan across `src/uav_tracker/` and `saltr/src/salt_r/`. Move files tagged **UNUSED** to `./garbage/`. Files tagged **TEST-ONLY** or **SCRIPT-ONLY** may remain but are not production-critical.
+
+### Task for engineer: move to `./garbage/`
+
+These have zero callers in production and no test coverage worth keeping:
+
+| File | What it defines | Why dead |
+|---|---|---|
+| `src/uav_tracker/ml/ttt/__init__.py` | empty namespace | TTT feature killed; `test_no_tsa_runtime.py` bans it |
+| `src/uav_tracker/ml/ttt/head_adaptor.py` | `HeadAdaptor`, loss functions | TTT never instantiated anywhere |
+| `src/uav_tracker/ml/difficulty_predictor/base.py` | `DifficultyPredictor` Protocol | No caller in any test or script |
+| `src/uav_tracker/ml/difficulty_predictor/regression_predictor.py` | `MLPDifficultyPredictor` | Registry entry never fires |
+| `src/uav_tracker/ml/difficulty_predictor/__init__.py` | re-exports above | No caller |
+| `src/uav_tracker/training/augmentation.py` | `UAVAugmentPipeline` | Never called by any file anywhere |
+
+### TEST-ONLY — keep but do not extend
+
+These are used by tests or were part of v2 pipeline that is now superseded:
+
+| File | Note |
+|---|---|
+| `src/uav_tracker/ml/scene_classifier/` (whole dir) | Disabled in `_PLUGIN_MODULES`; v2 only |
+| `src/uav_tracker/ml/warmer/` (whole dir) | Disabled in `_PLUGIN_MODULES`; v2 only |
+| `src/uav_tracker/schedulers/ml_scene_scheduler.py` | Commented out of production init |
+| `src/uav_tracker/signals/tracker_confidence.py` | Registered but never built in production |
+| `src/uav_tracker/signals/motion_entropy.py` | V2 pipeline; superseded by SALT-RD features |
+| `src/uav_tracker/detectors/yolo.py` | Registration commented out; replaced by yolo26m |
+| `saltr/src/salt_r/policy.py` | Old TrackerAction; superseded by `actions.py` |
+| `saltr/src/salt_r/interventions.py` | Old action types; superseded by `actions.py` |
+| `saltr/src/salt_r/integrate.py` | Old integration wrapper; superseded by `controller.py` |
+| `saltr/src/salt_r/memory.py` | Proxy memory approach (killed after ablation) |
+| `saltr/src/salt_r/memory_features.py` | Companion to `memory.py` |
+| `saltr/src/salt_r/eprocess.py` | Analysis only; 3.1% recall, not a runtime gate |
+| `saltr/src/salt_r/policy_sweep.py` | V2 policy sweep; superseded |
+| `saltr/src/salt_r/make_oof_predictions.py` | OOF helper; test-only |
+
+### SCRIPT-ONLY — keep for reproducibility
+
+These are standalone CLI scripts, valid as research tools:
+
+`advisor.py`, `shadow_mode.py`, `center_freeze_sweep.py`, `action_audit.py`,
+`oracle_action_audit.py`, `oracle_actions.py`, `make_safe_to_update_labels.py`,
+`baselines.py`, `diagnose_labels.py`, `train_policy.py`, `calibrate_policy.py`,
+`rollout_policy.py`, `src/uav_tracker/training/label_generator.py`,
+`src/uav_tracker/datasets/uav123_ml.py`
+
+### USED in production
+
+`actions.py`, `controller.py`, `evidence.py`, `feature_schema.py`, `model.py`,
+`policy_model.py`, `train.py`, `eval.py`, `collect_features.py`,
+`src/uav_tracker/ml/motion_predictor/lstm_predictor.py` (disabled by config but code path exists),
+`src/uav_tracker/ml/appearance_memory/cosine_memory.py`,
+`src/uav_tracker/schedulers/multi_tier.py`,
+`src/uav_tracker/signals/optical_flow.py`,
+`src/uav_tracker/signals/global_motion.py`
+
+---
+
+## HANDOFF_NEXT Approach Analysis — What Worked, What Didn't, What to Try Next
+
+### ✅ Worked
+
+| Approach | Result | Key number |
+|---|---|---|
+| 28-dim telemetry GRU risk model (v2_retrained) | Valid false-confirmed signal | Val fc AUROC 0.885, Diag 0.598 |
+| Proxy memory pos-only (RAM) | +0.176 diag AUROC gain | Diag 0.598 → 0.774 (89% of full memory gain) |
+| LODO cross-dataset generalization | All 3 held-out pass gate | 0.939/0.608/0.802 >> 0.598 baseline |
+| Stage 2 advisory/veto | wrir=0, msu=0.081 | GO confirmed |
+| No-flow schema (v3) | +0.099 diag AUROC vs v2_retrained | Diag 0.598 → 0.697 (ablation); 0.911 on weak fold |
+| LK point tracking gate | Passes diagnostic gate 0.65 | `pt_inside_pred_ratio` AUROC 0.729 on diagnostic |
+| Oracle reinit audit | Confirms reinit is the only AUC path | +0.083 hard AUC oracle gain |
+| Phase 1–4 SALT-RD architecture | TSA removed, controller loop clean | 449 tests passing |
+
+### ❌ Killed / Did Not Work
+
+| Approach | Result | Why killed |
+|---|---|---|
+| Real SGLATrack embeddings (score_weighted) | Diag AUROC 0.584 < 0.598 baseline | DeiT-tiny search tokens = localization, not identity |
+| Real SGLATrack embeddings (peak_local) | Identical to score_weighted | Same root cause |
+| DINOv2 ROI identity (CLS/patch_mean, 5 variants) | Diag 0.514–0.563, all FAIL gate | Generic crop similarity fails on Gull2/organic scenes |
+| SGLATrack top-K score-map candidates | Overall top-5 recall@0.3 = 0.298; bike2/Gull2/SB1 = 0.000 | Target absent from score map during false-confirmed |
+| CoTracker3 point teacher | KILLED — 8–16 GB RAM crash, marginal +0.019 over LK | Not edge-deployable |
+| LK point sidecar + v2.3 training (33-dim) | Diag AUROC 0.546 < 0.598 baseline | LK features don't generalize from UAV123 train → hard DTB70 diag |
+| Full memory (37-dim, neg+pos) | Diag 0.796 but val AUPRC 0.243 (too low) | Best on diag, worst on val — overfit signal |
+| Negative memory only | Diag AUROC 0.496 (sub-random) | Harmful without positive context |
+| TSA-based SALT-RD Stage 3 routing | Hard AUC +0.046 but rejected architecture | Uses TargetState integers and handcrafted thresholds |
+| Phase 7 p_fc/APCE threshold recovery | Hard AUC -0.036 regression | Threshold policy causes regressions on standard sequences |
+| Center-freeze | ~0.000 hard AUC gain | Target already moved far from frozen position at FC time |
+| Advisory mode delta | Full UAV123: baseline=0.673, advisory=0.673 | Advisory/veto has no trajectory effect without action execution |
+
+### ⏳ Next approaches to try (from papers/)
+
+Current training (Run 1) will reveal the candidate quality gap. If uav3-7 show zero bbox
+changes in rollout, the following approaches address it (in priority order):
+
+| Approach | Paper | Why promising | Estimated effort |
+|---|---|---|---|
+| **Score-map top-k as reinit target** | — (internal) | Score map has target when YOLO doesn't; already extracted | Low — modify oracle_actions.py |
+| **LK point consistency as reinit trigger** | `papers/05_CoTracker3_*.pdf` (LK proxy) | `pt_inside_pred_ratio` AUROC 0.729 on diag; passed Phase 5A gate | Medium — wire into oracle label generation |
+| **Verifier-guided pseudo-labeling** | `papers/04_Verifier_Guided_Pseudo_Labeling_Point_Tracking.pdf` | Point tracks verify candidates temporally | Medium — implement teacher offline |
+| **DINO-Tracker frozen features for candidate identity** | `papers/06_DINO_Tracker_*.pdf` | Frozen DINO for self-supervised point tracking; no finetuning | Medium — need to confirm Gull2 case |
+| **DAM4SAM-style target-vs-distractor margin** | `papers/DAM4SAM_*.pdf` (reference_dam4sam_paper.md) | Lightweight distractor-aware memory, not full SAM2 | High — needs candidate source first |
+| **ORTrack backbone (occlusion-robust ViT)** | `papers/08_ORTrack_*.pdf` | Better base tracker for hard UAV occlusion scenes | High — full tracker replacement |
+
+**Red lines from HANDOFF_NEXT (permanent):**
+- No training on diagnostic sequences (bike2, Gull2, Sheep1, StreetBasketball1, uav0000164)
+- No negative memory
+- No CoTracker3 (RAM crash)
+- No global entropy threshold (dataset shift, inverted on diagnostic)
+- No temperature scaling as template-update unlock
+- v2_retrained = strict baseline for all gates (diag 0.598, val 0.885)
+- Per-dataset reporting mandatory for all GO/KILL decisions
+
+---
+
+## Task: Full Benchmark + Video + FPS/GFLOPs (for engineer)
+
+**Priority:** medium — needed before any paper submission claim.
+
+### What needs to be built / run
+
+1. **Full UAV123 benchmark** (all 123 sequences, no frame cap):
+   - Already has `fast_bench.py` with `--all-sequences --max-frames 0`
+   - Needs to run against: SGLATrack baseline, SALT-RD no-flow risk-only, SALT-RD learned reinit v1
+   - Output: per-sequence AUC table + hard subset delta
+
+2. **VisDrone-SOT and DTB70 benchmarks** (new, not yet run):
+   - Same `fast_bench.py` or new `bench_visdrone.py` / `bench_dtb70.py`
+   - Required for paper (per-dataset reporting is mandatory per HANDOFF_NEXT red lines)
+
+3. **FPS measurement**:
+   - Tracker-only FPS (SGLATrack full compute, CE kr=0.50)
+   - SALT-RD inference overhead (GRU + evidence extractor per frame)
+   - Total system FPS
+   - Measure on Apple MPS and CPU separately
+
+4. **GFLOPs per frame**:
+   - SGLATrack forward pass GFLOPs (full vs CE pruned)
+   - SALT-RD policy model GFLOPs
+   - Total per-frame budget
+   - `thop` or `fvcore` for flop counting
+
+5. **Visualization video**:
+   - Overlay: predicted bbox (green), GT bbox (gray), SALT-RD action indicator (color coded)
+   - Action color code: FULL=white, REINIT=red, SCORE_CANDIDATES=orange, NOOP=none
+   - Per-frame telemetry: APCE, p_fc, reinit_recall, changed_bbox
+   - Relevant sequences: uav6 (+0.229 reinit oracle), uav4, uav8, car7, bike2
+   - Output: MP4, 30fps, 640×480 or 1280×720
+
+### Code that already exists and should be extended
+
+- `scripts/fast_bench.py` — baseline + advisory benchmark (adapt for SALT-RD learned controller)
+- `scripts/hard_bench.py` — hard subset benchmark (adapt for policy rollout)
+- `saltr/src/salt_r/rollout_policy.py` — already generates per-sequence AUC delta (use as basis for benchmark)
+- `src/uav_tracker/trackers/sglatrack.py` — has FPS timing in `update()` already
+
+### Proposed new script: `scripts/benchmark_full.py`
+
+```python
+# Usage:
+# PYTHONPATH=src:saltr/src .venv/bin/python scripts/benchmark_full.py \
+#   --dataset uav123 --split all --no-cap \
+#   --checkpoint saltr/checkpoints/policy_reinit_v1/saltrd_policy_best.pt \
+#   --output saltr/results/benchmark_uav123_policy_reinit_v1.json \
+#   --report-fps --report-gflops
+
+# Outputs per-sequence: AUC, Pr@20, FPS, changed_bbox_frames, action_distribution
+# Outputs aggregate: hard_mean_auc, full_mean_auc, fps_mean, gflops_mean
+```
+
+### Proposed new script: `scripts/visualize_sequence.py`
+
+```python
+# Usage:
+# PYTHONPATH=src:saltr/src .venv/bin/python scripts/visualize_sequence.py \
+#   --sequence uav123/uav6 \
+#   --checkpoint saltr/checkpoints/policy_reinit_v1/saltrd_policy_best.pt \
+#   --output saltr/results/viz_uav6_policy_reinit_v1.mp4 \
+#   --show-actions --show-telemetry
+```
+
+---
+
+## Requirement: Per-Dataset Training, Eval, Calibration, Results
+
+HANDOFF_NEXT red line: **pooled val is not enough; per-dataset reporting is mandatory.**
+
+### What this means for every experiment going forward
+
+Every `eval.py` run must produce and report:
+
+| Dataset | AUC gate | Notes |
+|---|---|---|
+| UAV123 | Primary benchmark; 123 seqs | Full + hard subset |
+| VisDrone-SOT | Secondary; drone footage | Different domain from UAV123 |
+| DTB70 | Hard; includes Gull2/Sheep1 | Lowest AUROC typically |
+
+**Required fields in every result JSON:**
+```json
+{
+  "head_metrics": { "false_confirmed": {"auroc": ..., "auprc": ...} },
+  "per_dataset_head_metrics": {
+    "uav123":      {"false_confirmed": {"auroc": ..., "auprc": ...}},
+    "visdrone_sot": {"false_confirmed": {"auroc": ..., "auprc": ...}},
+    "dtb70":       {"false_confirmed": {"auroc": ..., "auprc": ...}}
+  }
+}
+```
+
+**Gate: a result only counts as GO if ALL THREE datasets pass the gate, not just the pooled average.**
+
+### Training: LODO already validates this
+
+From HANDOFF_NEXT: LODO (leave-one-dataset-out) models all pass per-dataset gates:
+- LODO no-UAV123: UAV123 OOD AUROC = 0.939 (generalization confirmed)
+- LODO no-DTB70: DTB70 OOD AUROC = 0.608 (lowest; expected due to harder dynamics)
+- LODO no-VisDrone: VisDrone OOD AUROC = 0.802
+
+For the **policy model** (Train Run 1+), per-dataset results are not yet available.
+Required before calling any policy training GO:
+```bash
+PYTHONPATH=src:saltr/src .venv/bin/python -m salt_r.rollout_policy \
+  --checkpoint saltr/checkpoints/policy_reinit_v1/saltrd_policy_best.pt \
+  --split hard --datasets uav123 visdrone_sot dtb70 \
+  --output saltr/results/rollout_hard_policy_reinit_v1_perdataset.json
+```
+
+### Calibration: also per-dataset
+
+Temperature scaling on val pooled may hide per-dataset ECE drift.
+Required calibration check per dataset before any production rollout.
+
+---
+
+## Engineer Task List (summary of all open engineering tasks)
+
+| # | Task | Priority | Files involved |
+|---|---|---|---|
+| 1 | Move `garbage/` files (see dead code list above) | High | 6 UNUSED files → `./garbage/` |
+| 2 | Commit `train_policy.py` split fix (`"train"` → `"diagnostic"`) | High | `saltr/src/salt_r/train_policy.py` |
+| 3 | Add `feature_schema` to `train.py` checkpoint save | Medium | `saltr/src/salt_r/train.py` |
+| 4 | Pass `image_shape=frame.shape[:2]` to extractor in runner | Medium | `src/uav_tracker/salt_runner.py` |
+| 5 | Implement `scripts/benchmark_full.py` (per-dataset, FPS, GFLOPs) | Medium | new script |
+| 6 | Implement `scripts/visualize_sequence.py` (bbox overlay + action video) | Medium | new script |
+| 7 | Add per-dataset reporting to `rollout_policy.py` | Medium | `saltr/src/salt_r/rollout_policy.py` |
+| 8 | Run VisDrone-SOT + DTB70 benchmarks on policy v1 | Medium | after policy converges |
+| 9 | Implement event-balanced oversampling in `OracleReinitDataset` | ~~Medium~~ **RESOLVED** — epoch 34 recall 0.73 | `saltr/src/salt_r/train_policy.py` |
+| 10 | Regenerate oracle labels with score-map top-k candidates | High (for Run 2) | `saltr/src/salt_r/oracle_actions.py` |
+| 11 | Wire `update_with_action()` search/template/recovery fully in sglatrack | Medium | `src/uav_tracker/trackers/sglatrack.py` |
+
+---
+
+## Review — 2026-05-22 Pass 8
+
+### [OK] Commit 0633a9e — full TSA/state residue purge
+
+Everything TSA-related removed from production files:
+- `sglatrack.py`: `_STATE_COMPUTE_MAP`, `_STATE_SEARCH_MAP`, `update_with_state()` (~210 lines gone)
+- `advisor.py`: `SALTRDState` enum, `get_state(tsa_state_int)`, `stage3_policy(tsa_state_int)` removed
+- `salt_runner.py`, `shadow_mode.py`: OCCLUDED/LOST/CONFIRMED strings purged from comments/docstrings
+
+Production grep for forbidden patterns: **0 hits** in `sglatrack.py`, **comment-only** in `salt_runner.py` and `advisor.py` (docstrings referencing old API in examples — no functional code).
+
+25 no-TSA and action API tests pass.
+
+### [OK] train_policy.py split fix committed
+
+`split="diagnostic"` (the correct training pool) is now committed in the same 0633a9e commit.
+`inverse-frequency class weights (REINIT×43, REJECT×0.023)` also committed.
+
+### [OK] Policy training converged — epoch 34, reinit_recall = 0.73
+
+| Epoch | reinit_recall | macro_F1 | val_loss | reject_prec |
+|---:|---:|---:|---:|---:|
+| 1 | 0.000 | 0.245 | 0.166 | 0.962 |
+| 3 | 0.005 | 0.248 | 0.151 | 0.962 |
+| **34** | **0.730** | **0.262** | **0.727** | **0.986** |
+
+**Recall 0.73 >> SUPER_PLAN gate of 0.40.** Model fires reinit on 73% of oracle-positive
+frames. Reject precision 0.986 — model is conservative: when it does NOT predict reinit,
+it's almost always correct not to.
+
+Gate status before rollout: **GO on recall. ROLLOUT NOW REQUIRED.**
+
+### [BUG-COSMETIC] TSA words remain in advisor.py/salt_runner.py docstrings
+
+`advisor.py` lines 20-21, 276, 464 contain `update_with_state()` in docstring examples and
+`LOST` in a comment. `salt_runner.py` line 750 has `# Last known position before LOST state`
+comment. These are documentation artifacts with zero functional impact. They do not affect
+behavior. Not blocking.
+
+### [NOTE] FROZEN.md conflict — SUPER_PLAN supersedes
+
+`FROZEN.md` (2026-05-19) says `update_with_state()` must be preserved for CE ablation.
+Commit 0633a9e removed it. The SUPER_PLAN (2026-05-22) explicitly requires this removal.
+SUPER_PLAN is the newer architectural authority. FROZEN.md is stale and should itself be
+archived. The CE ablation is still possible via config (`enable_ce: false`) — the method
+was not the only ablation path.
+
+### [ACTION REQUIRED] Rollout evaluation — gates 1, 2, 3 all unverified
+
+Recall = 0.73 proves the model fires correctly. But the SUPER_PLAN gates require:
+- Hard subset AUC delta >= +0.10 (or +0.08 interim)
+- Full AUC delta >= +0.010
+- Changed bbox frames > 0.5%
+
+None of these are measured yet. `rollout_policy.py` exists and is ready. Run:
+
+```bash
+# Diagnostic split (contains hard seqs uav2/uav4/uav6/uav8 + many others)
+PYTHONPATH=src:saltr/src .venv/bin/python -m salt_r.rollout_policy \
+  --oracle saltr/results/reinit_oracle_dataset.npz \
+  --checkpoint saltr/checkpoints/policy_reinit_v1/saltrd_policy_best.pt \
+  --split diagnostic \
+  --output saltr/results/rollout_diagnostic_policy_reinit_v1.json
+
+# Val split (held-out — checks for wrong reinit on non-hard sequences)
+PYTHONPATH=src:saltr/src .venv/bin/python -m salt_r.rollout_policy \
+  --oracle saltr/results/reinit_oracle_dataset.npz \
+  --checkpoint saltr/checkpoints/policy_reinit_v1/saltrd_policy_best.pt \
+  --split val \
+  --output saltr/results/rollout_val_policy_reinit_v1.json
+```
+
+These two runs are the **single most important missing experiment**.
+
+---
+
+### Updated state summary
+
+| Component | Status |
+|---|---|
+| TSA in production code | OK — zero functional references (comments only) |
+| `update_with_state()` | OK — removed per SUPER_PLAN |
+| `SALTRDState` / `stage3_policy()` | OK — removed |
+| Policy training | OK — epoch 34, recall=0.73, READY FOR ROLLOUT |
+| Rollout diagnostic split | **MISSING — highest priority** |
+| Rollout val split | **MISSING — needed for wrong-reinit check** |
+| Hard subset AUC delta | NOT MEASURED — rollout needed |
+| Changed bbox frames | NOT MEASURED — rollout needed |
+| Calibration | NOT RUN — after rollout GO only |
+| FROZEN.md | STALE — superseded by SUPER_PLAN, archive it |
