@@ -381,6 +381,14 @@ class SALTRunner:
         _template_updated: bool = False
         _reinit_vetoed: bool = False
 
+        # Stage 3: Get SALT-RD primary state when advisor attached
+        _saltrd_policy: dict | None = None
+        _saltrd_state = None
+        if _advisor is not None:
+            _tsa_int = self._prev_tsa_state_int
+            _saltrd_policy = _advisor.stage3_policy(_tsa_int)
+            _saltrd_state = _saltrd_policy['state']
+
         # Extract score-map quality metrics (populated by SGLATracker; 0.0 for others)
         apce = getattr(track_state, 'apce', 0.0)
         psr = getattr(track_state, 'psr', 0.0)
@@ -794,6 +802,11 @@ class SALTRunner:
             _aux["salt_rd_template_attempted"] = _template_attempted
             _aux["salt_rd_template_updated"] = _template_updated
             _aux["salt_rd_reinit_vetoed"] = _reinit_vetoed
+            # Stage 3: SALT-RD primary state telemetry
+            if _saltrd_policy is not None:
+                _aux["saltrd_state"] = _saltrd_policy['state'].value
+                _aux["saltrd_allow_ce"] = _saltrd_policy['allow_ce_pruning']
+                _aux["saltrd_force_full"] = _saltrd_policy['force_full_compute']
 
         return TelemetryEntry(
             frame_idx=self._frame_idx,
