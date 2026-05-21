@@ -53,9 +53,11 @@ class SALTRDController:
         if not np.isfinite(features).all():
             return self._safe_noop(reason="features_not_finite")
 
-        # Run model (policy_net is a callable: features -> dict of outputs)
+        # Run model — convert numpy (28,) to tensor (1, 1, 28) for GRU forward
         try:
-            output = self._policy_net(features)
+            import torch
+            x = torch.tensor(features, dtype=torch.float32).unsqueeze(0).unsqueeze(0)
+            output = self._policy_net(x)
         except Exception as e:  # noqa: BLE001
             return self._safe_noop(reason=f"model_error:{e}")
 
@@ -63,7 +65,15 @@ class SALTRDController:
 
     def _decode_output(self, output: dict[str, Any], evidence: EvidenceFrame) -> SALTRDDecision:
         """Decode raw model output dict into a SALTRDDecision."""
-        risk_probs = output.get("risk_probs", {})
+        # Convert any tensor values to plain Python floats
+        def _to_float(v: Any) -> float:
+            try:
+                return float(v)
+            except Exception:
+                return 0.0
+
+        raw_risk = output.get("risk_probs", {})
+        risk_probs = {k: _to_float(v) for k, v in raw_risk.items()}
         action_logits = output.get("action_logits", {})
 
         # Argmax decode per action head
@@ -110,18 +120,25 @@ class SALTRDController:
 
     @staticmethod
     def _decode_enum(logits, enum_cls, default):
-        """Argmax decode logits dict -> enum value. Falls back to default on error."""
-        if not logits:
+        """Argmax decode logits tensor/array/dict -> enum value. Falls back to default on error."""
+        if logits is None:
             return default
         try:
+            # Convert torch tensor to numpy
+            try:
+                import torch
+                if isinstance(logits, torch.Tensor):
+                    logits = logits.detach().cpu().numpy().flatten()
+            except ImportError:
+                pass
             if isinstance(logits, dict):
                 best_key = max(logits, key=logits.__getitem__)
                 return enum_cls(best_key)
-            # If it's a list/array, index by position using enum order
+            # list/array: argmax by position using enum order
             idx = int(np.argmax(logits))
             members = list(enum_cls)
             return members[idx] if idx < len(members) else default
-        except (ValueError, IndexError, TypeError):
+        except (ValueError, IndexError, TypeError, RuntimeError):
             return default
 
     def _safe_noop(self, reason: str = "") -> SALTRDDecision:
