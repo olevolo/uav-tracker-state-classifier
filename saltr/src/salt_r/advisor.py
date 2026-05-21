@@ -146,6 +146,8 @@ class SALTRDAdvisor:
         checkpoint: str,
         device: str = "cpu",
         fc_block: float = _FC_BLOCK_DEFAULT,
+        freeze_max_frames: int = 20,
+        freeze_release_pfc: float = 0.35,
     ) -> None:
         self.device = device
         self.fc_block = fc_block
@@ -156,10 +158,12 @@ class SALTRDAdvisor:
             sys.path.insert(0, _src)
 
         from salt_r.model import build_model
+        from salt_r.feature_schema import apply_feature_schema as _apply_schema
         import torch as _torch
 
         self._model = build_model(checkpoint, device=device)
         self._model.eval()
+        self._apply_schema = _apply_schema
 
         ck = _torch.load(checkpoint, map_location="cpu")
         self._window_size: int = int(ck.get("window_size", 20))
@@ -169,6 +173,10 @@ class SALTRDAdvisor:
         )
         self._n_features: int = int(ck.get("n_features", 28))
         self._total_dim: int = self._n_features + self._extra_dim
+
+        # Feature schema: auto-applied from checkpoint metadata
+        self._drop_feature_indices: list[int] = list(ck.get("drop_feature_indices", []))
+        self._feature_schema: str = ck.get("feature_schema", "legacy_v2")
 
         # Rolling buffers for base features (max 25 so apce_ratio_20 works)
         self._apce_buf:   deque[float] = deque(maxlen=25)
@@ -211,6 +219,17 @@ class SALTRDAdvisor:
         self.n_allowed: int = 0
         self.n_steps:   int = 0
 
+        # Center-freeze state (Stage 3 / Phase 5)
+        self._last_good_bbox: tuple[float, float, float, float] | None = None  # (cx,cy,w,h)
+        self._freeze_active: bool = False
+        self._freeze_frame_count: int = 0
+        self._freeze_max_frames: int = freeze_max_frames
+        self._freeze_release_pfc: float = freeze_release_pfc
+
+        # Last gate reason — updated by should_block_template_update()
+        # Values: gate1_pfc | gate2_rise | gate3_streak | gate4_smap | gate5_cool | allowed | not_attempted
+        self._last_gate_reason: str = "not_attempted"
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -236,6 +255,11 @@ class SALTRDAdvisor:
         self.n_blocked = 0
         self.n_allowed = 0
         self.n_steps = 0
+        # Reset center-freeze state
+        self._last_good_bbox = None
+        self._freeze_active = False
+        self._freeze_frame_count = 0
+        self._last_gate_reason = "not_attempted"
 
     def step(
         self,
@@ -379,6 +403,11 @@ class SALTRDAdvisor:
             flow_iou, flow_residual, flow_consistency,
         ], dtype=np.float32)  # (28,)
 
+        # Apply feature schema before window append (flow indices zeroed for
+        # saltrd_v2_online_no_flow schema — prevents train/inference mismatch)
+        if self._drop_feature_indices:
+            base = self._apply_schema(base, self._drop_feature_indices)
+
         # ------------------------------------------------------------------
         # 6. RAM memory features (4) — compute BEFORE updating RAM
         # ------------------------------------------------------------------
@@ -442,36 +471,155 @@ class SALTRDAdvisor:
         # Gate 1 — absolute p_fc
         if self._last_p_fc >= self.fc_block:
             self.n_blocked += 1
+            self._last_gate_reason = "gate1_pfc"
             return True
 
         # Gate 2 — rising edge: delta over last 3 frames
         hist = list(self._p_fc_history)
         if len(hist) >= 3 and (hist[-1] - hist[-3]) > self.delta_block:
             self.n_blocked += 1
+            self._last_gate_reason = "gate2_rise"
             return True
 
         # Gate 3 — trusted streak requirement
         if self._trusted_streak < self.streak_required:
             self.n_blocked += 1
+            self._last_gate_reason = "gate3_streak"
             return True
 
         # Gate 4 — score map competition (n_secondary + strong top2_ratio)
         for n_sec, top2r in list(self._smap_history)[-3:]:
             if n_sec >= 1 and top2r >= self.smap_top2_block:
                 self.n_blocked += 1
+                self._last_gate_reason = "gate4_smap"
                 return True
 
         # Gate 5 — post-update cooldown
         if (self._current_frame - self._last_tmpl_frame) < self.tmpl_cooldown:
             self.n_blocked += 1
+            self._last_gate_reason = "gate5_cool"
             return True
 
         self.n_allowed += 1
+        self._last_gate_reason = "allowed"
         return False
 
     def should_block_reinit(self) -> bool:
         """Block reinit when p_fc is high — tracker is false-confirmed, not lost."""
         return self._last_p_fc >= self.fc_block_reinit
+
+    def update_center_freeze(self, bbox: Any, apce: float) -> bool:
+        """Update freeze state and return whether freeze is currently active.
+
+        Call AFTER step() so we have the latest p_fc.
+
+        Args:
+            bbox: current tracker bbox (BBox with x,y,w,h attributes or similar)
+            apce: current APCE value
+
+        Returns:
+            True if freeze should be active this frame.
+        """
+        p = self._last_p_fc
+
+        # Update last_good_bbox when tracker is trusted
+        if p < 0.30 and apce > 100.0:
+            cx = float(getattr(bbox, 'x', 0) + getattr(bbox, 'w', 1) / 2)
+            cy = float(getattr(bbox, 'y', 0) + getattr(bbox, 'h', 1) / 2)
+            bw = float(getattr(bbox, 'w', 1))
+            bh = float(getattr(bbox, 'h', 1))
+            self._last_good_bbox = (cx, cy, bw, bh)
+
+        # Activate freeze
+        if not self._freeze_active:
+            if p >= self.fc_block and self._last_good_bbox is not None:
+                self._freeze_active = True
+                self._freeze_frame_count = 0
+
+        # Maintain / release freeze
+        if self._freeze_active:
+            self._freeze_frame_count += 1
+            should_release = (
+                p < self._freeze_release_pfc
+                or self._freeze_frame_count >= self._freeze_max_frames
+            )
+            if should_release:
+                self._freeze_active = False
+                self._freeze_frame_count = 0
+
+        return self._freeze_active
+
+    @property
+    def center_freeze_bbox(self) -> tuple[float, float, float, float] | None:
+        """Return last-good center as (cx,cy,w,h) when freeze is active, else None."""
+        if self._freeze_active and self._last_good_bbox is not None:
+            return self._last_good_bbox
+        return None
+
+    def should_trigger_early_recovery(self) -> bool:
+        """Return True when SALT-RD detects imminent failure before TSA declares LOST.
+
+        Trigger when:
+        - p_fc >= 0.55 (moderate false-confirmed risk)
+        - AND APCE_ratio5 < 0.75 (APCE degrading relative to recent history)
+
+        This fires earlier than TSA's LOST declaration, giving the system
+        time to prepare a spatially-constrained recovery.  Intentionally does
+        NOT check whether recovery is already in progress — the caller is
+        responsible for that guard.
+        """
+        p = self._last_p_fc
+        # apce_r5 is computed inside step() and NOT stored; recompute from buffer.
+        buf = list(self._apce_buf)
+        if len(buf) >= 5:
+            hist = buf[-5:]
+            mean_hist = float(np.mean(hist)) if hist else 1.0
+            current = buf[-1] if buf else 0.0
+            apce_r5 = current / (mean_hist + 1e-8) if mean_hist > 1e-8 else 1.0
+        else:
+            apce_r5 = 1.0  # not enough history — treat as stable
+        return p >= 0.55 and apce_r5 < 0.75
+
+    def get_recovery_crop_bbox(
+        self,
+        frame_h: int,
+        frame_w: int,
+        expand_factor: float = 3.0,
+    ) -> "tuple[float, float, float, float] | None":
+        """Return (x, y, w, h) crop bbox for spatially-constrained detector.
+
+        Uses the advisor's last known good bbox (from ``_prev_bbox`` which stores
+        (cx, cy, bw, bh) after each step() call) expanded by *expand_factor*.
+        Returns ``None`` if no reference bbox is available yet.
+
+        Parameters
+        ----------
+        frame_h, frame_w:
+            Frame dimensions for clamping the crop to valid pixel coordinates.
+        expand_factor:
+            Multiplier applied to each side of the reference bbox (default 3.0).
+
+        Returns
+        -------
+        (x, y, w, h) in pixel coordinates clamped to [0, frame_w) × [0, frame_h),
+        or ``None`` when ``_prev_bbox`` is ``None``.
+        """
+        if self._prev_bbox is None:
+            return None
+
+        cx, cy, bw, bh = self._prev_bbox
+        crop_w = bw * expand_factor
+        crop_h = bh * expand_factor
+
+        x = max(0.0, cx - crop_w / 2)
+        y = max(0.0, cy - crop_h / 2)
+        w = min(crop_w, float(frame_w) - x)
+        h = min(crop_h, float(frame_h) - y)
+
+        if w <= 0 or h <= 0:
+            return None
+
+        return (x, y, w, h)
 
     # ------------------------------------------------------------------
     # Stage 3: Primary Learned Controller

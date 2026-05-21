@@ -324,6 +324,7 @@ def main(argv: list[str] | None = None) -> int:
             sys.path.insert(0, p)
 
     from salt_r.model import build_model
+    from salt_r.feature_schema import apply_feature_schema as _apply_schema
 
     print(f"[shadow_mode] Loading checkpoint: {args.checkpoint}", flush=True)
     model = build_model(args.checkpoint, device=args.device)
@@ -344,6 +345,14 @@ def main(argv: list[str] | None = None) -> int:
     mem_dim     = int(ck.get("memory_dim", 0))
     label_names_ck = list(ck.get("label_names", []))
     print(f"[shadow_mode] window_size={window_size}  feat_dim={len(feat_names)}  memory_dim={mem_dim}", flush=True)
+
+    # Read feature schema from checkpoint for auto-applying during inference
+    ck_drop_indices: list[int] = list(ck.get("drop_feature_indices", []))
+    ck_feature_schema: str = ck.get("feature_schema", "legacy_v2")
+
+    if ck_drop_indices:
+        print(f"[shadow_mode] Checkpoint schema={ck_feature_schema!r}  "
+              f"auto-zeroing indices {ck_drop_indices}", flush=True)
 
     print(f"[shadow_mode] Loading NPZ: {args.npz}", flush=True)
     npz = np.load(args.npz, allow_pickle=True)
@@ -375,6 +384,10 @@ def main(argv: list[str] | None = None) -> int:
         features = npz[feat_key].astype(np.float32)     # (T, 28)
         labels   = npz[label_key].astype(np.float32)    # (T, n_labels)
         T = len(features)
+
+        # Apply checkpoint feature schema (zero flow indices for no-flow schema)
+        if ck_drop_indices:
+            features = _apply_schema(features, ck_drop_indices)
 
         memory_feats = None
         if sidecar is not None and mem_key in sidecar.files:
@@ -497,6 +510,8 @@ def main(argv: list[str] | None = None) -> int:
         "split": args.split,
         "mode": args.mode,
         "n_sequences": len(results),
+        "feature_schema": ck_feature_schema,
+        "drop_feature_indices": ck_drop_indices,
         "policy": {
             "fc_block": fc_block, "fc_verify": fc_verify,
             "fc_abstain": fc_abstain, "ifd_full": _IFD_FULL,

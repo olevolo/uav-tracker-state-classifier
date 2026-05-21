@@ -891,6 +891,7 @@ def _run_inference(
         return {}
 
     import torch
+    from salt_r.feature_schema import apply_feature_schema as _apply_schema
 
     model = model.to(device)
     preds: dict[str, np.ndarray] = {}
@@ -898,10 +899,9 @@ def _run_inference(
     with torch.no_grad():
         for seq_key, feats in features_dict.items():
             n = feats.shape[0]
-            # Apply feature zeroing if requested (ablation mode)
+            # Apply feature zeroing if requested (ablation/schema mode)
             if drop_feature_indices:
-                feats = feats.copy()
-                feats[:, drop_feature_indices] = 0.0
+                feats = _apply_schema(feats, drop_feature_indices)
             x = torch.tensor(feats, dtype=torch.float32, device=device)  # (n, F)
 
             # Build sliding windows: (n_windows, window_size, F)
@@ -1075,13 +1075,55 @@ def evaluate(
     # 1. Load NPZ
     # ------------------------------------------------------------------
     print(f"Loading NPZ: {npz_path}  split={split}")
-    if drop_feature_indices:
+
+    # ------------------------------------------------------------------
+    # 0. Read checkpoint schema metadata (before --drop-features conflict check)
+    # ------------------------------------------------------------------
+    checkpoint_drop_indices: list[int] = []
+    checkpoint_schema: str = "legacy_v2"
+    if checkpoint_path:
+        try:
+            import torch as _torch_schema
+            _ck_schema = _torch_schema.load(checkpoint_path, map_location="cpu")
+            if isinstance(_ck_schema, dict):
+                checkpoint_drop_indices = list(_ck_schema.get("drop_feature_indices", []))
+                checkpoint_schema = _ck_schema.get("feature_schema", "legacy_v2")
+        except Exception:
+            pass
+
+    # Resolve effective drop_feature_indices:
+    # - If caller provides drop_feature_indices (from --drop-features): validate against checkpoint
+    # - If not provided: auto-apply checkpoint's schema
+    if drop_feature_indices is not None:
+        # Validate: if checkpoint has schema, caller must match
+        if checkpoint_drop_indices and sorted(drop_feature_indices) != sorted(checkpoint_drop_indices):
+            raise ValueError(
+                f"--drop-features conflict: you specified {sorted(drop_feature_indices)} but "
+                f"checkpoint was trained with drop_feature_indices={sorted(checkpoint_drop_indices)} "
+                f"(schema={checkpoint_schema!r}). "
+                "Either omit --drop-features to auto-apply checkpoint schema, or match exactly."
+            )
+        applied_drop_indices = drop_feature_indices
+    else:
+        # Auto-apply from checkpoint
+        applied_drop_indices = checkpoint_drop_indices
+        if applied_drop_indices:
+            try:
+                from salt_r.collect_features import FEATURE_NAMES as _FN
+                _drop_names = [_FN[i] if i < len(_FN) else f"idx_{i}" for i in applied_drop_indices]
+            except Exception:
+                _drop_names = [f"idx_{i}" for i in applied_drop_indices]
+            print(f"  Auto-applying checkpoint schema={checkpoint_schema!r}: "
+                  f"zeroing indices {applied_drop_indices} ({_drop_names})")
+
+    if applied_drop_indices:
         try:
             from salt_r.collect_features import FEATURE_NAMES as _FN
-            _drop_names = [_FN[i] if i < len(_FN) else f"idx_{i}" for i in drop_feature_indices]
+            _drop_names = [_FN[i] if i < len(_FN) else f"idx_{i}" for i in applied_drop_indices]
         except Exception:
-            _drop_names = [f"idx_{i}" for i in drop_feature_indices]
-        print(f"  drop_feature_indices={drop_feature_indices}  ({_drop_names})")
+            _drop_names = [f"idx_{i}" for i in applied_drop_indices]
+        if drop_feature_indices is not None:  # only print if explicitly specified (auto-apply already printed)
+            print(f"  drop_feature_indices={applied_drop_indices}  ({_drop_names})")
     features_dict, labels_dict, iou_dict = _load_npz_split(npz_path, split)
 
     # Read label names from NPZ (fall back to collect_features default)
@@ -1279,7 +1321,7 @@ def evaluate(
             aug[seq_key] = augmented
         infer_features_dict = aug
 
-    preds_dict = _run_inference(model, infer_features_dict, window_size, device, drop_feature_indices=drop_feature_indices)
+    preds_dict = _run_inference(model, infer_features_dict, window_size, device, drop_feature_indices=applied_drop_indices)
     has_preds = bool(preds_dict)
 
     # Derive actual head names from the loaded model (works for v0 and v1 schemas).
@@ -1507,7 +1549,9 @@ def evaluate(
         "point_sidecar_path": point_sidecar_path or None,
         "point_feature_names_used": list(_ckpt_point_feature_names) if _ckpt_point_feature_names else [],
         "point_dim": _ckpt_point_dim_only,
-        "drop_feature_indices": list(drop_feature_indices) if drop_feature_indices else [],
+        "drop_feature_indices": list(applied_drop_indices) if applied_drop_indices else [],
+        "applied_drop_indices": list(applied_drop_indices) if applied_drop_indices else [],
+        "feature_schema": checkpoint_schema,
     }
 
     if calibrate_heads and temperatures:
