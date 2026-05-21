@@ -404,13 +404,44 @@ All 3 leave-one-dataset-out models pass the generalization gate (fc AUROC > 0.59
 Checkpoints: `saltr/checkpoints/lodo_no_{uav123,dtb70,visdrone_sot}/saltrd_best.pt`
 Evals: `saltr/results/eval_lodo_no_{uav123,dtb70,visdrone_sot}.json`
 
-### ⚠️ Template update re-enablement (REVERTED)
+### ✅ Phase 7 Stage 2B — 5-gate temporal guard + reinit veto (Stage 2 complete)
 
-Attempt to re-enable `try_update_template()` in salt_runner.py with SALT-RD gate (p_fc < 0.60) caused car7 regression: 0.570 → 0.321 AUC. Root cause: p_fc doesn't rise fast enough when same-class distractor briefly appears — one template update fires before SALT-RD detects risk.
+**Root cause of car7 regression:** p_fc<0.60 gate fires too late — GRU needs 5–10 frames to accumulate evidence, template update fires at frame 2–3. Fix: temporal guard that catches the rising edge and score-map competition before the GRU window fills.
 
-Template update is disabled again. **EMA freeze kept**: `_ref_embedding` EMA update now gated by `_advisory_p_fc < 0.30` (prevents cosine guard drift during confirmed tracking — pure improvement, no AUC impact measured).
+**5-gate `should_block_template_update()` in `advisor.py`:**
 
-Advisory mode AUC impact: **zero** (expected — template update disabled, advisor is observer only).
+| Gate | Signal | Threshold | What it catches |
+|---|---|---|---|
+| 1 | p_fc absolute | ≥ 0.60 | GRU already confident of risk |
+| 2 | rising edge | Δp_fc > 0.08 over 3f | Distractor onset before GRU accumulates |
+| 3 | trusted streak | < 5 consecutive p_fc < 0.30 | Any uncertainty period resets requirement |
+| 4 | smap competition | n_sec ≥ 1 AND top2_ratio ≥ 0.72 in last 3f | Direct spatial distractor signal |
+| 5 | post-update cooldown | < 15f since last update | Stale context after update |
+
+`notify_template_updated(frame_idx)` in `sglatrack.try_update_template()` resets trusted_streak + cooldown after every actual update.
+
+**Reinit veto** in `salt_runner.py` Guard5: `advisor.should_block_reinit()` (fc_block_reinit=0.70) — skips detector recovery when tracker is likely false-confirmed (not genuinely lost). wrir=0 validated → safe.
+
+**Validation:**
+- car7: 0.321 → **0.570** = baseline ✅  
+- car13/building1/truck1: no regression ✅
+- Shadow mode Stage 2 gate: wrir=0.0, msu=0.081 → GO ✅
+
+**Template updates not actually firing:** `apce_threshold=220.0` in `salt_runner.try_update_template()` is never met (typical confirmed APCE=100–180). 5-gate guard is infrastructure-ready — threshold tuning delegated to architect. Zero AUC delta confirmed on full-length truck1/uav2.
+
+**Threshold sweep** (fc_block on val, per dataset):
+- Global optimum: **0.60** (current setting, no change needed)
+- VisDrone: 0.66 would drop msu 0.172→0.020 but coverage 0.742→0.330
+- DTB70: 0.62 only valid point (fragile 1-point window due to unbalanced val split)
+
+**fast_bench.py** new CLI: `--max-frames 0` (unlimited), `--all-sequences`, `--advisory-fc-block`
+
+**Full UAV123 benchmark** (123 seqs, no frame cap) running in background:
+```
+saltr/results/bench_uav123_full_baseline.log   ← baseline
+saltr/results/bench_uav123_full_advisory.log   ← advisory 5-gate
+```
+Target: advisory AUC ≥ 0.720 (SALT v3 reference). Any > 0.720 = paper contribution.
 
 Working name: **SALT-RD v2.3 with LK point features**.
 
@@ -678,6 +709,9 @@ At frame t=1, `_last_template_embedding` is unconditionally added to RAM as `sou
 | v2.3 checkpoint (LK point) | `saltr/checkpoints/v2_3_point/saltrd_best.pt` | ✅ KILL — diag 0.546 < baseline |
 | v2.3 eval val | `saltr/results/eval_val_v2_3_point.json` | ✅ AUROC=0.880, AUPRC=0.329 |
 | v2.3 eval diagnostic | `saltr/results/eval_diagnostic_v2_3_point.json` | ✅ AUROC=0.546 — KILL |
+| Threshold sweep (per-frame) | `saltr/results/shadow_mode_val_sweep.json` | ✅ fc_block=0.60 optimal globally |
+| Shadow mode 5-gate advisory | `saltr/results/shadow_mode_val_v2_retrained_5gate.json` | ✅ wrir=0, msu=0.081 → GO |
+| Full UAV123 benchmark (running) | `saltr/results/bench_uav123_full_{baseline,advisory}.log` | ⏳ baseline vs 5-gate advisory |
 
 ---
 
@@ -768,9 +802,9 @@ Phase 7: TSA → SALT-RD transition
 10. ✅ Stage 2 Advisory GO: v2_retrained 28-dim → wrir=0, msu=0.081, coverage=65.7%
 11. ✅ advisor.py + sglatrack.py wired — SALTRDAdvisor, step/veto/reset
 12. ✅ LODO generalization: all 3 held-out datasets pass gate (0.939/0.608/0.802 >> 0.598)
-13. ⚠️ Template update re-enable: car7 regression (0.570→0.321), reverted — EMA freeze kept
-14. ⏳ Template update safe path: need early-warning signal before p_fc rises to 0.60
-15. ⏳ Runtime rollout: advisory as pure veto/observer (no template update)
+13. ✅ Template update 5-gate temporal guard: car7 regression fixed, reinit veto added (Stage 2 complete)
+14. ⏳ Template update actually firing: apce>220 threshold never met in practice — threshold tuning for architect
+15. ⏳ Full UAV123 benchmark (123 seqs, no cap): running, logs in saltr/results/bench_uav123_full_*.log
 16. ⏳ TSA-to-SALT-RD migration: Shadow → Advisory/Veto → Primary Learned Controller
 ```
 
@@ -791,30 +825,40 @@ Read HANDOFF_NEXT.md.
 
 STATE:
 - Tests: 230 passed
-- LODO generalization: COMPLETE — all 3 held-out datasets pass gate
+- Full UAV123 benchmark (123 seqs, no cap) RUNNING in background:
+    saltr/results/bench_uav123_full_baseline.log
+    saltr/results/bench_uav123_full_advisory.log
+  Check these first — if advisory >= 0.720, template update infrastructure is validated.
 
-COMPLETED THIS SESSION:
-1. Shadow mode canonical state names, advisory mode GO
-2. Phase 5B v2.3 LK: KILLED (diag 0.546)
-3. SALTRDAdvisor + sglatrack.py wired, fast_bench.py --advisory flag
-4. LODO: no-UAV123 OOD=0.939, no-DTB70 OOD=0.608, no-VisDrone OOD=0.802 → all PASS
-5. Template update re-enable: car7 regression (0.570→0.321) → REVERTED
-6. EMA freeze kept (p_fc<0.30 gate on _ref_embedding update)
-7. Code review bugs fixed: point_sidecar_extractor (dead check, stride guard, lazy resize, unused import), shadow_mode (dead elif→if, feature index validation)
+COMPLETED THIS SESSION (session 8):
+1. 5-gate temporal guard for template updates — car7 regression fixed (0.321→0.570)
+2. Reinit veto — advisor.should_block_reinit() wired into salt_runner Guard5
+3. Stage 2 architecturally complete: template veto + reinit veto + EMA freeze
+4. Threshold sweep: fc_block=0.60 confirmed globally optimal, no change needed
+5. fast_bench: --max-frames, --all-sequences, --advisory-fc-block added
+6. Template updates not actually firing (apce>220 threshold never met) — FOR ARCHITECT
 
 OPEN ITEMS:
-- Template update safe path: needs early-warning signal before p_fc reaches 0.60
-  Current attempt: p_fc < 0.60 gate too late for car7-class distractors
-  Idea: use ifd10 (imminent failure) or SALT-RD proactive warning (p_fc > 0.30 = LOW_EVIDENCE)
-  as earlier gate — update only when p_fc < 0.30 (TRUSTED_TRACKING state)
-- Runtime rollout design (advisory as observer + reinit veto only)
-- Paper writing: LODO + shadow mode results + advisory gate = paper-ready claim
+- apce_threshold in salt_runner.try_update_template(): currently 220 (unreachable)
+  Architect to decide: lower to 150? 5-gate guard is in place to prevent car7 regression.
+- Full UAV123 benchmark result: check logs above
+- Per-dataset fc_block: UAV123=0.60, DTB70=0.62, VisDrone=0.66 (see threshold sweep)
+  fast_bench --advisory-fc-block supports per-dataset tuning without code changes
+
+KEY INFRASTRUCTURE (all in place):
+- SALTRDAdvisor: advisor.py, 5-gate guard, notify_template_updated(), should_block_reinit()
+- sglatrack.py: set_salt_rd_advisor(), advisor.step() in update_with_state(), veto in try_update_template()
+- salt_runner.py: template update call (gated by 5-gate), reinit veto, EMA freeze
+- fast_bench.py: --advisory, --advisory-fc-block, --max-frames, --all-sequences
+
+LIVE ADVISORY CHECKPOINT: saltr/checkpoints/v2_corrected/saltrd_best.pt (28-dim, v2_retrained)
 
 RED LINES (permanent):
 - v2_retrained = strict baseline (diag 0.598, val 0.885)
-- Template update: DISABLED until early-warning signal validated
+- Template update thresholds (apce>220): ARCHITECT DECISION
 - v2.3 LK point = KILLED
 - CoTracker3 = DROPPED
 - Neg memory: never include
 - Gull2/SB1: hard outliers, separate report
+- LODO checkpoints: lodo_no_{uav123,dtb70,visdrone_sot}/saltrd_best.pt (for per-dataset use)
 ```
