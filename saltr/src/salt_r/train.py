@@ -175,6 +175,7 @@ class SALTRDDataset(Dataset):
         window_size: int = 20,
         head_names: Optional[List[str]] = None,
         all_label_names: Optional[List[str]] = None,
+        exclude_dataset: Optional[str] = None,
     ) -> None:
         assert split in {"train", "val", "diagnostic"}, f"Unknown split: {split!r}"
         self.split = split
@@ -196,6 +197,8 @@ class SALTRDDataset(Dataset):
 
         for key, seq_split in ds.split.items():
             if seq_split != split:
+                continue
+            if exclude_dataset and key.startswith(f"{exclude_dataset}/"):
                 continue
             feats = ds.features[key].astype(np.float32)   # (n_frames, n_features)
             labs = ds.labels[key].astype(np.float32)      # (n_frames, n_labels)
@@ -389,6 +392,9 @@ def train(
     label_schema: str = "v0",
     memory_sidecar_path: str | None = None,
     memory_feature_names: list[str] | None = None,
+    point_sidecar_path: str | None = None,
+    point_feature_names: list[str] | None = None,
+    exclude_dataset: str | None = None,
 ) -> None:
     """Train SALTRD on the given NPZ dataset.
 
@@ -462,6 +468,28 @@ def train(
         else:
             print(f"[train] No memory sidecar provided, using 28-dim input only", flush=True)
 
+    # ------------------------------------------------------------------
+    # 0c. Load point sidecar (optional — LK/Farneback point features)
+    # ------------------------------------------------------------------
+    point_features: dict[str, np.ndarray] = {}
+    all_point_feature_names: list[str] = []
+    if point_sidecar_path and Path(point_sidecar_path).exists():
+        pt_npz = np.load(point_sidecar_path, allow_pickle=True)
+        all_point_feature_names = list(pt_npz.get("point_feature_names", [f"pt_dim_{i}" for i in range(13)]))
+        for k in pt_npz.files:
+            if k.startswith("point_features/"):
+                seq = k[len("point_features/"):]
+                point_features[seq] = pt_npz[k].astype(np.float32)
+        print(f"[train] Loaded point features for {len(point_features)} sequences", flush=True)
+        if point_feature_names is not None:
+            selected_indices = [all_point_feature_names.index(n) for n in point_feature_names]
+            for seq in point_features:
+                point_features[seq] = point_features[seq][:, selected_indices]
+            print(f"[train] Subsetting to {len(point_feature_names)} point features: {point_feature_names}", flush=True)
+    else:
+        if point_sidecar_path:
+            print(f"[train] Point sidecar not found at {point_sidecar_path}, skipping", flush=True)
+
     # Select label schema — v1 adds hard_dynamic_scene_v2 + imminent_failure_dynamic
     if label_schema == "v2":
         _schema_head_names = list(_HEAD_NAMES_V2)
@@ -480,6 +508,7 @@ def train(
     train_ds = SALTRDDataset(
         npz_path, split="train", window_size=window_size,
         head_names=_schema_head_names, all_label_names=_schema_label_names,
+        exclude_dataset=exclude_dataset,
     )
     print(f"[train] train samples: {len(train_ds):,}", flush=True)
 
@@ -487,6 +516,7 @@ def train(
     val_ds = SALTRDDataset(
         npz_path, split="val", window_size=window_size,
         head_names=_schema_head_names, all_label_names=_schema_label_names,
+        exclude_dataset=exclude_dataset,
     )
     print(f"[train] val samples:   {len(val_ds):,}", flush=True)
 
@@ -521,6 +551,34 @@ def train(
 
         _apply_memory(train_ds, "train")
         _apply_memory(val_ds, "val")
+
+    if point_features:
+        def _apply_point(ds: SALTRDDataset, tag: str) -> None:
+            """In-place: append point sidecar columns after existing features."""
+            patched = 0
+            for i, seq_key in enumerate(ds._sequence_keys):
+                if seq_key not in point_features:
+                    continue
+                feats, labs = ds._sequences[i]
+                pt = point_features[seq_key]
+                T_feats = feats.shape[0]
+                T_pt = pt.shape[0]
+                if T_pt >= T_feats:
+                    pt_aligned = pt[:T_feats]
+                else:
+                    pad = np.zeros((T_feats - T_pt, pt.shape[1]), dtype=np.float32)
+                    pt_aligned = np.concatenate([pt, pad], axis=0)
+                ds._sequences[i] = (np.concatenate([feats, np.nan_to_num(pt_aligned, nan=0.0)], axis=1), labs)
+                patched += 1
+            n_total = len(ds._sequence_keys)
+            assert patched > 0 or n_total == 0, (
+                f"[train] {tag}: 0/{n_total} sequences point-augmented — "
+                "check that sidecar keys match NPZ sequence keys exactly"
+            )
+            print(f"[train] {tag}: point-augmented {patched}/{n_total} sequences", flush=True)
+
+        _apply_point(train_ds, "train_pt")
+        _apply_point(val_ds, "val_pt")
 
     if len(train_ds) == 0:
         raise RuntimeError("Training split is empty — check the NPZ file.")
@@ -565,9 +623,21 @@ def train(
     else:
         memory_dim = 0
 
-    model = SALTRD(n_features=n_features, memory_dim=memory_dim, head_names=train_ds.head_names).to(dev)
+    if point_features:
+        first_key = next(iter(point_features))
+        point_dim = point_features[first_key].shape[1]
+        bad_pt = [k for k, v in point_features.items() if v.shape[1] != point_dim]
+        if bad_pt:
+            raise ValueError(
+                f"[train] Point sidecar has inconsistent widths: expected {point_dim} "
+                f"but {len(bad_pt)} sequences differ (e.g. {bad_pt[0]})."
+            )
+    else:
+        point_dim = 0
+
+    model = SALTRD(n_features=n_features, memory_dim=memory_dim + point_dim, head_names=train_ds.head_names).to(dev)
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"[train] SALTRD  params={total_params:,}  memory_dim={memory_dim}", flush=True)
+    print(f"[train] SALTRD  params={total_params:,}  memory_dim={memory_dim}  point_dim={point_dim}", flush=True)
 
     # ------------------------------------------------------------------
     # 3. Loss / optimiser / scheduler
@@ -690,6 +760,9 @@ def train(
                     "memory_dim": memory_dim,
                     "memory_sidecar_path": str(memory_sidecar_path) if memory_sidecar_path else "",
                     "memory_feature_names": memory_feature_names or (all_feature_names if memory_features else []),
+                    "point_dim": point_dim,
+                    "point_sidecar_path": str(point_sidecar_path) if point_sidecar_path else "",
+                    "point_feature_names": point_feature_names or (all_point_feature_names if point_features else []),
                 },
                 ckpt_path,
             )
@@ -764,6 +837,36 @@ def main() -> None:
             "Example: --memory-feature-names mem_target_minus_distractor_margin"
         ),
     )
+    parser.add_argument(
+        "--point-sidecar",
+        default=None,
+        help=(
+            "Path to point sidecar NPZ with keys point_features/{seq} (T×13 float32). "
+            "When provided, selected point dims are appended after memory dims. "
+            "Example: --point-sidecar saltr/data/salt_rd_point_sidecar_lk.npz"
+        ),
+    )
+    parser.add_argument(
+        "--point-feature-names",
+        type=str,
+        default=None,
+        help=(
+            "Comma-separated subset of point feature names from the point sidecar. "
+            "Example: --point-feature-names pt_inside_pred_ratio,pt_cluster_area_ratio,"
+            "pt_bbox_center_disagreement,pt_forward_backward_error,pt_median_motion"
+        ),
+    )
+    parser.add_argument(
+        "--exclude-dataset",
+        type=str,
+        default=None,
+        choices=["uav123", "dtb70", "visdrone_sot"],
+        help=(
+            "LODO: exclude all sequences from this dataset during training. "
+            "Eval on the excluded dataset to measure out-of-distribution generalization. "
+            "Example: --exclude-dataset dtb70"
+        ),
+    )
     args = parser.parse_args()
 
     train(
@@ -779,6 +882,9 @@ def main() -> None:
         label_schema=args.label_schema,
         memory_sidecar_path=args.memory_sidecar,
         memory_feature_names=args.memory_feature_names.split(",") if args.memory_feature_names else None,
+        point_sidecar_path=args.point_sidecar,
+        point_feature_names=args.point_feature_names.split(",") if args.point_feature_names else None,
+        exclude_dataset=args.exclude_dataset,
     )
 
 

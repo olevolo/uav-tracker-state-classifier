@@ -832,9 +832,10 @@ def _load_model(checkpoint_path: str, n_features: int, n_labels: int, device: st
         head_names = checkpoint_data.get("head_names", list(HEAD_NAMES))
         # memory_dim: default 0 for backwards compatibility with pre-v2.1 checkpoints.
         memory_dim = int(checkpoint_data.get("memory_dim", 0))
+        point_dim = int(checkpoint_data.get("point_dim", 0))
         memory_feature_names_ckpt = checkpoint_data.get("memory_feature_names", None)
 
-        model = SALTRD(head_names=head_names, memory_dim=memory_dim)
+        model = SALTRD(head_names=head_names, memory_dim=memory_dim + point_dim)
         if isinstance(checkpoint_data, dict) and "model_state_dict" in checkpoint_data:
             model.load_state_dict(checkpoint_data["model_state_dict"])
         elif isinstance(checkpoint_data, dict) and "state_dict" in checkpoint_data:
@@ -1014,6 +1015,7 @@ def evaluate(
     predictions_output: str | None = None,
     calibrate_heads: list[str] | None = None,
     memory_sidecar_path: str | None = None,
+    point_sidecar_path: str | None = None,
 ) -> dict[str, Any]:
     """Run full evaluation and return results dict.
 
@@ -1080,6 +1082,21 @@ def evaluate(
         )
 
     # ------------------------------------------------------------------
+    # 1a. Read per-component extra dims from checkpoint for sidecar routing.
+    # ------------------------------------------------------------------
+    _ckpt_memory_dim_only = 0
+    _ckpt_point_dim_only = 0
+    if checkpoint_path:
+        try:
+            import torch as _torch_dims
+            _ckpt_dims_state = _torch_dims.load(checkpoint_path, map_location="cpu")
+            if isinstance(_ckpt_dims_state, dict):
+                _ckpt_memory_dim_only = int(_ckpt_dims_state.get("memory_dim", 0))
+                _ckpt_point_dim_only = int(_ckpt_dims_state.get("point_dim", 0))
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------
     # 1b. Load and apply memory sidecar (optional — DAM-style 9-dim features)
     # ------------------------------------------------------------------
     eval_memory_features: dict[str, np.ndarray] = {}
@@ -1115,6 +1132,38 @@ def evaluate(
         print(f"  Memory sidecar not found at {memory_sidecar_path}, using base features only")
 
     # ------------------------------------------------------------------
+    # 1c. Load point sidecar (optional — LK/Farneback point features)
+    # ------------------------------------------------------------------
+    eval_point_features: dict[str, np.ndarray] = {}
+    _ckpt_point_feature_names: list[str] | None = None
+    if point_sidecar_path and Path(point_sidecar_path).exists():
+        pt_npz = np.load(point_sidecar_path, allow_pickle=True)
+        for k in pt_npz.files:
+            if k.startswith("point_features/"):
+                seq = k[len("point_features/"):]
+                eval_point_features[seq] = pt_npz[k].astype(np.float32)
+        print(f"  Loaded point features for {len(eval_point_features)} sequences")
+        if checkpoint_path:
+            try:
+                import torch as _torch_pt
+                _ckpt_state_pt = _torch_pt.load(checkpoint_path, map_location="cpu")
+                if isinstance(_ckpt_state_pt, dict):
+                    _ckpt_point_feature_names = _ckpt_state_pt.get("point_feature_names", None)
+            except Exception:
+                pass
+        if _ckpt_point_feature_names:
+            _all_pt_names = list(pt_npz.get("point_feature_names", [f"pt_dim_{i}" for i in range(13)]))
+            _pt_indices = [_all_pt_names.index(n) for n in _ckpt_point_feature_names]
+            for seq in eval_point_features:
+                eval_point_features[seq] = eval_point_features[seq][:, _pt_indices]
+            print(
+                f"  Subsetting point features to {len(_ckpt_point_feature_names)} dims "
+                f"(from checkpoint): {_ckpt_point_feature_names}"
+            )
+    elif point_sidecar_path:
+        print(f"  Point sidecar not found at {point_sidecar_path}, using base features only")
+
+    # ------------------------------------------------------------------
     # 2. Load model and run inference
     # ------------------------------------------------------------------
     n_features = next(iter(features_dict.values())).shape[1] if features_dict else 28
@@ -1129,11 +1178,9 @@ def evaluate(
     infer_features_dict = features_dict
     _n_sequences_with_memory = 0  # tracks sequences that had actual sidecar entries
     if model is not None and getattr(model, "memory_dim", 0) > 0:
-        mem_dim = model.memory_dim
-        if not eval_memory_features:
-            # No sidecar loaded at all — distinguish no-arg vs file-not-found
+        if _ckpt_memory_dim_only > 0 and not eval_memory_features:
             raise ValueError(
-                f"Checkpoint was trained with memory_dim={mem_dim} but "
+                f"Checkpoint was trained with memory_dim={_ckpt_memory_dim_only} but "
                 + (
                     "no --memory-sidecar was provided. "
                     "Re-run with --memory-sidecar pointing to the correct sidecar NPZ."
@@ -1142,50 +1189,74 @@ def evaluate(
                     "Check the path and re-run."
                 )
             )
-
-        # Count sequences that are missing from the sidecar
-        n_total = len(features_dict)
-        n_missing = sum(1 for k in features_dict if k not in eval_memory_features)
-        if n_missing > 0:
-            missing_frac = n_missing / max(n_total, 1)
-            if missing_frac > 0.10:
-                raise ValueError(
-                    f"{n_missing}/{n_total} sequences ({missing_frac*100:.1f}%) are missing "
-                    f"from the memory sidecar at {memory_sidecar_path!r}. "
-                    "More than 10% missing is not allowed — regenerate the sidecar or "
-                    "check that sidecar keys match NPZ sequence keys."
+        if _ckpt_point_dim_only > 0 and not eval_point_features:
+            raise ValueError(
+                f"Checkpoint was trained with point_dim={_ckpt_point_dim_only} but "
+                + (
+                    "no --point-sidecar was provided. "
+                    "Re-run with --point-sidecar pointing to the correct sidecar NPZ."
+                    if not point_sidecar_path
+                    else f"the point sidecar file was not found at {point_sidecar_path!r}. "
+                    "Check the path and re-run."
                 )
-            else:
+            )
+
+        n_total = len(features_dict)
+        if eval_memory_features:
+            n_missing_mem = sum(1 for k in features_dict if k not in eval_memory_features)
+            if n_missing_mem / max(n_total, 1) > 0.10:
+                raise ValueError(
+                    f"{n_missing_mem}/{n_total} sequences missing from memory sidecar. "
+                    "More than 10% missing — regenerate the sidecar."
+                )
+            elif n_missing_mem > 0:
                 print(
-                    f"  WARNING: {n_missing}/{n_total} sequences missing from memory sidecar "
-                    f"({missing_frac*100:.1f}%) — zero-padding those sequences."
+                    f"  WARNING: {n_missing_mem}/{n_total} sequences missing from memory sidecar "
+                    f"— zero-padding those sequences."
                 )
 
         aug: dict[str, np.ndarray] = {}
         _n_sequences_with_memory = 0
         for seq_key, feats in features_dict.items():
-            if seq_key in eval_memory_features:
-                mem = eval_memory_features[seq_key]
-                if mem.shape[1] != mem_dim:
-                    raise ValueError(
-                        f"Memory sidecar width mismatch for sequence {seq_key!r}: "
-                        f"checkpoint expects {mem_dim} dims but sidecar has {mem.shape[1]}. "
-                        "Re-run memory_features.py with the correct --memory-feature-names selection."
-                    )
-                T = min(feats.shape[0], mem.shape[0])
-                if T < feats.shape[0]:
-                    pad = np.zeros((feats.shape[0] - T, mem.shape[1]), dtype=np.float32)
-                    mem_full = np.concatenate([mem[:T], pad], axis=0)
+            augmented = feats
+            if _ckpt_memory_dim_only > 0:
+                if seq_key in eval_memory_features:
+                    mem = eval_memory_features[seq_key]
+                    if mem.shape[1] != _ckpt_memory_dim_only:
+                        raise ValueError(
+                            f"Memory sidecar width mismatch for sequence {seq_key!r}: "
+                            f"checkpoint expects {_ckpt_memory_dim_only} dims but sidecar has {mem.shape[1]}. "
+                            "Re-run memory_features.py with the correct --memory-feature-names selection."
+                        )
+                    T = min(feats.shape[0], mem.shape[0])
+                    if T < feats.shape[0]:
+                        pad = np.zeros((feats.shape[0] - T, mem.shape[1]), dtype=np.float32)
+                        mem_full = np.concatenate([mem[:T], pad], axis=0)
+                    else:
+                        mem_full = mem[:feats.shape[0]]
+                    augmented = np.concatenate([augmented, mem_full], axis=1)
+                    _n_sequences_with_memory += 1
                 else:
-                    mem_full = mem[:feats.shape[0]]
-                aug[seq_key] = np.concatenate([feats, mem_full], axis=1)
-                _n_sequences_with_memory += 1
-            else:
-                # Zero-pad for sequences not in sidecar (<10% missing, already validated above)
-                aug[seq_key] = np.concatenate(
-                    [feats, np.zeros((feats.shape[0], mem_dim), dtype=np.float32)],
-                    axis=1,
-                )
+                    augmented = np.concatenate(
+                        [augmented, np.zeros((feats.shape[0], _ckpt_memory_dim_only), dtype=np.float32)],
+                        axis=1,
+                    )
+            if _ckpt_point_dim_only > 0:
+                if seq_key in eval_point_features:
+                    pt = eval_point_features[seq_key]
+                    T_pt = pt.shape[0]
+                    if T_pt >= feats.shape[0]:
+                        pt_full = pt[:feats.shape[0]]
+                    else:
+                        pad = np.zeros((feats.shape[0] - T_pt, pt.shape[1]), dtype=np.float32)
+                        pt_full = np.concatenate([pt, pad], axis=0)
+                    augmented = np.concatenate([augmented, np.nan_to_num(pt_full, nan=0.0)], axis=1)
+                else:
+                    augmented = np.concatenate(
+                        [augmented, np.zeros((feats.shape[0], _ckpt_point_dim_only), dtype=np.float32)],
+                        axis=1,
+                    )
+            aug[seq_key] = augmented
         infer_features_dict = aug
 
     preds_dict = _run_inference(model, infer_features_dict, window_size, device)
@@ -1413,6 +1484,9 @@ def evaluate(
         "memory_feature_names_used": _used_feature_names,
         "memory_dim": _ckpt_memory_dim,
         "n_sequences_with_memory": _n_sequences_with_memory,
+        "point_sidecar_path": point_sidecar_path or None,
+        "point_feature_names_used": list(_ckpt_point_feature_names) if _ckpt_point_feature_names else [],
+        "point_dim": _ckpt_point_dim_only,
     }
 
     if calibrate_heads and temperatures:
@@ -1541,6 +1615,14 @@ def main() -> None:
             "features only. (default: saltr/data/salt_rd_memory_sidecar.npz)"
         ),
     )
+    parser.add_argument(
+        "--point-sidecar",
+        default=None,
+        help=(
+            "Path to point sidecar NPZ with keys point_features/{seq} (T×13 float32). "
+            "Required when checkpoint was trained with --point-sidecar."
+        ),
+    )
     args = parser.parse_args()
 
     calibrate_heads: list[str] | None = None
@@ -1557,6 +1639,7 @@ def main() -> None:
         predictions_output=args.predictions_output,
         calibrate_heads=calibrate_heads,
         memory_sidecar_path=args.memory_sidecar,
+        point_sidecar_path=args.point_sidecar,
     )
     verdict = check_go_nogo(results)
     print(f"\nGO/NO-GO: {verdict}")
