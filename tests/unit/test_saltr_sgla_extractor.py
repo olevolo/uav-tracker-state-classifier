@@ -300,3 +300,22 @@ class TestFrame0Zeros:
         assert isinstance(p_fc, float)
         assert isinstance(p_ifd, float)
         assert isinstance(apce_norm, float)
+
+
+# ---------------------------------------------------------------------------
+# Key prefix: sidecar must write memory_features/ not ram_features/
+# ---------------------------------------------------------------------------
+
+
+def test_sidecar_writes_memory_features_key():
+    """train.py/eval.py read memory_features/{seq} — extractor must use that prefix."""
+    import inspect
+    from salt_r import sgla_memory_extractor as m
+    source = inspect.getsource(m)
+    assert "memory_features/" in source, (
+        "sgla_memory_extractor must write 'memory_features/<seq>' keys "
+        "(train.py/eval.py only read that prefix, not 'ram_features/')"
+    )
+    assert "ram_features/" not in source, (
+        "Legacy 'ram_features/' prefix found — must be replaced with 'memory_features/'"
+    )

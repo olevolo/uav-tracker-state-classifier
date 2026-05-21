@@ -419,6 +419,62 @@ def _validate_merged(
     )
 
 
+def validate_final_merged(
+    preds_all: Dict[str, object],
+    npz_path: str,
+    train_seqs: Set[str],
+    val_seqs: Set[str],
+    diagnostic_seqs: Set[str],
+) -> None:
+    """Validate the final merged predictions dict (train OOF + val teacher + diag teacher).
+
+    Unlike _validate_merged, this function REQUIRES diagnostic sequences to be present
+    (they are added in Phase 5 from teacher predictions, not OOF). Raises ValueError if:
+      - any sequence has the wrong frame count;
+      - any of train/val/diagnostic sequences is missing;
+      - any unexpected key appears that is not in train ∪ val ∪ diagnostic.
+    """
+    n_frames_in_npz = _get_n_frames(npz_path)
+    errors: List[str] = []
+
+    prediction_seqs = {k for k in preds_all.keys() if k != "_meta"}
+    expected_all = train_seqs | val_seqs | diagnostic_seqs
+
+    # Frame count check
+    for seq, frames in preds_all.items():
+        if seq == "_meta":
+            continue
+        if seq not in n_frames_in_npz:
+            errors.append(f"{seq}: not found in NPZ keys")
+            continue
+        expected_T = n_frames_in_npz[seq]
+        if len(frames) != expected_T:
+            errors.append(f"{seq}: {len(frames)} preds != {expected_T} frames in NPZ")
+
+    # Exact coverage: all expected present, no unexpected extras
+    missing = expected_all - prediction_seqs
+    extra = prediction_seqs - expected_all
+    if missing:
+        errors.append(
+            f"{len(missing)} sequence(s) missing from merged preds "
+            f"(train ∪ val ∪ diagnostic): {sorted(missing)[:5]}..."
+        )
+    if extra:
+        errors.append(
+            f"{len(extra)} unexpected key(s) not in train ∪ val ∪ diagnostic: "
+            f"{sorted(extra)[:5]}..."
+        )
+
+    if errors:
+        raise ValueError("Final merged predictions validation failed:\n" + "\n".join(errors))
+
+    print(
+        f"[validate_final] {len(prediction_seqs)} sequences "
+        f"(train={len(train_seqs)}, val={len(val_seqs)}, diag={len(diagnostic_seqs)}) "
+        "— frame counts match, exact coverage confirmed."
+    )
+
+
 # ---------------------------------------------------------------------------
 # Phase 5: assemble metadata header
 # ---------------------------------------------------------------------------
@@ -432,8 +488,8 @@ def _build_meta(
 ) -> dict:
     return {
         "train_source": f"oof_{n_folds}fold",
-        "val_source": "v2_corrected_teacher",
-        "diagnostic_source": "v2_corrected_teacher",
+        "val_source": "v2_retrained_teacher",
+        "diagnostic_source": "v2_retrained_teacher",
         "n_folds": n_folds,
         "n_train_seqs": len(train_seqs),
         "n_val_seqs": len(val_seqs),
@@ -719,8 +775,8 @@ def run_oof_pipeline(
         preds_all.update({k: v for k, v in preds_val_teacher.items() if k != "_meta"})
         preds_all.update({k: v for k, v in preds_diag_teacher.items() if k != "_meta"})
 
-        # Validation.
-        _validate_merged(
+        # Validation: final merged must contain exactly train ∪ val ∪ diagnostic.
+        validate_final_merged(
             preds_all=preds_all,
             npz_path=npz_path,
             train_seqs=set(train_seqs),
@@ -781,8 +837,10 @@ def main() -> None:
         "--teacher-checkpoint",
         default="saltr/checkpoints/v2_corrected/saltrd_best.pt",
         help=(
-            "Path to the canonical no-memory teacher checkpoint "
-            "(default: saltr/checkpoints/v2_corrected/saltrd_best.pt)."
+            "Path to the canonical no-memory teacher checkpoint. "
+            "Use saltr/checkpoints/v2_retrained/saltrd_best.pt for the strict baseline "
+            "(default: saltr/checkpoints/v2_corrected/saltrd_best.pt for backwards compat — "
+            "prefer v2_retrained for new experiments)."
         ),
     )
     parser.add_argument(

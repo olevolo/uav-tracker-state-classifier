@@ -4,11 +4,11 @@ Tests cover:
 1. _make_fold_assignments: all train sequences covered exactly once across 5 folds.
 2. _make_fold_assignments: approximately balanced dataset distribution per fold.
 3. _validate_merged: raises ValueError on frame-count mismatch.
-4. _validate_merged: raises ValueError if a diagnostic sequence appears in merged preds.
+4. _validate_merged: raises ValueError if a diagnostic sequence appears in OOF train preds.
 5. _write_fold_npz: correct split labels in written NPZ.
 6. _merge_fold_preds: raises FileNotFoundError on missing fold file.
-
-No model weights or real NPZ files are used; all tests use synthetic fixtures.
+7. validate_final_merged: passes when train ∪ val ∪ diagnostic are all present.
+8. validate_final_merged: raises if a split is missing from the final merged dict.
 """
 
 from __future__ import annotations
@@ -24,6 +24,7 @@ import pytest
 from salt_r.make_oof_predictions import (
     _make_fold_assignments,
     _validate_merged,
+    validate_final_merged,
     _write_fold_npz,
     _merge_fold_preds,
     _dataset_bucket,
@@ -193,21 +194,14 @@ def test_validate_merged_raises_on_frame_count_mismatch(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Test 4: _validate_merged raises if diagnostic sequence leaks into merged preds
+# Test 4: _validate_merged raises if diagnostic sequence appears in OOF train preds
 # ---------------------------------------------------------------------------
 
 
-def test_validate_merged_raises_on_diagnostic_leak(tmp_path):
-    """_validate_merged should raise ValueError if an original-diagnostic sequence
-    appears as if it were covered by OOF (i.e. is listed in the diagnostic_seqs set
-    that should only come from teacher predictions, but is in the prediction dict AND
-    also in the diagnostic_seqs set passed as 'should not be in train OOF' check).
-
-    The specific check: diagnostic sequences should not overlap with the
-    train_seqs set.  If a diagnostic sequence is accidentally included while
-    the caller passes diagnostic_seqs separately, the function should flag it
-    as a leak.
-    """
+def test_validate_merged_raises_on_diagnostic_in_oof(tmp_path):
+    """_validate_merged (OOF-only validator) should raise if a diagnostic
+    sequence is present in preds AND is not in the expected train+val sets.
+    This simulates a diagnostic seq accidentally included in OOF output."""
     train_seqs_list = ["uav123/seq_000", "uav123/seq_001"]
     val_seqs_list = ["dtb70/seq_val_0"]
     diag_seqs_list = ["dtb70/Gull2"]
@@ -219,35 +213,87 @@ def test_validate_merged_raises_on_diagnostic_leak(tmp_path):
         n_frames_per_seq=30,
     )
 
-    # preds_all incorrectly includes a diagnostic key in the wrong source context.
-    # Simulate: we pass the full merged dict but ask validate to check that
-    # diagnostic_seqs are NOT present in train_seqs.
-    # To trigger the leak check we fabricate a scenario where preds_all
-    # covers all keys AND we pass a smaller train_seqs set that does NOT
-    # include the diagnostic seq — so the diagnostic seq is "extra".
+    # Simulate OOF preds that accidentally include a diagnostic sequence.
+    preds_oof_with_leak = {
+        "uav123/seq_000": [{"false_confirmed": 0.1}] * 30,
+        "uav123/seq_001": [{"false_confirmed": 0.2}] * 30,
+        "dtb70/Gull2": [{"false_confirmed": 0.4}] * 30,  # WRONG: diagnostic seq in OOF
+    }
+
+    # _validate_merged with train_seqs+val_seqs but NOT diagnostic as expected:
+    # Gull2 appears in preds but is not in train_seqs ∪ val_seqs → flagged as "extra".
+    with pytest.raises(ValueError, match=r"(extra|unexpected|missing)"):
+        _validate_merged(
+            preds_all=preds_oof_with_leak,
+            npz_path=npz_path,
+            train_seqs=set(train_seqs_list),
+            val_seqs=set(val_seqs_list),
+            diagnostic_seqs=None,  # OOF validator: diagnostic seqs not expected
+        )
+
+
+# ---------------------------------------------------------------------------
+# Tests 7-8: validate_final_merged
+# ---------------------------------------------------------------------------
+
+
+def test_validate_final_merged_passes_with_all_splits(tmp_path):
+    """validate_final_merged should NOT raise when train ∪ val ∪ diagnostic
+    are all present — this is the expected shape of preds_all_v2_oof_teacher.json."""
+    train_seqs_list = ["uav123/seq_000", "uav123/seq_001"]
+    val_seqs_list = ["dtb70/seq_val_0"]
+    diag_seqs_list = ["dtb70/Gull2"]
+
+    npz_path = _make_synthetic_npz(
+        train_seqs=train_seqs_list,
+        val_seqs=val_seqs_list,
+        diagnostic_seqs=diag_seqs_list,
+        n_frames_per_seq=30,
+    )
+
     preds_all = {
         "uav123/seq_000": [{"false_confirmed": 0.1}] * 30,
         "uav123/seq_001": [{"false_confirmed": 0.2}] * 30,
         "dtb70/seq_val_0": [{"false_confirmed": 0.3}] * 30,
-        "dtb70/Gull2": [{"false_confirmed": 0.4}] * 30,  # from teacher — expected
+        "dtb70/Gull2": [{"false_confirmed": 0.4}] * 30,  # diagnostic — expected here
     }
 
-    # When diagnostic_seqs is passed, the validator checks that those sequences
-    # are NOT keys that belong to the train-OOF set.  We simulate a scenario
-    # where a diagnostic sequence somehow got into preds AND we pass it as
-    # a member of diagnostic_seqs but also sneak it into train_seqs to trigger
-    # the "leaked into merged" path.  The simplest way to trigger the check is
-    # to pass a train_seqs set that includes the diagnostic sequence AND pass
-    # diagnostic_seqs so validate_merged can flag the overlap.
-    with pytest.raises(ValueError, match=r"(leak|diagnostic|missing|unexpected)"):
-        _validate_merged(
-            preds_all=preds_all,
+    # Must not raise
+    validate_final_merged(
+        preds_all=preds_all,
+        npz_path=npz_path,
+        train_seqs=set(train_seqs_list),
+        val_seqs=set(val_seqs_list),
+        diagnostic_seqs=set(diag_seqs_list),
+    )
+
+
+def test_validate_final_merged_raises_on_missing_split(tmp_path):
+    """validate_final_merged should raise if any split is absent from preds."""
+    train_seqs_list = ["uav123/seq_000", "uav123/seq_001"]
+    val_seqs_list = ["dtb70/seq_val_0"]
+    diag_seqs_list = ["dtb70/Gull2"]
+
+    npz_path = _make_synthetic_npz(
+        train_seqs=train_seqs_list,
+        val_seqs=val_seqs_list,
+        diagnostic_seqs=diag_seqs_list,
+        n_frames_per_seq=30,
+    )
+
+    # Missing diagnostic sequences entirely
+    preds_missing_diag = {
+        "uav123/seq_000": [{"false_confirmed": 0.1}] * 30,
+        "uav123/seq_001": [{"false_confirmed": 0.2}] * 30,
+        "dtb70/seq_val_0": [{"false_confirmed": 0.3}] * 30,
+        # dtb70/Gull2 missing
+    }
+
+    with pytest.raises(ValueError, match=r"missing"):
+        validate_final_merged(
+            preds_all=preds_missing_diag,
             npz_path=npz_path,
-            # Claim that Gull2 was a train seq (it is a diagnostic one) — this
-            # creates a mismatch between the claimed train set and the known
-            # diagnostic set, which _validate_merged should catch via the
-            # "extra_train" path.
-            train_seqs=set(train_seqs_list) | {"dtb70/Gull2"},
+            train_seqs=set(train_seqs_list),
             val_seqs=set(val_seqs_list),
             diagnostic_seqs=set(diag_seqs_list),
         )

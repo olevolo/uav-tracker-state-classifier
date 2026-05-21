@@ -176,25 +176,8 @@ def extract_sequence(
     # np.zeros already initialised above)
     # Update mem._current_frame so update_age computation is consistent
     mem._current_frame = 0
-
-    # Gate frame 0: preds-based gate
-    # Even if gate passes, we do NOT add frame 0 to memory yet because
-    # compute_features(embedding[0]) was already computed as zeros (frame 0 contract).
-    # We still run the gate check to decide whether to add the zero embedding.
-    emb_0 = _get_embedding(tracker, embedding_view)  # zeros after init
-    p_fc_0, p_ifd_0, apce_norm_0 = _get_gate_signals(preds_for_seq, t=0)
-    if mem.positive.should_update(
-        p_fc=p_fc_0, p_ifd=p_ifd_0, apce_norm=apce_norm_0, current_frame=0
-    ):
-        from salt_r.memory import MemoryEntry
-        mem.positive.add(MemoryEntry(
-            embedding=emb_0.copy(),
-            frame_idx=0,
-            iou=float("nan"),
-            apce_norm=apce_norm_0,
-            p_fc=p_fc_0,
-            source="target_confident",
-        ))
+    # Frame 0: zeros output, empty RAM — no add() (zero embedding would corrupt similarities).
+    # First real backbone embedding arrives at frame 1.
 
     # Frames 1..T-1
     for t in range(1, T):
@@ -483,7 +466,7 @@ def build_sidecar(args: argparse.Namespace) -> None:
             else:
                 print("ok")
 
-            out[f"ram_features/{seq_key}"] = mem_feats.astype(np.float32)
+            out[f"memory_features/{seq_key}"] = mem_feats.astype(np.float32)
             n_done += 1
             n_total_frames += T
 
