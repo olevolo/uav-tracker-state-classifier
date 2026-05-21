@@ -324,7 +324,12 @@ def main(argv: list[str] | None = None) -> int:
             sys.path.insert(0, p)
 
     from salt_r.model import build_model
-    from salt_r.feature_schema import apply_feature_schema as _apply_schema
+
+    def _apply_schema(feats: np.ndarray, indices: list) -> np.ndarray:
+        """Zero feature columns at *indices* (generic helper)."""
+        out = feats.copy()
+        out[..., indices] = 0.0
+        return out
 
     print(f"[shadow_mode] Loading checkpoint: {args.checkpoint}", flush=True)
     model = build_model(args.checkpoint, device=args.device)

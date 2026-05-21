@@ -158,12 +158,12 @@ class SALTRDAdvisor:
             sys.path.insert(0, _src)
 
         from salt_r.model import build_model
-        from salt_r.feature_schema import apply_feature_schema as _apply_schema
+        from salt_r.feature_schema import zero_production_features as _zero_prod_features
         import torch as _torch
 
         self._model = build_model(checkpoint, device=device)
         self._model.eval()
-        self._apply_schema = _apply_schema
+        self._zero_prod_features = _zero_prod_features
 
         ck = _torch.load(checkpoint, map_location="cpu")
         self._window_size: int = int(ck.get("window_size", 20))
@@ -427,7 +427,7 @@ class SALTRDAdvisor:
         # Apply feature schema before window append (flow indices zeroed for
         # saltrd_v2_online_no_flow schema — prevents train/inference mismatch)
         if self._drop_feature_indices:
-            base = self._apply_schema(base, self._drop_feature_indices)
+            base = self._zero_prod_features(base)
 
         # ------------------------------------------------------------------
         # 6. RAM memory features (4) — compute BEFORE updating RAM

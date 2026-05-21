@@ -891,7 +891,13 @@ def _run_inference(
         return {}
 
     import torch
-    from salt_r.feature_schema import apply_feature_schema as _apply_schema
+    from salt_r.feature_schema import zero_production_features as _zero_prod_features
+
+    def _apply_schema(feats: np.ndarray, indices: list) -> np.ndarray:
+        """Zero feature columns at *indices* (generic helper for eval.py)."""
+        out = feats.copy()
+        out[..., indices] = 0.0
+        return out
 
     model = model.to(device)
     preds: dict[str, np.ndarray] = {}

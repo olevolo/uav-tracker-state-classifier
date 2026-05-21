@@ -103,6 +103,11 @@ class SALTRunner:
     motion_predictor: Any | None = None   # OnlineLSTMMotionPredictor
     seed: int = 42
 
+    # Center-freeze disabled by default — oracle showed 0.000 AUC gain and it
+    # causes regression on standard sequences (car13 -0.396, truck1 -0.156).
+    # Enable with runner._enable_center_freeze = True for experimental evaluation.
+    _enable_center_freeze: bool = field(default=False, init=False, repr=False)
+
     # per-run state
     _trajectory: list = field(default_factory=list, init=False, repr=False)
     _prev_frame: Optional[np.ndarray] = field(default=None, init=False, repr=False)
@@ -418,13 +423,19 @@ class SALTRunner:
         response_entropy = getattr(track_state, 'response_entropy', 0.0)
 
         # Center-freeze (Stage 3 / Phase 5)
+        # Disabled by default (_enable_center_freeze=False): oracle showed 0.000 AUC gain
+        # and unconditional activation causes regression on standard sequences
+        # (car13: -0.396, truck1: -0.156 when p_fc >= 0.60 fires on correct frames).
+        # Still call update_center_freeze() so telemetry state stays consistent.
         _freeze_active: bool = False
         _freeze_bbox_hint: tuple | None = None
         if _advisor is not None:
-            _freeze_active = _advisor.update_center_freeze(
+            _cf_active = _advisor.update_center_freeze(
                 track_state.bbox, getattr(track_state, 'apce', 0.0)
             )
-            _freeze_bbox_hint = _advisor.center_freeze_bbox
+            if self._enable_center_freeze:
+                _freeze_active = _cf_active
+                _freeze_bbox_hint = _advisor.center_freeze_bbox
         if _freeze_active and _freeze_bbox_hint is not None:
             cx_fr, cy_fr, bw_fr, bh_fr = _freeze_bbox_hint
             self.tracker.override_search_center(cx_fr, cy_fr, bw_fr, bh_fr)
