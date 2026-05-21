@@ -166,6 +166,12 @@ class SALTRDDataset(Dataset):
     head_names:
         List of head names to use as targets.  Defaults to HEAD_NAMES
         (all 7 predictive heads, excluding "correct").
+    drop_feature_indices:
+        Optional list of feature column indices (into the 28-dim FEATURE_NAMES
+        vector) to zero out during training/eval.  Used for ablation experiments
+        (e.g. [3, 11] to zero entropy features, [22..27] for flow features).
+        Zeroing happens at window assembly time so the model never sees those
+        features and learns as if they don't exist.
     """
 
     def __init__(
@@ -176,10 +182,12 @@ class SALTRDDataset(Dataset):
         head_names: Optional[List[str]] = None,
         all_label_names: Optional[List[str]] = None,
         exclude_dataset: Optional[str] = None,
+        drop_feature_indices: Optional[List[int]] = None,
     ) -> None:
         assert split in {"train", "val", "diagnostic"}, f"Unknown split: {split!r}"
         self.split = split
         self.window_size = window_size
+        self.drop_feature_indices: List[int] = list(drop_feature_indices) if drop_feature_indices else []
         self.head_names: List[str] = head_names if head_names is not None else list(_HEAD_NAMES)
         # Use provided label schema or fall back to v0 default.
         # When training on v1 NPZ, pass all_label_names=LABEL_NAMES_V1 so that
@@ -222,6 +230,9 @@ class SALTRDDataset(Dataset):
         # Window: [frame_idx - window_size + 1, frame_idx] inclusive
         start = frame_idx - self.window_size + 1
         window = feats[start : frame_idx + 1]           # (window_size, n_features)
+        if self.drop_feature_indices:
+            window = window.copy()
+            window[:, self.drop_feature_indices] = 0.0
         target = labs[frame_idx, self.head_label_indices]  # (n_heads,)
         return (
             torch.from_numpy(window),
@@ -395,6 +406,7 @@ def train(
     point_sidecar_path: str | None = None,
     point_feature_names: list[str] | None = None,
     exclude_dataset: str | None = None,
+    drop_feature_indices: list[int] | None = None,
 ) -> None:
     """Train SALTRD on the given NPZ dataset.
 
@@ -428,6 +440,11 @@ def train(
         Optional list of memory feature names to select (subset of all 9 dims).
         If None, all dims from the sidecar are used (backwards-compatible default).
         Example: ["mem_pos_max_sim", "mem_pos_mean_sim"] uses only 2 dims.
+    drop_feature_indices:
+        Optional list of feature column indices to zero out during training and
+        validation.  Used for ablation experiments.  Example: [3, 11] zeros
+        entropy and entropy_delta_5; [22, 23, 24, 25, 26, 27] zeros all flow
+        features.  The model is trained as if those features do not exist.
     """
     # ------------------------------------------------------------------
     # 0. Seed
@@ -438,6 +455,9 @@ def train(
 
     dev = _resolve_device(device)
     print(f"[train] device={dev}  npz={npz_path}  schema={label_schema}", flush=True)
+    if drop_feature_indices:
+        _drop_names = [FEATURE_NAMES[i] if i < len(FEATURE_NAMES) else f"idx_{i}" for i in drop_feature_indices]
+        print(f"[train] drop_feature_indices={drop_feature_indices}  ({_drop_names})", flush=True)
 
     # ------------------------------------------------------------------
     # 0b. Load memory sidecar (optional — DAM-style 9-dim features)
@@ -509,6 +529,7 @@ def train(
         npz_path, split="train", window_size=window_size,
         head_names=_schema_head_names, all_label_names=_schema_label_names,
         exclude_dataset=exclude_dataset,
+        drop_feature_indices=drop_feature_indices,
     )
     print(f"[train] train samples: {len(train_ds):,}", flush=True)
 
@@ -517,6 +538,7 @@ def train(
         npz_path, split="val", window_size=window_size,
         head_names=_schema_head_names, all_label_names=_schema_label_names,
         exclude_dataset=exclude_dataset,
+        drop_feature_indices=drop_feature_indices,
     )
     print(f"[train] val samples:   {len(val_ds):,}", flush=True)
 
@@ -763,6 +785,7 @@ def train(
                     "point_dim": point_dim,
                     "point_sidecar_path": str(point_sidecar_path) if point_sidecar_path else "",
                     "point_feature_names": point_feature_names or (all_point_feature_names if point_features else []),
+                    "drop_feature_indices": list(drop_feature_indices) if drop_feature_indices else [],
                 },
                 ckpt_path,
             )
@@ -867,7 +890,36 @@ def main() -> None:
             "Example: --exclude-dataset dtb70"
         ),
     )
+    parser.add_argument(
+        "--drop-features",
+        type=str,
+        default=None,
+        help=(
+            "Comma-separated feature indices or names to zero during training and eval. "
+            "Indices must be in range [0, 27] for the 28-dim FEATURE_NAMES vector. "
+            "Example: --drop-features 3,11 (no-entropy: entropy, entropy_delta_5); "
+            "--drop-features 22,23,24,25,26,27 (no-flow: all 6 flow features); "
+            "--drop-features entropy,entropy_delta_5 (same as 3,11 but by name)."
+        ),
+    )
     args = parser.parse_args()
+
+    # Parse --drop-features: accept comma-separated indices or feature names
+    drop_feature_indices: list[int] | None = None
+    if args.drop_features:
+        parts = [p.strip() for p in args.drop_features.split(",") if p.strip()]
+        resolved: list[int] = []
+        for p in parts:
+            if p.isdigit():
+                resolved.append(int(p))
+            else:
+                if p not in FEATURE_NAMES:
+                    raise ValueError(
+                        f"--drop-features: unknown feature name {p!r}. "
+                        f"Valid names: {list(FEATURE_NAMES)}"
+                    )
+                resolved.append(FEATURE_NAMES.index(p))
+        drop_feature_indices = resolved
 
     train(
         npz_path=args.npz,
@@ -885,6 +937,7 @@ def main() -> None:
         point_sidecar_path=args.point_sidecar,
         point_feature_names=args.point_feature_names.split(",") if args.point_feature_names else None,
         exclude_dataset=args.exclude_dataset,
+        drop_feature_indices=drop_feature_indices,
     )
 
 

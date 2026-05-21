@@ -860,6 +860,7 @@ def _run_inference(
     features_dict: dict[str, np.ndarray],
     window_size: int,
     device: str,
+    drop_feature_indices: list[int] | None = None,
 ) -> dict[str, np.ndarray]:
     """Run model inference over all sequences.
 
@@ -877,6 +878,9 @@ def _run_inference(
         Temporal window length fed to the GRU.
     device:
         Torch device string.
+    drop_feature_indices:
+        Optional list of feature column indices to zero before inference.
+        Must match the indices used during training for consistent ablations.
 
     Returns
     -------
@@ -894,6 +898,10 @@ def _run_inference(
     with torch.no_grad():
         for seq_key, feats in features_dict.items():
             n = feats.shape[0]
+            # Apply feature zeroing if requested (ablation mode)
+            if drop_feature_indices:
+                feats = feats.copy()
+                feats[:, drop_feature_indices] = 0.0
             x = torch.tensor(feats, dtype=torch.float32, device=device)  # (n, F)
 
             # Build sliding windows: (n_windows, window_size, F)
@@ -1016,6 +1024,7 @@ def evaluate(
     calibrate_heads: list[str] | None = None,
     memory_sidecar_path: str | None = None,
     point_sidecar_path: str | None = None,
+    drop_feature_indices: list[int] | None = None,
 ) -> dict[str, Any]:
     """Run full evaluation and return results dict.
 
@@ -1045,6 +1054,10 @@ def evaluate(
         (float32, T×9).  If None or file does not exist, evaluation uses the
         base 28-dim features only.  Sequences missing from the sidecar are
         padded with zeros when the checkpoint expects a 37-dim model.
+    drop_feature_indices:
+        Optional list of feature column indices (into the 28-dim FEATURE_NAMES
+        vector) to zero during inference.  Must match the indices used during
+        training.  Example: [3, 11] for no-entropy, [22..27] for no-flow.
 
     Returns
     -------
@@ -1062,6 +1075,13 @@ def evaluate(
     # 1. Load NPZ
     # ------------------------------------------------------------------
     print(f"Loading NPZ: {npz_path}  split={split}")
+    if drop_feature_indices:
+        try:
+            from salt_r.collect_features import FEATURE_NAMES as _FN
+            _drop_names = [_FN[i] if i < len(_FN) else f"idx_{i}" for i in drop_feature_indices]
+        except Exception:
+            _drop_names = [f"idx_{i}" for i in drop_feature_indices]
+        print(f"  drop_feature_indices={drop_feature_indices}  ({_drop_names})")
     features_dict, labels_dict, iou_dict = _load_npz_split(npz_path, split)
 
     # Read label names from NPZ (fall back to collect_features default)
@@ -1259,7 +1279,7 @@ def evaluate(
             aug[seq_key] = augmented
         infer_features_dict = aug
 
-    preds_dict = _run_inference(model, infer_features_dict, window_size, device)
+    preds_dict = _run_inference(model, infer_features_dict, window_size, device, drop_feature_indices=drop_feature_indices)
     has_preds = bool(preds_dict)
 
     # Derive actual head names from the loaded model (works for v0 and v1 schemas).
@@ -1487,6 +1507,7 @@ def evaluate(
         "point_sidecar_path": point_sidecar_path or None,
         "point_feature_names_used": list(_ckpt_point_feature_names) if _ckpt_point_feature_names else [],
         "point_dim": _ckpt_point_dim_only,
+        "drop_feature_indices": list(drop_feature_indices) if drop_feature_indices else [],
     }
 
     if calibrate_heads and temperatures:
@@ -1623,11 +1644,43 @@ def main() -> None:
             "Required when checkpoint was trained with --point-sidecar."
         ),
     )
+    parser.add_argument(
+        "--drop-features",
+        type=str,
+        default=None,
+        help=(
+            "Comma-separated feature indices or names to zero during inference. "
+            "Must match the indices used during training for consistent ablations. "
+            "Example: --drop-features 3,11 (no-entropy); "
+            "--drop-features 22,23,24,25,26,27 (no-flow)."
+        ),
+    )
     args = parser.parse_args()
 
     calibrate_heads: list[str] | None = None
     if args.calibrate_heads is not None:
         calibrate_heads = args.calibrate_heads if args.calibrate_heads else list(RELIABILITY_HEADS)
+
+    # Parse --drop-features: accept comma-separated indices or feature names
+    drop_feature_indices: list[int] | None = None
+    if args.drop_features:
+        try:
+            from salt_r.collect_features import FEATURE_NAMES as _FN
+        except Exception:
+            _FN = []
+        parts = [p.strip() for p in args.drop_features.split(",") if p.strip()]
+        resolved: list[int] = []
+        for p in parts:
+            if p.isdigit():
+                resolved.append(int(p))
+            elif _FN and p in _FN:
+                resolved.append(_FN.index(p))
+            else:
+                raise ValueError(
+                    f"--drop-features: unknown feature name or non-integer {p!r}. "
+                    f"Valid names: {list(_FN) if _FN else 'FEATURE_NAMES unavailable'}"
+                )
+        drop_feature_indices = resolved
 
     results = evaluate(
         npz_path=args.npz,
@@ -1640,6 +1693,7 @@ def main() -> None:
         calibrate_heads=calibrate_heads,
         memory_sidecar_path=args.memory_sidecar,
         point_sidecar_path=args.point_sidecar,
+        drop_feature_indices=drop_feature_indices,
     )
     verdict = check_go_nogo(results)
     print(f"\nGO/NO-GO: {verdict}")
