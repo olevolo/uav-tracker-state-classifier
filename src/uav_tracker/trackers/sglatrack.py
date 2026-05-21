@@ -896,6 +896,14 @@ class SGLATracker:
         """Attach a SALTRDAdvisor instance for Stage 2 advisory/veto mode."""
         self._salt_rd_advisor = advisor
 
+    def override_search_center(self, cx: float, cy: float, w: float, h: float) -> None:
+        """Override the search center for the next update() call.
+
+        Used by center-freeze policy: prevents tracker from drifting to distractor
+        by locking the search region to the last trusted position.
+        """
+        self._state = BBox(x=cx - w / 2, y=cy - h / 2, w=w, h=h)
+
     @property
     def is_stub_mode(self) -> bool:
         return self._is_stub

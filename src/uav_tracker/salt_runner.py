@@ -394,6 +394,20 @@ class SALTRunner:
         psr = getattr(track_state, 'psr', 0.0)
         response_entropy = getattr(track_state, 'response_entropy', 0.0)
 
+        # Center-freeze (Stage 3 / Phase 5)
+        _freeze_active: bool = False
+        _freeze_bbox_hint: tuple | None = None
+        if _advisor is not None:
+            _freeze_active = _advisor.update_center_freeze(
+                track_state.bbox, getattr(track_state, 'apce', 0.0)
+            )
+            _freeze_bbox_hint = _advisor.center_freeze_bbox
+        if _freeze_active and _freeze_bbox_hint is not None:
+            cx_fr, cy_fr, bw_fr, bh_fr = _freeze_bbox_hint
+            self.tracker.override_search_center(cx_fr, cy_fr, bw_fr, bh_fr)
+            # Note: output bbox is still the tracker's output, not the frozen bbox.
+            # The freeze affects next-frame search center, not current output bbox.
+
         # prev_bbox for flow warp: last confirmed position before this frame
         prev_bbox: BBox = self._trajectory[-1] if self._trajectory else track_state.bbox
 
@@ -546,6 +560,35 @@ class SALTRunner:
             self._lost_cooldown -= 1
 
         # ---- Step 4: Recovery — only after N consecutive LOST frames ----
+        # Phase 7: early recovery priming — set flag when SALT-RD signals imminent
+        # failure before TSA declares LOST. The flag is used in the recovery block
+        # below to prefer spatially-constrained detection over full-frame search.
+        _saltrd_early_recovery_primed: bool = getattr(self, '_saltrd_early_recovery_primed', False)
+        if _advisor is not None and _advisor.should_trigger_early_recovery():
+            if not _saltrd_early_recovery_primed:
+                _logger.debug(
+                    "SALT-RD Phase 7: early recovery primed at frame %d (p_fc=%.3f)",
+                    self._frame_idx, _advisory_p_fc,
+                )
+            self._saltrd_early_recovery_primed = True
+            _saltrd_early_recovery_primed = True
+
+        # Reset early-recovery prime when APCE recovers to healthy level for 3
+        # consecutive frames (proxy for successful self-recovery by the tracker).
+        if _saltrd_early_recovery_primed and apce > 150.0:
+            _apce_recovery_count = getattr(self, '_saltrd_apce_recovery_count', 0) + 1
+            self._saltrd_apce_recovery_count = _apce_recovery_count
+            if _apce_recovery_count >= 3:
+                self._saltrd_early_recovery_primed = False
+                _saltrd_early_recovery_primed = False
+                self._saltrd_apce_recovery_count = 0
+                _logger.debug(
+                    "SALT-RD Phase 7: early recovery prime cleared (APCE recovered) at frame %d",
+                    self._frame_idx,
+                )
+        else:
+            self._saltrd_apce_recovery_count = 0
+
         _genuine_loss = (self._consecutive_lost >= self._RECOVERY_MIN_LOST)
         _past_warmup = (self._frame_idx >= self._RECOVERY_WARMUP_FRAMES)
         if (_genuine_loss
@@ -566,7 +609,76 @@ class SALTRunner:
                     self._consecutive_lost,
                     self._consecutive_occluded,
                 )
-                detections = self.detector.detect(frame, hint_bbox=_frozen_hint)
+
+                # Phase 7: spatially-constrained recovery
+                # When an advisor is attached and has a reference bbox, crop the frame
+                # to a 3× expanded window around the last known good position before
+                # running the detector. This reduces distractor false-positives that
+                # arise when full-frame YOLO finds a different target class in a
+                # crowded scene (e.g. wrong cyclist in bike2, building in uav2).
+                _use_constrained_recovery: bool = False
+                _recovery_crop: "tuple[float, float, float, float] | None" = None
+
+                if _advisor is not None:
+                    _fh, _fw = frame.shape[:2]
+                    _recovery_crop = _advisor.get_recovery_crop_bbox(_fh, _fw, expand_factor=3.0)
+                    if _recovery_crop is not None:
+                        _use_constrained_recovery = True
+
+                if _use_constrained_recovery and _recovery_crop is not None:
+                    _rx, _ry, _rw, _rh = _recovery_crop
+                    _rx_i, _ry_i = int(_rx), int(_ry)
+                    _rw_i, _rh_i = max(1, int(_rw)), max(1, int(_rh))
+
+                    cropped_frame = frame[_ry_i:_ry_i + _rh_i, _rx_i:_rx_i + _rw_i]
+
+                    if cropped_frame.size > 0:
+                        crop_detections = self.detector.detect(cropped_frame, hint_bbox=None)
+
+                        # Offset detection coordinates back to full-frame space.
+                        # Use a lightweight wrapper so we don't depend on the
+                        # concrete Detection type (YOLOv8 uses 'score', VisDrone
+                        # uses 'confidence'; _best_detection accesses 'confidence').
+                        class _OffsetDet:
+                            __slots__ = ("bbox", "confidence", "class_id")
+                            def __init__(self, d: Any, dx: int, dy: int) -> None:
+                                self.bbox = BBox(
+                                    x=d.bbox.x + dx,
+                                    y=d.bbox.y + dy,
+                                    w=d.bbox.w,
+                                    h=d.bbox.h,
+                                )
+                                # VisDrone uses .confidence, YOLOv8 uses .score
+                                self.confidence = float(
+                                    getattr(d, "confidence", None)
+                                    or getattr(d, "score", 0.0)
+                                )
+                                self.class_id = getattr(d, "class_id", None)
+
+                        full_frame_detections = [
+                            _OffsetDet(_det, _rx_i, _ry_i)
+                            for _det in crop_detections
+                        ]
+
+                        if full_frame_detections:
+                            detections = full_frame_detections
+                            _logger.warning(
+                                "SALT-RD Phase 7: constrained recovery used "
+                                "crop=(%.0f,%.0f %.0f×%.0f) n_dets=%d",
+                                _rx, _ry, _rw, _rh, len(detections),
+                            )
+                        else:
+                            # No detections in crop — fall back to full-frame pass
+                            _logger.debug(
+                                "SALT-RD Phase 7: constrained crop empty, falling back to full frame"
+                            )
+                            detections = self.detector.detect(frame, hint_bbox=_frozen_hint)
+                            _use_constrained_recovery = False
+                    else:
+                        detections = self.detector.detect(frame, hint_bbox=_frozen_hint)
+                        _use_constrained_recovery = False
+                else:
+                    detections = self.detector.detect(frame, hint_bbox=_frozen_hint)
                 if detections:
                     # Guard 4: class filter — keep only detections matching the target class
                     if self._target_class is not None:
@@ -697,6 +809,8 @@ class SALTRunner:
                                 self._lost_cooldown = 0
                                 self._consecutive_lost = 0  # reset after successful recovery
                                 self._consecutive_occluded = 0  # reset so escalation restarts cleanly
+                                self._saltrd_early_recovery_primed = False  # Phase 7: clear prime on recovery
+                                self._saltrd_apce_recovery_count = 0
                                 self._trajectory.append(track_state.bbox)
                                 if len(self._trajectory) > 200:
                                     self._trajectory = self._trajectory[-200:]
@@ -715,6 +829,10 @@ class SALTRunner:
                                         "apce_raw": 0.0,
                                         "psr_raw": 0.0,
                                         "entropy_raw": 0.0,
+                                        # Phase 7 telemetry
+                                        "saltrd_constrained_recovery_used": _use_constrained_recovery,
+                                        "saltrd_recovery_crop": list(_recovery_crop) if _recovery_crop else None,
+                                        "saltrd_early_recovery_primed": _saltrd_early_recovery_primed,
                                     },
                                 )
                         else:
@@ -799,9 +917,25 @@ class SALTRunner:
         }
         if _advisor is not None:
             _aux["salt_rd_p_fc"] = _advisory_p_fc
+            _aux["salt_rd_p_ifd10"] = 0.0  # placeholder: p_ifd10 not yet computed
             _aux["salt_rd_template_attempted"] = _template_attempted
             _aux["salt_rd_template_updated"] = _template_updated
             _aux["salt_rd_reinit_vetoed"] = _reinit_vetoed
+            # Action audit telemetry fields (hard_bench Phase 1+2)
+            _aux["template_update_attempted"] = _template_attempted
+            _aux["template_update_blocked"] = (_template_attempted and not _template_updated and not _advisor.should_block_template_update() is False)
+            _aux["template_update_allowed"] = _template_attempted and not _aux["template_update_blocked"]
+            _aux["template_updated"] = _template_updated
+            _aux["template_gate_reason"] = _advisor._last_gate_reason
+            _aux["reinit_vetoed"] = _reinit_vetoed
+            _aux["search_expanded_by_risk"] = False  # placeholder for Phase 5
+            # Phase 7 telemetry (always emitted when advisor is attached)
+            _aux["saltrd_constrained_recovery_used"] = False
+            _aux["saltrd_recovery_crop"] = None
+            _aux["saltrd_early_recovery_primed"] = _saltrd_early_recovery_primed
+            # Center-freeze telemetry (Stage 3 / Phase 5)
+            _aux["center_freeze_active"] = _freeze_active
+            _aux["center_freeze_bbox"] = list(_freeze_bbox_hint) if _freeze_bbox_hint else None
             # Stage 3: SALT-RD primary state telemetry
             if _saltrd_policy is not None:
                 _aux["saltrd_state"] = _saltrd_policy['state'].value
@@ -1021,6 +1155,9 @@ class SALTRunner:
         self._ref_embedding = None
         self._target_class = None
         self._last_recovery_sim = 0.0
+        # Phase 7: reset early-recovery priming state
+        self._saltrd_early_recovery_primed = False
+        self._saltrd_apce_recovery_count = 0
         if self.tsa:
             self.tsa.reset()
         if self.appearance_memory:
