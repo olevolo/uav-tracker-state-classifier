@@ -231,6 +231,13 @@ class SGLATracker:
         self._is_stub: bool = True
         self._template_last_update: int = 0
         self._template_update_count: int = 0  # hard cap: max 5 updates per sequence
+        # Per-frame embedding export hook — populated after every update() call.
+        # All three are extracted from backbone_feat[:, -256:, :] (search tokens, 16×16 grid)
+        # and template tokens [:, :64, :]. Zero extra inference cost.
+        self._last_search_global: torch.Tensor | None = None
+        self._last_search_score_weighted: torch.Tensor | None = None
+        self._last_search_peak_local: torch.Tensor | None = None
+        self._last_template_embedding: torch.Tensor | None = None
 
     @property
     def _device(self) -> torch.device:
@@ -293,6 +300,34 @@ class SGLATracker:
         with torch.no_grad():
             out = self._model(template=self._z_tensor, search=x_tensor,
                               ce_template_mask=None)
+
+            # --- Per-frame embedding export hook ---
+            # Extracts 3 views of search appearance + template embedding.
+            # backbone_feat shape: (1, 320, 192) — first 64 = template, last 256 = search.
+            # score_map shape: (1, 1, 16, 16) — spatial confidence over 16×16 search grid.
+            if 'backbone_feat' in out:
+                _bfeat = out['backbone_feat']
+                _search_tokens = _bfeat[:, -256:, :].squeeze(0)  # (256, 192)
+
+                # 1. Global mean-pool over all 256 search tokens
+                self._last_search_global = _search_tokens.mean(0)  # (192,)
+
+                # 2. Score-map-weighted mean: softmax weights from (1,1,16,16) → (256,)
+                _score = out['score_map'].squeeze()          # (16, 16)
+                _weights = _score.reshape(256).softmax(0)    # (256,) normalized
+                self._last_search_score_weighted = (_weights.unsqueeze(1) * _search_tokens).sum(0)  # (192,)
+
+                # 3. Mean of tokens in 3×3 neighborhood around score peak
+                _flat_peak = _score.reshape(256).argmax()
+                _pr, _pc = _flat_peak // 16, _flat_peak % 16
+                _rs = torch.clamp(torch.arange(_pr - 1, _pr + 2, device=_score.device), 0, 15)
+                _cs = torch.clamp(torch.arange(_pc - 1, _pc + 2, device=_score.device), 0, 15)
+                _idxs = (_rs.unsqueeze(1) * 16 + _cs.unsqueeze(0)).reshape(-1)
+                self._last_search_peak_local = _search_tokens[_idxs].mean(0)  # (192,)
+
+                # Template embedding: mean-pool over 64 template tokens
+                self._last_template_embedding = _bfeat[:, :64, :].mean(dim=1).squeeze(0)  # (192,)
+            # --- end embedding hook ---
 
         # Apply Hann window to score map for smoother localisation
         score_map = out["score_map"]                          # (1,1,16,16)
@@ -440,6 +475,34 @@ class SGLATracker:
                 ce_keep_rate=ce_keep_rate,
                 pruning_mode=self._pruning_mode,
             )
+
+            # --- Per-frame embedding export hook ---
+            # Extracts 3 views of search appearance + template embedding.
+            # backbone_feat shape: (1, 320, 192) — first 64 = template, last 256 = search.
+            # score_map shape: (1, 1, 16, 16) — spatial confidence over 16×16 search grid.
+            if 'backbone_feat' in out:
+                _bfeat = out['backbone_feat']
+                _search_tokens = _bfeat[:, -256:, :].squeeze(0)  # (256, 192)
+
+                # 1. Global mean-pool over all 256 search tokens
+                self._last_search_global = _search_tokens.mean(0)  # (192,)
+
+                # 2. Score-map-weighted mean: softmax weights from (1,1,16,16) → (256,)
+                _score = out['score_map'].squeeze()          # (16, 16)
+                _weights = _score.reshape(256).softmax(0)    # (256,) normalized
+                self._last_search_score_weighted = (_weights.unsqueeze(1) * _search_tokens).sum(0)  # (192,)
+
+                # 3. Mean of tokens in 3×3 neighborhood around score peak
+                _flat_peak = _score.reshape(256).argmax()
+                _pr, _pc = _flat_peak // 16, _flat_peak % 16
+                _rs = torch.clamp(torch.arange(_pr - 1, _pr + 2, device=_score.device), 0, 15)
+                _cs = torch.clamp(torch.arange(_pc - 1, _pc + 2, device=_score.device), 0, 15)
+                _idxs = (_rs.unsqueeze(1) * 16 + _cs.unsqueeze(0)).reshape(-1)
+                self._last_search_peak_local = _search_tokens[_idxs].mean(0)  # (192,)
+
+                # Template embedding: mean-pool over 64 template tokens
+                self._last_template_embedding = _bfeat[:, :64, :].mean(dim=1).squeeze(0)  # (192,)
+            # --- end embedding hook ---
 
         score_map = out["score_map"]
         score_map = self._hann * score_map
