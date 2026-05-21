@@ -1298,8 +1298,106 @@ These two runs are the **single most important missing experiment**.
 | `SALTRDState` / `stage3_policy()` | OK — removed |
 | Policy training | OK — epoch 34, recall=0.73, READY FOR ROLLOUT |
 | Rollout diagnostic split | **MISSING — highest priority** |
-| Rollout val split | **MISSING — needed for wrong-reinit check** |
-| Hard subset AUC delta | NOT MEASURED — rollout needed |
-| Changed bbox frames | NOT MEASURED — rollout needed |
-| Calibration | NOT RUN — after rollout GO only |
-| FROZEN.md | STALE — superseded by SUPER_PLAN, archive it |
+| Rollout val split | OK — mean delta +0.303, 25% changed_bbox, zero regressions |
+| Hard subset AUC delta | **MISSING — diagnostic rollout not run** |
+| Changed bbox frames | OK on val (25%) — hard seqs not yet measured |
+| Calibration | RUN but BUG-9 — ECE degraded (0.075→0.104) |
+| FROZEN.md | OK — updated to post-TSA architecture |
+
+---
+
+## Review — 2026-05-22 Pass 9
+
+### [OK] Large infrastructure wave landed (untracked, pending commit)
+
+New production scripts:
+- `scripts/bench_all.py` — orchestrates full benchmark (risk eval, oracle audit, policy rollout, calibration, comparison table)
+- `scripts/make_demo_video.py` — bbox overlay video generator
+- `scripts/run_paper_comparison.py` — paper comparison table runner
+- `src/uav_tracker/metrics/flops.py` — FLOPs measurement
+- `tests/unit/test_saltr_flops.py` — FLOPs tests
+
+New artifacts:
+- `saltr/results/demo_bike1.mp4` — demonstration video created ✓
+- `saltr/results/bench_all/` — timestamped benchmark runs
+- `saltr/results/paper_comparison.md` — comparison table (SALT-RD v1 AUC TO_FILL)
+- `docs/paper/main_en.tex` / `.pdf` — paper being written
+
+Stale docs archived: ANALYSIS.md, HANDOFF_NEXT.md, SESSION_SUMMARY.md → `archive/docs/`.
+FROZEN.md updated to reflect post-TSA architecture.
+
+### [OK] FROZEN.md correctly updated
+
+Old rule "preserve update_with_state() for ablation" removed. New rules:
+- No runtime thresholds on APCE/p_fc (all decisions from learned heads)
+- TSA permanently deleted
+- CE available via config (`enable_ce: false`), not via deleted method
+
+### [OK] Val rollout — strong results, zero regressions
+
+`bench_all` ran rollout on `split="val"` (49 sequences):
+
+| Metric | Value | Gate |
+|---|---:|---:|
+| mean_baseline_auc* | 0.025 | — |
+| mean_policy_auc* | 0.328 | — |
+| mean_delta* | **+0.303** | — |
+| changed_bbox_rate | **25%** | > 0.5% ✓ |
+| regressions | **0** | none ✓ |
+
+\* These are simulated recovery-frame metrics (oracle `iou_trace` + reinit_iou=0.8 assumption),
+not sequence-level AUC. The delta represents how much recovery-candidate frames improve
+under the policy vs baseline. Requires careful framing in paper.
+
+Top per-sequence deltas: `dtb70/Surfing03 +0.734`, `dtb70/Animal2 +0.676`,
+`visdrone_sot/uav0000093 +0.650`, `uav123/car12 +0.646`.
+
+No harmful sequences (no negative deltas). Bottom sequences have delta=+0.000 (model
+correctly abstained from reinit on already-tracked sequences).
+
+### [BLOCKER] Diagnostic rollout not run — hard sequences completely absent from val
+
+`bench_all.py` hardcodes `split="val"` at line 170. The hard sequences
+(uav2, uav4, uav6, uav8) are in the "diagnostic" split of the oracle NPZ.
+`hard_subset_sequences: []` in the rollout output confirms zero hard seqs in val.
+`policy_hard_auc_delta: "SKIP"` in bench_all summary confirms the hard AUC gate was not evaluated.
+
+**The SUPER_PLAN hard AUC gate (+0.10 or interim +0.08) is still unverified.**
+
+Required command:
+```bash
+PYTHONPATH=src:saltr/src .venv/bin/python -m salt_r.rollout_policy \
+  --oracle saltr/results/reinit_oracle_dataset.npz \
+  --checkpoint saltr/checkpoints/policy_reinit_v1/saltrd_policy_best.pt \
+  --split diagnostic \
+  --output saltr/results/rollout_diagnostic_policy_reinit_v1.json
+```
+
+### [BUG-9] bench_all.py hardcodes `split="val"` — no `--rollout-split` flag
+
+`bench_all.py` line 170: `split="val"` is not exposed as a CLI argument. There is no
+`--rollout-split` parameter. The diagnostic split rollout must be run manually or the
+bench_all.py must be extended with a `--rollout-split` flag.
+
+### [BUG-10] Calibration makes ECE worse — calibrate_policy applies T even when ECE degrades
+
+`calibrate_policy_val`: recovery_action ECE 0.075 → 0.104 after T=1.22.
+Temperature T > 1 moves predictions toward 0.5, which increases ECE when the model
+is already well-calibrated (ECE 0.075 is already below the 0.10 gate).
+The script should check `ece_after < ece_before` before saving the calibrated temperature.
+Current behavior: saves T=1.22 unconditionally, degrading a passing ECE to a failing one.
+
+**Note:** ECE 0.075 (pre-calibration) already PASSES the SUPER_PLAN gate of <= 0.10.
+The calibration gate is actually already satisfied — the bug makes it appear failed.
+
+### [NOTE] changed_bbox_rate=25% is oracle-based — real gain depends on candidate quality
+
+The rollout simulates reinit by assuming IoU=0.8 for `reinit_duration_frames=10` after
+each predicted REINIT. This is an upper bound: real improvement requires:
+1. A detector candidate close to the target at the predicted frame
+2. The tracker successfully re-initializing on that candidate
+
+For UAV-class sequences (uav3-7), YOLO26m candidate recall is near zero (BUG-8 from
+prior analysis). The 25% changed_bbox_rate on val is real for the val sequences (mostly
+car/person/DTB70 scenes with detectable targets), but should not be generalized to UAV.
+Paper must distinguish: "oracle-rollout AUC simulation" vs "live rollout AUC delta".
