@@ -110,5 +110,8 @@ saltr/checkpoints/eval_*.json
 saltr/checkpoints/policy_*.json
 saltr/checkpoints/preds_*.json
 
+# ---- SALT-RD temporary extraction artifacts (intermediate, not committed) ----
+saltr/tmp/
+
 # ---- Conference / presentation materials (local only) ----
 конференція/
