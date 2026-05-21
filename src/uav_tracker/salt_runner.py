@@ -376,6 +376,11 @@ class SALTRunner:
         _advisor = getattr(self.tracker, '_salt_rd_advisor', None)
         _advisory_p_fc: float = _advisor.last_p_fc if _advisor is not None else 0.0
 
+        # SALT-RD per-frame telemetry flags (updated below as events occur)
+        _template_attempted: bool = False
+        _template_updated: bool = False
+        _reinit_vetoed: bool = False
+
         # Extract score-map quality metrics (populated by SGLATracker; 0.0 for others)
         apce = getattr(track_state, 'apce', 0.0)
         psr = getattr(track_state, 'psr', 0.0)
@@ -668,6 +673,7 @@ class SALTRunner:
                                     "SALT-RD advisory: blocking reinit at frame %d (p_fc=%.3f)",
                                     self._frame_idx, _advisory_p_fc,
                                 )
+                                _reinit_vetoed = True
                                 self._lost_cooldown = 25
                                 self._prev_tsa_state_int = TargetState.OCCLUDED.value
                             else:
@@ -760,12 +766,34 @@ class SALTRunner:
                 _cosine = float(_cosine_sim(_sw.cpu().numpy(), _te.cpu().numpy()))
             else:
                 _cosine = 1.0
-            self.tracker.try_update_template(
+            _template_attempted = True
+            _template_updated = self.tracker.try_update_template(
                 frame, track_state.bbox, apce, psr, self._frame_idx, _cosine,
                 apce_threshold=150.0, psr_threshold=500.0,
                 min_interval=100, cosine_threshold=0.80, max_updates=3,
             )
 
+
+        # Build aux dict; attach extended SALT-RD telemetry when an advisor is present
+        _aux: dict[str, Any] = {
+            "target_state": state_name,
+            "tsa_confidence": tsa_confidence,
+            "lstm_pred": (
+                [lstm_pred.x, lstm_pred.y, lstm_pred.w, lstm_pred.h]
+                if lstm_pred else None
+            ),
+            "appearance_drift": round(drift, 4),
+            # SALT-RD telemetry — zero/empty-defaulted, does not change tracker behaviour
+            "score_map_stats": getattr(track_state, "score_map_stats", {}),
+            "apce_raw": getattr(track_state, "apce", 0.0),
+            "psr_raw": getattr(track_state, "psr", 0.0),
+            "entropy_raw": getattr(track_state, "response_entropy", 0.0),
+        }
+        if _advisor is not None:
+            _aux["salt_rd_p_fc"] = _advisory_p_fc
+            _aux["salt_rd_template_attempted"] = _template_attempted
+            _aux["salt_rd_template_updated"] = _template_updated
+            _aux["salt_rd_reinit_vetoed"] = _reinit_vetoed
 
         return TelemetryEntry(
             frame_idx=self._frame_idx,
@@ -773,20 +801,7 @@ class SALTRunner:
             confidence=track_state.confidence,
             tier=1,
             switched=False,
-            aux={
-                "target_state": state_name,
-                "tsa_confidence": tsa_confidence,
-                "lstm_pred": (
-                    [lstm_pred.x, lstm_pred.y, lstm_pred.w, lstm_pred.h]
-                    if lstm_pred else None
-                ),
-                "appearance_drift": round(drift, 4),
-                # SALT-RD telemetry — zero/empty-defaulted, does not change tracker behaviour
-                "score_map_stats": getattr(track_state, "score_map_stats", {}),
-                "apce_raw": getattr(track_state, "apce", 0.0),
-                "psr_raw": getattr(track_state, "psr", 0.0),
-                "entropy_raw": getattr(track_state, "response_entropy", 0.0),
-            },
+            aux=_aux,
         )
 
     def _best_detection(self, detections: list, frame: np.ndarray,
@@ -999,6 +1014,11 @@ class SALTRunner:
             self.appearance_memory.reset()
         if self.motion_predictor:
             self.motion_predictor.reset()
+        # Reset tracker template counters and advisor rolling buffers so they
+        # do not leak between sequences.  tracker.reset() calls advisor.reset()
+        # internally, so this is the single authoritative reset point.
+        if hasattr(self.tracker, 'reset'):
+            self.tracker.reset()
         elapsed_ms = (time.perf_counter() - t0) * 1000
         if elapsed_ms > 50:
             _logger.warning(

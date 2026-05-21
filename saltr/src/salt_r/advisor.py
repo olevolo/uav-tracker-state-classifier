@@ -210,6 +210,10 @@ class SALTRDAdvisor:
         self._smap_history.clear()
         self._trusted_streak = 0
         self._last_tmpl_frame = -100
+        # Reset per-sequence counters so stats reflect the current sequence only
+        self.n_blocked = 0
+        self.n_allowed = 0
+        self.n_steps = 0
 
     def step(
         self,
@@ -256,10 +260,9 @@ class SALTRDAdvisor:
         # ------------------------------------------------------------------
         # 2. Rolling ratio / delta features
         # ------------------------------------------------------------------
-        self._apce_buf.append(apce)
-        self._ent_buf.append(ent)
-        self._pmarg_buf.append(peak_margin)
-
+        # IMPORTANT: compute ratio/delta BEFORE appending current values so the
+        # history window is the previous N frames only (matching offline
+        # collect_features.py which uses feature_matrix[max(0,t-5):t, 0]).
         def _ratio(val: float, buf: deque, n: int) -> float:
             hist = list(buf)[-n:] if len(buf) >= n else list(buf)
             m = float(np.mean(hist)) if hist else 1.0
@@ -273,6 +276,11 @@ class SALTRDAdvisor:
         apce_r20 = _ratio(apce, self._apce_buf, 20)
         ent_d5   = _delta(ent, self._ent_buf, 5)
         pm_d5    = _delta(peak_margin, self._pmarg_buf, 5)
+
+        # Append current values after ratios/deltas are computed
+        self._apce_buf.append(apce)
+        self._ent_buf.append(ent)
+        self._pmarg_buf.append(peak_margin)
 
         # Streak counters
         if apce > 100.0:
