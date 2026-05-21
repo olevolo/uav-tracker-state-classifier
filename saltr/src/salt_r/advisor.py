@@ -1,8 +1,12 @@
-"""advisor.py — SALT-RD Stage 2 Advisory/Veto controller.
+"""advisor.py — SALT-RD Stage 2/3 Advisory/Veto + Primary Learned Controller.
 
 Computes the 32-dim feature vector (28 base telemetry + 4 pos-only RAM memory)
 online from live SGLATrack outputs and gates template updates by predicted
 p_false_confirmed.
+
+Stage 2 (Advisory/Veto): blocks dangerous template updates and reinits.
+Stage 3 (Primary Learned Controller): maps signals to SALTRDState and returns
+  recommended actions dict via stage3_policy().
 
 Usage
 -----
@@ -18,19 +22,37 @@ Usage
     track_state = tracker.update_with_state(frame, tsa_state)
     # advisor.step() is called automatically inside update_with_state()
 
-    # Before template update:
+    # Stage 2: Before template update:
     if not advisor.should_block_template_update():
         tracker.try_update_template(frame, bbox, apce, psr, frame_idx, cosine_sim)
+
+    # Stage 3: Get full policy dict:
+    policy = advisor.stage3_policy(tsa_state_int=0)
+    # policy['state'] is SALTRDState, policy['allow_ce_pruning'] etc.
 """
 from __future__ import annotations
 
 import math
 import sys
 from collections import deque
+from enum import Enum
 from pathlib import Path
 from typing import Any, Optional
 
 import numpy as np
+
+
+# ---------------------------------------------------------------------------
+# Stage 3 learned state enum
+# ---------------------------------------------------------------------------
+
+class SALTRDState(Enum):
+    """Primary learned tracking state produced by SALT-RD Stage 3 controller."""
+    TRUSTED_TRACKING = "trusted_tracking"
+    LOW_EVIDENCE_TRACKING = "low_evidence_tracking"
+    FALSE_CONFIRMED_RISK = "false_confirmed_risk"
+    PROACTIVE_DYNAMIC_RISK = "proactive_dynamic_risk"
+    REACQUIRE_NEEDED = "reacquire_needed"
 
 _FC_BLOCK_DEFAULT = 0.60   # mirrors shadow_mode._FC_BLOCK
 
@@ -442,6 +464,115 @@ class SALTRDAdvisor:
     def should_block_reinit(self) -> bool:
         """Block reinit when p_fc is high — tracker is false-confirmed, not lost."""
         return self._last_p_fc >= self.fc_block_reinit
+
+    # ------------------------------------------------------------------
+    # Stage 3: Primary Learned Controller
+    # ------------------------------------------------------------------
+
+    def get_state(self, tsa_state_int: int | None = None) -> SALTRDState:
+        """Classify current tracking state from SALT-RD signals.
+
+        Parameters
+        ----------
+        tsa_state_int:
+            TSA state value (0=CONFIRMED, 1=OCCLUDED, 2=LOST, 3=DYNAMIC).
+            Used only for REACQUIRE_NEEDED detection.
+
+        Returns
+        -------
+        SALTRDState member corresponding to current SALT-RD assessment.
+        """
+        p = self._last_p_fc
+
+        # Check rising edge (Gate 2 logic)
+        hist = list(self._p_fc_history)
+        rising = len(hist) >= 3 and (hist[-1] - hist[-3]) > self.delta_block
+
+        # Check score-map competition (Gate 4 logic)
+        smap_competition = any(
+            n_sec >= 1 and top2r >= self.smap_top2_block
+            for n_sec, top2r in list(self._smap_history)[-3:]
+        )
+
+        # REACQUIRE_NEEDED: high p_fc + tracker signal shows lost/occluded
+        if (p >= self.fc_block_reinit
+                and tsa_state_int is not None
+                and tsa_state_int >= 1):
+            return SALTRDState.REACQUIRE_NEEDED
+
+        # FALSE_CONFIRMED_RISK: p_fc high (confident of false tracking)
+        if p >= self.fc_block:  # 0.60
+            return SALTRDState.FALSE_CONFIRMED_RISK
+
+        # PROACTIVE_DYNAMIC_RISK: medium p_fc with rising edge or distractor
+        if p >= 0.30 and (rising or smap_competition):
+            return SALTRDState.PROACTIVE_DYNAMIC_RISK
+
+        # LOW_EVIDENCE_TRACKING: moderate uncertainty
+        if p >= 0.30:
+            return SALTRDState.LOW_EVIDENCE_TRACKING
+
+        # TRUSTED_TRACKING: low p_fc with sufficient streak
+        if self._trusted_streak >= self.streak_required:
+            return SALTRDState.TRUSTED_TRACKING
+
+        # Low p_fc but streak not yet built
+        return SALTRDState.LOW_EVIDENCE_TRACKING
+
+    def stage3_policy(self, tsa_state_int: int | None = None) -> dict:
+        """Return Stage 3 recommended actions dict for current state.
+
+        SALT-RD becomes the primary decision surface. TSA remains as fallback
+        and is still reported in telemetry.
+
+        Parameters
+        ----------
+        tsa_state_int:
+            TSA state value (0=CONFIRMED, 1=OCCLUDED, 2=LOST, 3=DYNAMIC).
+            Passed through to get_state() for REACQUIRE_NEEDED detection.
+
+        Returns
+        -------
+        dict with keys:
+          'state'               : SALTRDState — current learned state
+          'allow_ce_pruning'    : bool — CE token pruning allowed (TRUSTED only)
+          'allow_template_update': bool — template update allowed
+          'allow_reinit'        : bool — reinit allowed
+          'force_full_compute'  : bool — disable CE pruning; use full compute
+          'request_verification': bool — flag frame for external verification
+        """
+        state = self.get_state(tsa_state_int)
+        block_update = self.should_block_template_update()
+        block_reinit = self.should_block_reinit()
+
+        base: dict = {
+            'state': state,
+            'allow_ce_pruning': False,
+            'allow_template_update': not block_update,
+            'allow_reinit': not block_reinit,
+            'force_full_compute': False,
+            'request_verification': False,
+        }
+
+        if state == SALTRDState.TRUSTED_TRACKING:
+            base['allow_ce_pruning'] = True
+        elif state == SALTRDState.LOW_EVIDENCE_TRACKING:
+            base['force_full_compute'] = True
+            base['allow_template_update'] = False
+            base['allow_reinit'] = False
+        elif state == SALTRDState.FALSE_CONFIRMED_RISK:
+            base['force_full_compute'] = True
+            base['allow_template_update'] = False
+            base['allow_reinit'] = False
+            base['request_verification'] = True
+        elif state == SALTRDState.PROACTIVE_DYNAMIC_RISK:
+            base['force_full_compute'] = True
+            base['request_verification'] = True
+        elif state == SALTRDState.REACQUIRE_NEEDED:
+            # Only through calibrated gate — do not allow unconditional reinit
+            base['allow_reinit'] = False
+
+        return base
 
     @property
     def last_p_fc(self) -> float:

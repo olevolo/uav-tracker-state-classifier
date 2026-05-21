@@ -302,12 +302,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--device",     default="cpu")
     parser.add_argument("--no-frames",  action="store_true",
                         help="Omit per-frame log from JSON (smaller output)")
-    parser.add_argument("--mode", choices=["shadow", "advisory"], default="shadow",
-                        help="shadow = observe only (Stage 1); advisory = conservative veto (Stage 2)")
+    parser.add_argument("--mode", choices=["shadow", "advisory", "stage3"], default="shadow",
+                        help="shadow = observe only (Stage 1); advisory = conservative veto (Stage 2); "
+                             "stage3 = primary learned controller reporting (Stage 3)")
     args = parser.parse_args(argv)
 
     # Select policy thresholds
-    if args.mode == "advisory":
+    if args.mode in ("advisory", "stage3"):
         fc_block  = _FC_BLOCK_ADVISORY
         fc_verify = _FC_VERIFY_ADVISORY
         fc_abstain = _FC_ABSTAIN_ADVISORY
@@ -469,6 +470,15 @@ def main(argv: list[str] | None = None) -> int:
         print(f"    msu  < 0.40:   {'✅ PASS' if msu_pass  else '❌ FAIL'}  ({msu:.3f})")
         overall = "GO" if (wrir_pass and msu_pass) else "STOP"
         print(f"    → {overall}")
+    if args.mode == "stage3":
+        print()
+        print(f"  Stage 3 Primary Learned Controller — Gates:")
+        wrir_pass = wrir == 0.0
+        msu_pass  = not math.isnan(msu) and msu < 0.40
+        print(f"    wrir == 0.0:   {'✅ PASS' if wrir_pass else '❌ FAIL'}  ({wrir:.4f})")
+        print(f"    msu  < 0.40:   {'✅ PASS' if msu_pass  else '❌ FAIL'}  ({msu:.3f})")
+        overall = "GO" if (wrir_pass and msu_pass) else "STOP"
+        print(f"    → Stage 3 deployment: {overall}")
     print()
     print(f"  Learned state distribution (over active frames):")
     for state in ["TRUSTED_TRACKING","LOW_EVIDENCE_TRACKING","FALSE_CONFIRMED_RISK",

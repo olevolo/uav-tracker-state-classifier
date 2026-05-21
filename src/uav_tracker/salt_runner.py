@@ -376,6 +376,14 @@ class SALTRunner:
         _advisor = getattr(self.tracker, '_salt_rd_advisor', None)
         _advisory_p_fc: float = _advisor.last_p_fc if _advisor is not None else 0.0
 
+        # Stage 3: Get SALT-RD primary state when advisor attached
+        _saltrd_policy: dict | None = None
+        _saltrd_state = None
+        if _advisor is not None:
+            _tsa_int = self._prev_tsa_state_int
+            _saltrd_policy = _advisor.stage3_policy(_tsa_int)
+            _saltrd_state = _saltrd_policy['state']
+
         # Extract score-map quality metrics (populated by SGLATracker; 0.0 for others)
         apce = getattr(track_state, 'apce', 0.0)
         psr = getattr(track_state, 'psr', 0.0)
@@ -786,6 +794,12 @@ class SALTRunner:
                 "apce_raw": getattr(track_state, "apce", 0.0),
                 "psr_raw": getattr(track_state, "psr", 0.0),
                 "entropy_raw": getattr(track_state, "response_entropy", 0.0),
+                # Stage 3: SALT-RD primary state telemetry
+                **({
+                    "saltrd_state": _saltrd_policy['state'].value,
+                    "saltrd_allow_ce": _saltrd_policy['allow_ce_pruning'],
+                    "saltrd_force_full": _saltrd_policy['force_full_compute'],
+                } if _saltrd_policy is not None else {}),
             },
         )
 
