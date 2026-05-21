@@ -21,7 +21,7 @@ Usage::
     # Full pipeline
     python -m salt_r.make_oof_predictions \\
         --npz saltr/data/salt_rd_v2_labels.npz \\
-        --teacher-checkpoint saltr/checkpoints/v2_corrected/saltrd_best.pt \\
+        --teacher-checkpoint saltr/checkpoints/production/saltrd_best.pt \\
         --output-dir saltr/results/oof/ \\
         --merged-output saltr/results/preds_all_v2_oof_teacher.json \\
         --n-folds 5
@@ -847,12 +847,11 @@ def main() -> None:
     )
     parser.add_argument(
         "--teacher-checkpoint",
-        default="saltr/checkpoints/v2_corrected/saltrd_best.pt",
+        default="saltr/checkpoints/production/saltrd_best.pt",
         help=(
             "Path to the canonical no-memory teacher checkpoint. "
-            "Use saltr/checkpoints/v2_retrained/saltrd_best.pt for the strict baseline "
-            "(default: saltr/checkpoints/v2_corrected/saltrd_best.pt for backwards compat — "
-            "prefer v2_retrained for new experiments)."
+            "(default: saltr/checkpoints/production/saltrd_best.pt — v2_retrained, "
+            "28-dim, val AUROC=0.885)."
         ),
     )
     parser.add_argument(

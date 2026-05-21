@@ -24,10 +24,10 @@ Usage
 -----
     python -m salt_r.shadow_mode \\
         --npz saltr/data/salt_rd_v2_labels.npz \\
-        --checkpoint saltr/checkpoints/v2_1_memory/saltrd_best.pt \\
+        --checkpoint saltr/checkpoints/production/saltrd_best.pt \\
         --memory-sidecar saltr/data/salt_rd_memory_sidecar.npz \\
         --split val \\
-        --output saltr/results/shadow_mode_val_v2_1.json
+        --output saltr/results/shadow_mode_val.json
 """
 from __future__ import annotations
 

@@ -9,7 +9,7 @@ Usage
     from salt_r.advisor import SALTRDAdvisor
 
     advisor = SALTRDAdvisor(
-        checkpoint="saltr/checkpoints/v2_1_memory/saltrd_best.pt",
+        checkpoint="saltr/checkpoints/production/saltrd_best.pt",
         device="cpu",
     )
     tracker.set_salt_rd_advisor(advisor)

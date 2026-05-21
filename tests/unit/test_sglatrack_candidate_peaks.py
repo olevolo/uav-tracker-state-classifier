@@ -1,7 +1,7 @@
-"""Unit tests for SGLATrack candidate mining helpers.
+"""Unit tests for SGLATrack score-map candidate peak helpers.
 
-These tests avoid loading tracker weights.  They protect the score-map
-candidate geometry used by the offline false-confirmed pilot.
+These tests protect the geometry of candidate peak extraction and bbox
+mapping used by the tracker's multi-hypothesis output path.
 """
 
 from __future__ import annotations
@@ -48,29 +48,3 @@ def test_candidate_bbox_from_peak_maps_search_center_to_frame_center() -> None:
     assert cand["row"] == 8
     assert cand["col"] == 8
     assert np.allclose(cand["bbox"], [95.0, 95.0, 10.0, 10.0], atol=1e-5)
-
-
-def test_candidate_frame_record_marks_oracle_topk_hit() -> None:
-    from salt_r.candidate_mining_pilot import _candidate_frame_record
-
-    candidates = [
-        {"bbox": [100, 100, 20, 20]},
-        {"bbox": [10, 10, 20, 20]},
-        {"bbox": [50, 50, 20, 20]},
-    ]
-    gt = np.array([52, 52, 20, 20], dtype=np.float32)
-    pred = np.array([100, 100, 20, 20], dtype=np.float32)
-
-    rec = _candidate_frame_record(
-        frame_idx=7,
-        candidates=candidates,
-        gt_bbox_xywh=gt,
-        tracker_bbox_xywh=pred,
-        false_confirmed=True,
-    )
-
-    assert rec["false_confirmed"] is True
-    assert rec["tracker_iou"] == 0.0
-    assert rec["best_rank"] == 2
-    assert rec["top3_hit_iou03"] is True
-    assert rec["top5_hit_iou03"] is True
