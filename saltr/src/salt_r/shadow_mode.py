@@ -1,22 +1,18 @@
 """shadow_mode.py — SALT-RD Stage 1 Shadow Mode observer.
 
-Runs SALT-RD alongside pre-recorded tracker telemetry. TSA/SALTRunner output is
+Runs SALT-RD alongside pre-recorded tracker telemetry. Tracker output is
 treated as read-only ground truth — nothing is modified. SALT-RD observes and
 logs what it WOULD have recommended per frame.
 
 Per-frame output
 ----------------
 - p_fc, p_ifd10, p_ifd20, p_recoverable, p_needs_full_compute
-- learned_state: TRUSTED_TRACKING | LOW_EVIDENCE_TRACKING | FALSE_CONFIRMED_RISK |
+- learned_state: TRACKING_OK | LOW_RISK | HIGH_RISK |
                  PROACTIVE_DYNAMIC_RISK | REACQUIRE_NEEDED
 - proposed_action: allow | verify | block (template_update)
                    none | abstain | run (recovery)
-- tsa_likely_action: inferred from confirmed_streak / low_conf_streak features
-- disagree_template: SALT-RD says block, TSA would allow
-- disagree_reinit: SALT-RD says abstain, TSA would reinit
 
 Exit gates before Stage 2 (Advisory/Veto):
-  - wrir = 0 (vacuously true in shadow)
   - no leakage: this script never writes to training data
   - calibration from val only; diagnostic never used for threshold tuning
 
@@ -56,14 +52,14 @@ def classify_learned_state(probs: dict[str, float]) -> str:
     p_i20 = probs.get("imminent_failure_dynamic_20", probs.get("failure_in_20", 0.0))
 
     if p_fc >= 0.60:
-        return "FALSE_CONFIRMED_RISK"
+        return "HIGH_RISK"
     if p_rec >= 0.60:
         return "REACQUIRE_NEEDED"
     if max(p_i10, p_i20) >= 0.50:
         return "PROACTIVE_DYNAMIC_RISK"
     if p_fc >= 0.30:
-        return "LOW_EVIDENCE_TRACKING"
-    return "TRUSTED_TRACKING"
+        return "LOW_RISK"
+    return "TRACKING_OK"
 
 
 # ---------------------------------------------------------------------------
@@ -115,26 +111,6 @@ def _apply_shadow_policy(
 
 
 # ---------------------------------------------------------------------------
-# TSA state inference from telemetry features
-# ---------------------------------------------------------------------------
-
-# Feature index constants (must match collect_features.FEATURE_NAMES)
-_CONFIRMED_STREAK_IDX = 13  # confirmed_streak
-_LOW_CONF_STREAK_IDX  = 14  # low_conf_streak
-
-
-def _infer_tsa_action(feat: np.ndarray) -> dict[str, str]:
-    """Infer what TSA is likely doing based on telemetry features."""
-    confirmed_streak = float(feat[_CONFIRMED_STREAK_IDX])
-    low_conf_streak  = float(feat[_LOW_CONF_STREAK_IDX])
-    # TSA updates template when confirmed for several consecutive frames
-    tsa_template = "allow" if confirmed_streak >= 3 else "hold"
-    # TSA reinits when low_conf_streak is very high (approaching LOST)
-    tsa_recovery = "reinit" if low_conf_streak >= 10 else "none"
-    return {"template_update": tsa_template, "recovery": tsa_recovery}
-
-
-# ---------------------------------------------------------------------------
 # Per-frame analysis
 # ---------------------------------------------------------------------------
 
@@ -162,22 +138,12 @@ def _analyse_frame(
 
     learned_state = classify_learned_state(probs)
     action = _apply_shadow_policy(probs, fc_block=fc_block, fc_verify=fc_verify, fc_abstain=fc_abstain)
-    tsa_action = _infer_tsa_action(feat_37[:28])  # telemetry-only features
 
     fc_idx  = label_names.index("false_confirmed")
     cor_idx = label_names.index("correct")
     label_fc  = int(label_row[fc_idx])
     label_cor = int(label_row[cor_idx])
 
-    # Disagreements
-    disagree_template = (
-        action["template_update"] == "block"
-        and tsa_action["template_update"] == "allow"
-    )
-    disagree_reinit = (
-        action["recovery"] == "abstain"
-        and tsa_action["recovery"] == "reinit"
-    )
     # False alarm: SALT-RD blocks but tracker is actually correct
     false_alarm = (action["template_update"] == "block") and (label_cor == 1)
     # True block: SALT-RD blocks and tracker is false-confirmed
@@ -193,12 +159,8 @@ def _analyse_frame(
         "learned_state": learned_state,
         "template_action": action["template_update"],
         "recovery_action": action["recovery"],
-        "tsa_template":    tsa_action["template_update"],
-        "tsa_reinit":      int(tsa_action["recovery"] == "reinit"),
         "label_fc":   label_fc,
         "label_cor":  label_cor,
-        "disagree_template": int(disagree_template),
-        "disagree_reinit":   int(disagree_reinit),
         "false_alarm":  int(false_alarm),
         "true_block":   int(true_block),
     }
@@ -249,12 +211,8 @@ def run_sequence(
     n_cor  = sum(f["label_cor"] for f in frames)
     n_block = sum(1 for f in frames if f["template_action"] == "block")
     n_verify = sum(1 for f in frames if f["template_action"] == "verify")
-    n_disagree_tmpl = sum(f["disagree_template"] for f in frames)
-    n_disagree_reinit = sum(f["disagree_reinit"] for f in frames)
     n_false_alarm = sum(f["false_alarm"] for f in frames)
     n_true_block  = sum(f["true_block"] for f in frames)
-    n_tsa_allow   = sum(1 for f in frames if f["tsa_template"] == "allow")
-    n_tsa_reinit  = sum(f.get("tsa_reinit", 0) for f in frames)
 
     state_counts: dict[str, int] = defaultdict(int)
     for f in frames:
@@ -275,10 +233,6 @@ def run_sequence(
             "n_verify": n_verify,
             "n_true_block":  n_true_block,
             "n_false_alarm": n_false_alarm,
-            "n_disagree_template": n_disagree_tmpl,
-            "n_disagree_reinit":   n_disagree_reinit,
-            "n_tsa_allow": n_tsa_allow,
-            "n_tsa_reinit": n_tsa_reinit,
             "block_rate_when_fc":      round(block_given_fc,  4) if not __import__("math").isnan(block_given_fc)  else None,
             "block_rate_when_correct": round(block_given_cor, 4) if not __import__("math").isnan(block_given_cor) else None,
             "learned_state_dist": dict(state_counts),
@@ -339,14 +293,6 @@ def main(argv: list[str] | None = None) -> int:
     ck = torch.load(args.checkpoint, map_location="cpu")
     window_size = int(ck.get("window_size", 20))
     feat_names  = list(ck.get("feature_names", []))
-    if feat_names:
-        assert len(feat_names) > _LOW_CONF_STREAK_IDX, "Feature names too short for streak indices"
-        assert feat_names[_CONFIRMED_STREAK_IDX] == "confirmed_streak", (
-            f"Expected feat_names[{_CONFIRMED_STREAK_IDX}]='confirmed_streak', got {feat_names[_CONFIRMED_STREAK_IDX]!r}"
-        )
-        assert feat_names[_LOW_CONF_STREAK_IDX] == "low_conf_streak", (
-            f"Expected feat_names[{_LOW_CONF_STREAK_IDX}]='low_conf_streak', got {feat_names[_LOW_CONF_STREAK_IDX]!r}"
-        )
     mem_dim     = int(ck.get("memory_dim", 0))
     label_names_ck = list(ck.get("label_names", []))
     print(f"[shadow_mode] window_size={window_size}  feat_dim={len(feat_names)}  memory_dim={mem_dim}", flush=True)
@@ -422,7 +368,6 @@ def main(argv: list[str] | None = None) -> int:
             f"  {seq_key:<42} "
             f"fc={s.get('n_fc',0):>4}  "
             f"block={s.get('n_block',0):>4}  "
-            f"disagree={s.get('n_disagree_template',0):>4}  "
             f"FA={s.get('block_rate_when_correct') or 0:.2f}  "
             f"cov={s.get('block_rate_when_fc') or 0:.2f}",
             flush=True,
@@ -434,9 +379,7 @@ def main(argv: list[str] | None = None) -> int:
     for r in results:
         s = r["stats"]
         for k in ("n_fc","n_correct","n_block","n_verify",
-                  "n_true_block","n_false_alarm",
-                  "n_disagree_template","n_disagree_reinit",
-                  "n_tsa_allow","n_tsa_reinit"):
+                  "n_true_block","n_false_alarm"):
             agg[k] += s.get(k) or 0  # guard None from old JSON versions
         agg["n_active"] += r.get("n_active", 0)
         for state, cnt in s.get("learned_state_dist", {}).items():
@@ -453,8 +396,6 @@ def main(argv: list[str] | None = None) -> int:
     coverage   = tp / total_fc  if total_fc  > 0 else float("nan")
     false_alarm_rate = fp / total_cor if total_cor > 0 else float("nan")
     block_rate = total_block / agg["n_active"] if agg["n_active"] > 0 else float("nan")
-    msu  = fp / agg["n_tsa_allow"] if agg["n_tsa_allow"] > 0 else float("nan")
-    wrir = agg["n_disagree_reinit"] / agg["n_tsa_reinit"] if agg["n_tsa_reinit"] > 0 else 0.0
 
     print()
     print("=" * 70)
@@ -468,38 +409,29 @@ def main(argv: list[str] | None = None) -> int:
     print(f"    block template update:  {total_block:>6,} frames  "
           f"({100*block_rate:.1f}% of active)")
     print(f"    verify (but allow):     {agg['n_verify']:>6,} frames")
-    print(f"    disagree with TSA:      {agg['n_disagree_template']:>6,} frames")
     print()
     print(f"  Quality:")
     print(f"    coverage  (block|fc=1):      {coverage:.3f}  "
           f"({tp:,}/{total_fc:,} fc frames blocked)")
     print(f"    false alarm (block|correct): {false_alarm_rate:.3f}  "
           f"({fp:,}/{total_cor:,} correct frames blocked)")
-    print(f"    msu (missed safe updates):   {msu:.3f}  "
-          f"({fp:,}/{agg['n_tsa_allow']:,} of TSA-allow frames blocked)")
-    print(f"    wrir (wrong reinit rate):    {wrir:.4f}  "
-          f"({agg['n_disagree_reinit']:,}/{agg['n_tsa_reinit']:,} TSA-reinit blocked)")
     if args.mode == "advisory":
         print()
         print(f"  Stage 2 Advisory Gates:")
-        wrir_pass = wrir == 0.0
-        msu_pass  = not math.isnan(msu) and msu < 0.40
-        print(f"    wrir == 0.0:   {'✅ PASS' if wrir_pass else '❌ FAIL'}  ({wrir:.4f})")
-        print(f"    msu  < 0.40:   {'✅ PASS' if msu_pass  else '❌ FAIL'}  ({msu:.3f})")
-        overall = "GO" if (wrir_pass and msu_pass) else "STOP"
+        fa_pass = not math.isnan(false_alarm_rate) and false_alarm_rate < 0.40
+        print(f"    false_alarm < 0.40:   {'✅ PASS' if fa_pass else '❌ FAIL'}  ({false_alarm_rate:.3f})")
+        overall = "GO" if fa_pass else "STOP"
         print(f"    → {overall}")
     if args.mode == "stage3":
         print()
         print(f"  Stage 3 Primary Learned Controller — Gates:")
-        wrir_pass = wrir == 0.0
-        msu_pass  = not math.isnan(msu) and msu < 0.40
-        print(f"    wrir == 0.0:   {'✅ PASS' if wrir_pass else '❌ FAIL'}  ({wrir:.4f})")
-        print(f"    msu  < 0.40:   {'✅ PASS' if msu_pass  else '❌ FAIL'}  ({msu:.3f})")
-        overall = "GO" if (wrir_pass and msu_pass) else "STOP"
+        fa_pass = not math.isnan(false_alarm_rate) and false_alarm_rate < 0.40
+        print(f"    false_alarm < 0.40:   {'✅ PASS' if fa_pass else '❌ FAIL'}  ({false_alarm_rate:.3f})")
+        overall = "GO" if fa_pass else "STOP"
         print(f"    → Stage 3 deployment: {overall}")
     print()
     print(f"  Learned state distribution (over active frames):")
-    for state in ["TRUSTED_TRACKING","LOW_EVIDENCE_TRACKING","FALSE_CONFIRMED_RISK",
+    for state in ["TRACKING_OK","LOW_RISK","HIGH_RISK",
                   "PROACTIVE_DYNAMIC_RISK","REACQUIRE_NEEDED"]:
         cnt = state_global.get(state, 0)
         pct = 100 * cnt / agg["n_active"] if agg["n_active"] > 0 else 0
@@ -527,8 +459,6 @@ def main(argv: list[str] | None = None) -> int:
             "coverage_block_when_fc": round(coverage, 4) if not math.isnan(coverage) else None,
             "false_alarm_rate_block_when_correct": round(false_alarm_rate, 4) if not math.isnan(false_alarm_rate) else None,
             "overall_block_rate": round(block_rate, 4) if not math.isnan(block_rate) else None,
-            "msu": round(msu, 4) if not math.isnan(msu) else None,
-            "wrir": round(wrir, 4),
         },
         "sequences": results,
     }

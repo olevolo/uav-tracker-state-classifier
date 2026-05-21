@@ -2,7 +2,7 @@
 
 Connects:
   SGLATracker        — primary tracker
-  SALTRDController   — SALT-RD decision controller (optional, replaces TSA)
+  SALTRDController   — SALT-RD decision controller (optional)
   EvidenceExtractor  — raw feature → EvidenceFrame
   CosineAppearanceMemory — appearance drift signal
   OnlineLSTMMotionPredictor — LSTM motion residual signal
@@ -398,7 +398,6 @@ class SALTRunner:
         _saltrd_changed_bbox: bool = False
 
         # ---- Guard 1: remember last good bbox for size-consistency filtering ----
-        # Use confidence threshold as proxy for "confirmed" (no TSA state required)
         if track_state.confidence >= 0.14:
             self._last_good_bbox = track_state.bbox
 
@@ -714,8 +713,8 @@ class SALTRunner:
         trajectory. Returns None if best candidate looks like a distractor
         (too far from last known position after tracking failure).
 
-        Spatial gate (Bug 3 fix): scales with n_lost. After N LOST/OCCLUDED
-        frames the target may have moved far, so we widen the search radius.
+        Spatial gate (Bug 3 fix): scales with n_lost. After N bad frames
+        the target may have moved far, so we widen the search radius.
         Base gate is max(3 * diag, 50px) * (1 + min(n_lost, 20) * 0.1).
         Example: after 10 bad frames → 3×diag × 2.0 = 6×diag.
 

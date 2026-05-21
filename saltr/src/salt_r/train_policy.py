@@ -406,8 +406,10 @@ def train(
     # ------------------------------------------------------------------
     # Datasets / loaders
     # ------------------------------------------------------------------
-    print("[train_policy] Loading train split ...", flush=True)
-    train_ds = OracleReinitDataset(oracle_path, split="train", window_size=window_size)
+    # Oracle dataset labels: 'diagnostic' = training pool; 'val' = held-out validation.
+    # Sequences in the NPZ are stored under their fold-selection priority split.
+    print("[train_policy] Loading train split (diagnostic) ...", flush=True)
+    train_ds = OracleReinitDataset(oracle_path, split="diagnostic", window_size=window_size)
     print(f"[train_policy] train samples: {len(train_ds):,}", flush=True)
     dist = train_ds.compute_class_distribution()
     print(f"[train_policy] train class distribution: {dist}", flush=True)
@@ -448,10 +450,25 @@ def train(
     print(f"[train_policy] SALTRDPolicyNet  params={total_params:,}", flush=True)
 
     # ------------------------------------------------------------------
-    # Loss weights
+    # Loss weights — inverse frequency, REINIT boosted to aid recall
     # ------------------------------------------------------------------
-    class_weights = torch.tensor(
-        _RECOVERY_CLASS_WEIGHTS, dtype=torch.float32, device=dev
+    dist = train_ds.compute_class_distribution()
+    # Class order: NONE=0, SCORE_CANDIDATES=1, REINIT=2, REJECT_REINIT=3
+    class_names = ["NONE", "SCORE_CANDIDATES", "REINIT", "REJECT_REINIT"]
+    n_reinit   = max(dist.get("REINIT", 1), 1)
+    n_reject   = max(dist.get("REJECT_REINIT", 1), 1)
+    n_none     = max(dist.get("NONE", 1), 1)
+    # SCORE_CANDIDATES has 0 training examples — set weight to 0 to ignore
+    w_reject   = n_reinit / n_reject        # ≈ 0.023 (down-weight majority)
+    w_none     = 1.0
+    w_sc       = 0.0
+    w_reinit   = min(n_reject / n_reinit, 50.0)  # inverse freq, capped at 50
+    weights_list = [w_none, w_sc, w_reinit, w_reject]
+    class_weights = torch.tensor(weights_list, dtype=torch.float32, device=dev)
+    print(
+        f"[train_policy] class weights  NONE={w_none:.2f}  SC={w_sc:.2f}"
+        f"  REINIT={w_reinit:.2f}  REJECT={w_reject:.4f}",
+        flush=True,
     )
 
     # ------------------------------------------------------------------
@@ -496,19 +513,12 @@ def train(
             y = y.to(dev)  # (B,) int64 class index
             optimizer.zero_grad()
             outputs = model(x)
-            # Convert integer class label to binary label_reinit / label_reject
-            label_reinit = (y == _REINIT_CLASS_IDX).float()
-            label_reject = (y == _REJECT_REINIT_CLASS_IDX).float()
-            targets = {
-                "label_reinit": label_reinit,
-                "label_reject": label_reject,
-            }
-            loss_dict = compute_loss(
-                outputs, targets,
-                lambda_recovery=lambda_recovery,
-                lambda_candidate=lambda_candidate,
+            # Weighted recovery CE directly — bypasses compute_loss to apply class_weights
+            recovery_logits = outputs["action_logits"]["recovery"]  # (B, 4)
+            recovery_loss = torch.nn.functional.cross_entropy(
+                recovery_logits, y, weight=class_weights
             )
-            loss = loss_dict["total"]
+            loss = lambda_recovery * recovery_loss
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
