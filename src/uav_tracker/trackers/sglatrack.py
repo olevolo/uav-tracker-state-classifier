@@ -388,6 +388,8 @@ class SGLATracker:
         self._last_search_score_weighted: torch.Tensor | None = None
         self._last_search_peak_local: torch.Tensor | None = None
         self._last_template_embedding: torch.Tensor | None = None
+        # Optional SALT-RD Stage 2 advisory controller.
+        self._salt_rd_advisor: object | None = None
 
     def _reset_embedding_cache(self) -> None:
         """Reset per-frame embedding cache. Call at init() and any early-return path."""
@@ -792,7 +794,7 @@ class SGLATracker:
         else:
             status = "lost"
 
-        return TrackState(
+        ts = TrackState(
             bbox=new_bbox,
             confidence=confidence,
             status=status,
@@ -802,6 +804,15 @@ class SGLATracker:
             score_map_stats=_score_map_stats,
             aux={"score_map_stats": _score_map_stats},
         )
+        if self._salt_rd_advisor is not None:
+            _emb = (
+                self._last_search_score_weighted.cpu().numpy()
+                if self._last_search_score_weighted is not None
+                else None
+            )
+            fh, fw = frame.shape[:2]
+            self._salt_rd_advisor.step(ts, fh, fw, search_embedding=_emb)
+        return ts
 
     def try_update_template(
         self,
@@ -829,6 +840,9 @@ class SGLATracker:
         Returns True if the template was updated.
         """
         if self._z_tensor is None:
+            return False
+
+        if self._salt_rd_advisor is not None and self._salt_rd_advisor.should_block_template_update():
             return False
 
         if self._template_update_count >= max_updates:
@@ -865,6 +879,12 @@ class SGLATracker:
         self._state = None
         self._template_last_update = 0
         self._template_update_count = 0
+        if self._salt_rd_advisor is not None:
+            self._salt_rd_advisor.reset()
+
+    def set_salt_rd_advisor(self, advisor: object) -> None:
+        """Attach a SALTRDAdvisor instance for Stage 2 advisory/veto mode."""
+        self._salt_rd_advisor = advisor
 
     @property
     def is_stub_mode(self) -> bool:
