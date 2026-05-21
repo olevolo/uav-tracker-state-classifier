@@ -123,13 +123,13 @@ class TestExtractSequenceFeatures:
         feats = extract_sequence_features(frames, pred, stride=1, window=5)
         assert feats.shape == (1, len(POINT_FEATURE_NAMES))
 
-    def test_stride_larger_than_window_covers_all(self):
-        # stride > window: some frames are not covered → NaN (ok, tested separately)
+    def test_stride_larger_than_window_raises(self):
+        # stride > window leaves silent NaN gaps — guard raises ValueError
         T = 40
         frames = _make_frames(T)
         pred = _make_pred_xyxy(T)
-        feats = extract_sequence_features(frames, pred, stride=20, window=10)
-        assert feats.shape == (T, len(POINT_FEATURE_NAMES))
+        with pytest.raises(ValueError, match="stride"):
+            extract_sequence_features(frames, pred, stride=20, window=10)
 
     def test_latest_seed_overwrites(self):
         # With stride=1 and window=5, every frame gets freshly seeded features.

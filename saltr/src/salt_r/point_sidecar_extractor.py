@@ -38,7 +38,6 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import json
 import sys
 import time
 from datetime import datetime, timezone
@@ -178,6 +177,12 @@ def extract_sequence_features(
     Seeding is from PRED bbox (causal).  Latest-seed wins per frame.
     Frames are resized to max_side on longest edge to keep memory low.
     """
+    if stride > window:
+        raise ValueError(
+            f"stride ({stride}) must be <= window ({window}): "
+            "gaps between windows leave NaN features"
+        )
+
     T = len(frames)
     F = len(POINT_FEATURE_NAMES)
     out = np.full((T, F), np.nan, dtype=np.float32)
@@ -187,15 +192,12 @@ def extract_sequence_features(
 
     tracker_fn = _TRACKERS[method]
 
-    # Resize scale
+    # Resize scale (compute dimensions once; resize lazily per window)
     h0, w0 = frames[0].shape[:2]
     scale = float(max_side) / float(max(h0, w0))
     out_h = max(1, int(round(h0 * scale)))
     out_w = max(1, int(round(w0 * scale)))
 
-    resized: list[np.ndarray] = [
-        cv2.resize(f, (out_w, out_h), interpolation=cv2.INTER_AREA) for f in frames
-    ]
     pred_s = pred_xyxy.astype(np.float32) * scale  # scaled bboxes
 
     for seed in range(0, T, stride):
@@ -205,15 +207,21 @@ def extract_sequence_features(
 
         # Seed query points from pred bbox at seed frame
         bbox_seed = pred_s[seed]
-        bw = max(bbox_seed[2] - bbox_seed[0], 1.0)
-        bh = max(bbox_seed[3] - bbox_seed[1], 1.0)
-        if bw < 1.0 or bh < 1.0:
+        bw_raw = bbox_seed[2] - bbox_seed[0]
+        bh_raw = bbox_seed[3] - bbox_seed[1]
+        if bw_raw < 1.0 or bh_raw < 1.0:
             continue  # degenerate bbox — skip this window
+        bw = float(bw_raw)  # noqa: F841 — kept for symmetry / future use
+        bh = float(bh_raw)  # noqa: F841
         query = sample_query_points(bbox_seed, n_points=n_points)
         if len(query) == 0:
             continue
 
-        window_frames = resized[seed:end]
+        # Resize only the frames needed for this window (lazy — avoids holding all T in RAM)
+        window_frames = [
+            cv2.resize(frames[i], (out_w, out_h), interpolation=cv2.INTER_AREA)
+            for i in range(seed, end)
+        ]
         tracks, vis = tracker_fn(window_frames, query)  # (W, P, 2), (W, P)
 
         # Compute features for this window's frames
