@@ -332,6 +332,32 @@ def test_temperature_calibration_reduces_ece():
     assert 0.05 < T < 20.0, f"T={T} out of sane range"
 
 
+def test_per_dataset_head_metrics_do_not_pool_splits():
+    """Per-dataset metrics must expose regressions hidden by pooled eval."""
+    from salt_r.eval import compute_per_dataset_head_metrics
+
+    label_names = ["correct", "false_confirmed"]
+    model_head_names = ["false_confirmed"]
+    labels = {
+        "uav123/a": np.array([[1, 0], [1, 1], [1, 0], [1, 1]], dtype=np.int8),
+        "dtb70/b": np.array([[1, 0], [1, 0], [1, 1], [1, 1]], dtype=np.int8),
+    }
+    preds = {
+        # Good ranking for UAV123 fc.
+        "uav123/a": np.array([[0.1], [0.9], [0.2], [0.8]], dtype=np.float32),
+        # Bad ranking for DTB70 fc.
+        "dtb70/b": np.array([[0.9], [0.8], [0.2], [0.1]], dtype=np.float32),
+    }
+
+    result = compute_per_dataset_head_metrics(labels, preds, label_names, model_head_names)
+
+    assert set(result) == {"uav123", "dtb70"}
+    assert result["uav123"]["false_confirmed"]["n_sequences"] == 1
+    assert result["dtb70"]["false_confirmed"]["n_frames"] == 4
+    assert result["uav123"]["false_confirmed"]["auroc"] > 0.9
+    assert result["dtb70"]["false_confirmed"]["auroc"] < 0.1
+
+
 # ---------------------------------------------------------------------------
 # Test: recompute_labels_v2 raises on v0 input
 # ---------------------------------------------------------------------------
@@ -515,4 +541,3 @@ def test_run_lead_time_analysis_three_horizons():
     assert set(result.keys()) == {"ifd5", "ifd10", "ifd20"}
     for key in ("ifd5", "ifd10", "ifd20"):
         assert "n_failure_events" in result[key] or "note" in result[key]
-

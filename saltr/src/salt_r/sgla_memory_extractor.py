@@ -292,7 +292,8 @@ def _get_gate_signals(
 def build_sidecar(args: argparse.Namespace) -> None:
     """Extract RAM features for all sequences and write output NPZ.
 
-    Partial results are saved on KeyboardInterrupt.
+    KeyboardInterrupt sets interrupted=True; canonical mode raises RuntimeError
+    without saving. Partial output is written only with --allow-partial or --smoke-test.
     """
     import sys
 
@@ -386,6 +387,7 @@ def build_sidecar(args: argparse.Namespace) -> None:
     n_done = 0
     n_skipped = 0
     n_total_frames = 0
+    interrupted = False
 
     try:
         for seq_key in seq_keys:
@@ -500,18 +502,19 @@ def build_sidecar(args: argparse.Namespace) -> None:
             n_total_frames += T
 
     except KeyboardInterrupt:
+        interrupted = True
         print(
             f"\n[sgla_memory_extractor] Interrupted after {n_done} sequences "
-            f"({n_skipped} skipped). Saving partial sidecar...",
+            f"({n_skipped} skipped). Use --allow-partial or --smoke-test to save incomplete output.",
             flush=True,
         )
 
     # P1 fail-fast: canonical extraction must cover all sequences.
     # Allow partial output only under --smoke-test or --allow-partial.
     is_partial_ok = args.smoke_test is not None or getattr(args, "allow_partial", False)
-    if n_skipped > 0 and not is_partial_ok:
+    if (n_skipped > 0 or interrupted) and not is_partial_ok:
         raise RuntimeError(
-            f"Extraction failed for {n_skipped}/{len(seq_keys)} sequence(s). "
+            f"Extraction incomplete: {n_done} done, {n_skipped} skipped, interrupted={interrupted}. "
             "Fix the issues logged above, then re-run. "
             "Use --allow-partial to save an incomplete sidecar (not for training)."
         )

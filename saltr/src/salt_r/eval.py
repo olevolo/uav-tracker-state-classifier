@@ -16,6 +16,7 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import collections
 import hashlib
 import json
 import subprocess
@@ -752,6 +753,66 @@ def _load_npz_split(
     return features_dict, labels_dict, iou_dict
 
 
+def _dataset_from_seq_key(seq_key: str) -> str:
+    """Return dataset prefix from compound key ``dataset/sequence``."""
+    return seq_key.split("/", 1)[0] if "/" in seq_key else "unknown"
+
+
+def compute_per_dataset_head_metrics(
+    labels_dict: dict[str, np.ndarray],
+    preds_dict: dict[str, np.ndarray],
+    label_names: list[str],
+    model_head_names: list[str],
+) -> dict[str, dict[str, dict[str, float]]]:
+    """Compute the same per-head metrics independently for each dataset.
+
+    Pooled val/diagnostic metrics can hide dataset-specific regressions because
+    UAV123 contributes many more frames than VisDrone/DTB70.  This helper keeps
+    the aggregate metrics unchanged while adding a stratified view for result
+    auditing and GO/KILL decisions.
+    """
+    by_dataset: dict[str, list[str]] = collections.defaultdict(list)
+    for seq_key in labels_dict:
+        by_dataset[_dataset_from_seq_key(seq_key)].append(seq_key)
+
+    results: dict[str, dict[str, dict[str, float]]] = {}
+    for dataset_name, seq_keys in sorted(by_dataset.items()):
+        dataset_metrics: dict[str, dict[str, float]] = {}
+        for hi, head in enumerate(label_names):
+            y_true_parts: list[np.ndarray] = []
+            y_pred_parts: list[np.ndarray] = []
+
+            for seq_key in seq_keys:
+                lab = labels_dict[seq_key].astype(float)
+                if hi >= lab.shape[1]:
+                    continue
+                y_true_parts.append(lab[:, hi])
+
+                if seq_key in preds_dict and head in model_head_names:
+                    pred_col = model_head_names.index(head)
+                    pred = preds_dict[seq_key]
+                    if pred_col < pred.shape[1]:
+                        y_pred_parts.append(pred[:, pred_col])
+                    else:
+                        y_pred_parts.append(np.full(lab.shape[0], 0.5, dtype=np.float32))
+                else:
+                    y_pred_parts.append(np.full(lab.shape[0], 0.5, dtype=np.float32))
+
+            if not y_true_parts:
+                continue
+
+            y_true = np.concatenate(y_true_parts)
+            y_pred = np.concatenate(y_pred_parts)
+            metric = compute_head_metrics(y_true, y_pred, head)
+            metric["n_frames"] = int(len(y_true))
+            metric["n_sequences"] = int(len(seq_keys))
+            dataset_metrics[head] = metric
+
+        results[dataset_name] = dataset_metrics
+
+    return results
+
+
 def _load_model(checkpoint_path: str, n_features: int, n_labels: int, device: str):
     """Load SALTRD model from checkpoint.
 
@@ -1272,6 +1333,13 @@ def evaluate(
                 m["note"] = "0.5 baseline — no model head for this label"
             head_metrics[head] = m
 
+    per_dataset_head_metrics = compute_per_dataset_head_metrics(
+        labels_dict=labels_dict,
+        preds_dict=preds_dict if has_preds else {},
+        label_names=label_names,
+        model_head_names=_model_head_names if has_preds else [],
+    )
+
     # ------------------------------------------------------------------
     # 5. NT2F at IoU thresholds 0.5 and 0.2
     # ------------------------------------------------------------------
@@ -1296,6 +1364,19 @@ def evaluate(
     # 7. Print formatted table
     # ------------------------------------------------------------------
     _print_summary_table(head_metrics, label_names)
+
+    if "false_confirmed" in label_names and per_dataset_head_metrics:
+        print("Per-dataset false_confirmed:")
+        for dataset_name, ds_metrics in per_dataset_head_metrics.items():
+            m = ds_metrics.get("false_confirmed", {})
+            print(
+                f"  {dataset_name:<14} "
+                f"seqs={int(m.get('n_sequences', 0)):>3} "
+                f"frames={int(m.get('n_frames', 0)):>6} "
+                f"base={m.get('base_rate', float('nan'))*100:>5.1f}% "
+                f"AUROC={m.get('auroc', float('nan')):>6.3f} "
+                f"AUPRC={m.get('auprc', float('nan')):>6.3f}"
+            )
 
     print(f"NT2F (IoU>=0.5):  mean={nt2f_05['nt2f_mean']:.4f}  "
           f"std={nt2f_05['nt2f_std']:.4f}  "
@@ -1322,6 +1403,7 @@ def evaluate(
         "split": split,
         "n_sequences": n_seqs,
         "head_metrics": head_metrics,
+        "per_dataset_head_metrics": per_dataset_head_metrics,
         "nt2f_05": nt2f_05,
         "nt2f_02": nt2f_02,
         "bootstrap_auprc_false_confirmed": bootstrap_result,
