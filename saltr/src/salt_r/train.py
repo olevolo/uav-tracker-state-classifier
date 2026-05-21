@@ -552,7 +552,11 @@ def train(
     # ------------------------------------------------------------------
     n_features = len(FEATURE_NAMES)   # 28
     n_heads = len(train_ds.head_names)
-    memory_dim = len(memory_feature_names) if memory_feature_names else (9 if memory_features else 0)
+    if memory_features:
+        first_key = next(iter(memory_features))
+        memory_dim = memory_features[first_key].shape[1]
+    else:
+        memory_dim = 0
 
     model = SALTRD(n_features=n_features, memory_dim=memory_dim, head_names=train_ds.head_names).to(dev)
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)

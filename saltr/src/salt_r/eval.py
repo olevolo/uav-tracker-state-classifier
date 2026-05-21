@@ -1022,6 +1022,7 @@ def evaluate(
     # 1b. Load and apply memory sidecar (optional — DAM-style 9-dim features)
     # ------------------------------------------------------------------
     eval_memory_features: dict[str, np.ndarray] = {}
+    _ckpt_feature_names: list[str] | None = None  # filled below if sidecar + checkpoint agree
     if memory_sidecar_path and Path(memory_sidecar_path).exists():
         mem_npz = np.load(memory_sidecar_path, allow_pickle=True)
         for k in mem_npz.files:
@@ -1032,7 +1033,6 @@ def evaluate(
 
         # Subset columns to match the features the checkpoint was trained on.
         # Read memory_feature_names from checkpoint; fall back to all dims if absent.
-        _ckpt_feature_names: list[str] | None = None
         if checkpoint_path:
             try:
                 import torch as _torch
@@ -1063,11 +1063,45 @@ def evaluate(
 
     # Build augmented features dict for inference when model expects memory dims.
     # If model has memory_dim > 0 and sidecar was loaded, concatenate per-sequence.
-    # Sequences missing from the sidecar are zero-padded to match model input size.
+    # Fail-fast if checkpoint expects memory but no sidecar was provided or too many
+    # sequences are missing.  Zero-pad only for the <10% missing case.
     infer_features_dict = features_dict
+    _n_sequences_with_memory = 0  # tracks sequences that had actual sidecar entries
     if model is not None and getattr(model, "memory_dim", 0) > 0:
         mem_dim = model.memory_dim
+        if not eval_memory_features:
+            # No sidecar loaded at all — distinguish no-arg vs file-not-found
+            raise ValueError(
+                f"Checkpoint was trained with memory_dim={mem_dim} but "
+                + (
+                    "no --memory-sidecar was provided. "
+                    "Re-run with --memory-sidecar pointing to the correct sidecar NPZ."
+                    if not memory_sidecar_path
+                    else f"the sidecar file was not found at {memory_sidecar_path!r}. "
+                    "Check the path and re-run."
+                )
+            )
+
+        # Count sequences that are missing from the sidecar
+        n_total = len(features_dict)
+        n_missing = sum(1 for k in features_dict if k not in eval_memory_features)
+        if n_missing > 0:
+            missing_frac = n_missing / max(n_total, 1)
+            if missing_frac > 0.10:
+                raise ValueError(
+                    f"{n_missing}/{n_total} sequences ({missing_frac*100:.1f}%) are missing "
+                    f"from the memory sidecar at {memory_sidecar_path!r}. "
+                    "More than 10% missing is not allowed — regenerate the sidecar or "
+                    "check that sidecar keys match NPZ sequence keys."
+                )
+            else:
+                print(
+                    f"  WARNING: {n_missing}/{n_total} sequences missing from memory sidecar "
+                    f"({missing_frac*100:.1f}%) — zero-padding those sequences."
+                )
+
         aug: dict[str, np.ndarray] = {}
+        _n_sequences_with_memory = 0
         for seq_key, feats in features_dict.items():
             if seq_key in eval_memory_features:
                 mem = eval_memory_features[seq_key]
@@ -1078,8 +1112,9 @@ def evaluate(
                 else:
                     mem_full = mem[:feats.shape[0]]
                 aug[seq_key] = np.concatenate([feats, mem_full], axis=1)
+                _n_sequences_with_memory += 1
             else:
-                # Pad with zeros for sequences not in sidecar
+                # Zero-pad for sequences not in sidecar (<10% missing, already validated above)
                 aug[seq_key] = np.concatenate(
                     [feats, np.zeros((feats.shape[0], mem_dim), dtype=np.float32)],
                     axis=1,
@@ -1275,6 +1310,8 @@ def evaluate(
     # ------------------------------------------------------------------
     # 8. Assemble results dict
     # ------------------------------------------------------------------
+    _ckpt_memory_dim = int(getattr(model, "memory_dim", 0)) if model is not None else 0
+    _used_feature_names: list[str] = list(_ckpt_feature_names) if _ckpt_feature_names else []
     results: dict[str, Any] = {
         "split": split,
         "n_sequences": n_seqs,
@@ -1283,6 +1320,11 @@ def evaluate(
         "nt2f_02": nt2f_02,
         "bootstrap_auprc_false_confirmed": bootstrap_result,
         "provenance": _build_provenance(npz_path, checkpoint_path, split),
+        "memory_sidecar_path": memory_sidecar_path or None,
+        "memory_sidecar_md5": _file_md5(memory_sidecar_path) if memory_sidecar_path else None,
+        "memory_feature_names_used": _used_feature_names,
+        "memory_dim": _ckpt_memory_dim,
+        "n_sequences_with_memory": _n_sequences_with_memory,
     }
 
     if calibrate_heads and temperatures:
