@@ -320,6 +320,17 @@ def calibrate(
     recovery_probs_after = _apply_temperature_multiclass(recovery_logits, T_recovery)
     ece_recovery_after = _ece_multiclass(recovery_probs_after, true_labels)
 
+    # Guard: skip temperature if it degrades ECE — pre-calibration may already pass gate
+    if ece_recovery_after >= ece_recovery_before:
+        print(
+            f"  [calibrate_policy] T={T_recovery:.4f} degrades ECE "
+            f"({ece_recovery_before:.4f} → {ece_recovery_after:.4f}) — reverting to T=1.0",
+            flush=True,
+        )
+        T_recovery = 1.0
+        recovery_probs_after = recovery_probs_before
+        ece_recovery_after = ece_recovery_before
+
     print(
         f"  recovery_action:  T={T_recovery:.4f}  "
         f"ECE {ece_recovery_before:.4f} → {ece_recovery_after:.4f}",
