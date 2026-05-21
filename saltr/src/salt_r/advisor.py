@@ -214,6 +214,19 @@ class SALTRDAdvisor:
         self.delta_block:      float = 0.08   # p_fc rise over 3 frames (rising edge)
         self.smap_top2_block:  float = 0.72   # competing secondary peak ratio threshold
 
+        # Proactive early recovery
+        self._recovery_hint_bbox: tuple[float, float, float, float] | None = None  # (cx,cy,w,h)
+        self._recovery_hint_active: bool = False
+        self._recovery_hint_frame: int = -1
+        self._recovery_hint_max_age: int = 30  # forget hint after 30 frames
+
+        # Early recovery trigger thresholds
+        self.early_recovery_pfc_threshold: float = 0.45  # p_fc above which we start tracking position for recovery
+        self.early_recovery_apce_ratio_threshold: float = 0.85  # APCE_ratio5 falling = degrading
+
+        # Last apce_ratio5 stored by step() for use in update_recovery_hint()
+        self._last_apce_ratio5: float = 1.0
+
         # Monitoring
         self.n_blocked: int = 0
         self.n_allowed: int = 0
@@ -251,6 +264,11 @@ class SALTRDAdvisor:
         self._smap_history.clear()
         self._trusted_streak = 0
         self._last_tmpl_frame = -100
+        # Proactive early recovery
+        self._recovery_hint_bbox = None
+        self._recovery_hint_active = False
+        self._recovery_hint_frame = -1
+        self._last_apce_ratio5 = 1.0
         # Reset per-sequence counters so stats reflect the current sequence only
         self.n_blocked = 0
         self.n_allowed = 0
@@ -322,6 +340,9 @@ class SALTRDAdvisor:
         apce_r20 = _ratio(apce, self._apce_buf, 20)
         ent_d5   = _delta(ent, self._ent_buf, 5)
         pm_d5    = _delta(peak_margin, self._pmarg_buf, 5)
+
+        # Store apce_ratio5 for use by update_recovery_hint()
+        self._last_apce_ratio5 = apce_r5
 
         # Append current values after ratios/deltas are computed
         self._apce_buf.append(apce)
@@ -454,6 +475,50 @@ class SALTRDAdvisor:
         """Call after any successful template update to reset safety context."""
         self._last_tmpl_frame = frame_idx
         self._trusted_streak  = 0   # evidence from before the update is stale
+
+    def update_recovery_hint(self, bbox, apce: float) -> bool:
+        """Track position for proactive recovery hint using internal apce_ratio5.
+
+        When SALT-RD detects early risk (p_fc rising + APCE_ratio5 falling),
+        saves the current position as a recovery anchor. When the tracker later
+        declares LOST, the recovery pipeline can use this hint to spatially
+        constrain the detector search area.
+
+        Returns True if a recovery hint is currently active (has a valid hint).
+        """
+        p = self._last_p_fc
+        apce_ratio5 = self._last_apce_ratio5
+
+        # Start tracking: save CURRENT position when SALT-RD detects early risk
+        at_risk = (p >= self.early_recovery_pfc_threshold and
+                   apce_ratio5 < self.early_recovery_apce_ratio_threshold)
+
+        if at_risk and not self._recovery_hint_active:
+            cx = float(getattr(bbox, 'x', 0) + getattr(bbox, 'w', 1) / 2)
+            cy = float(getattr(bbox, 'y', 0) + getattr(bbox, 'h', 1) / 2)
+            bw = float(getattr(bbox, 'w', 1))
+            bh = float(getattr(bbox, 'h', 1))
+            self._recovery_hint_bbox = (cx, cy, bw, bh)
+            self._recovery_hint_active = True
+            self._recovery_hint_frame = self._current_frame
+
+        # Expire hint if too old
+        if self._recovery_hint_active:
+            age = self._current_frame - self._recovery_hint_frame
+            if age > self._recovery_hint_max_age:
+                self._recovery_hint_active = False
+                self._recovery_hint_bbox = None
+
+        return self._recovery_hint_active
+
+    def consume_recovery_hint(self) -> "tuple[float, float, float, float] | None":
+        """Return (cx, cy, w, h) recovery hint and clear it, or None if no hint."""
+        if self._recovery_hint_active and self._recovery_hint_bbox is not None:
+            hint = self._recovery_hint_bbox
+            self._recovery_hint_active = False
+            self._recovery_hint_bbox = None
+            return hint
+        return None
 
     def should_block_template_update(self) -> bool:
         """5-gate template safety check. ALL gates must pass to allow update.

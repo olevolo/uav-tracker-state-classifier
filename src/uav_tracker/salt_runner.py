@@ -113,6 +113,13 @@ class SALTRunner:
     # GT bbox validity is checked: degenerate bbox (w<=0 or h<=0) sets this to
     # OCCLUDED so the first real frame uses full compute instead of CE-pruned.
     _prev_tsa_state_int: int = field(default=0, init=False, repr=False)
+    # SALT-RD policy from the previous frame — used when --use-saltrd-primary is active
+    # to route CE pruning on the next frame (mirrors the TSA state deferred-routing model).
+    _prev_saltrd_policy: "dict | None" = field(default=None, init=False, repr=False)
+    # Whether to use SALT-RD as the primary CE routing source (Stage 3 primary mode).
+    # When True: CE routing follows SALT-RD allow_ce_pruning / force_full_compute.
+    # When False (default): CE routing follows TSA state (backward-compatible).
+    use_saltrd_primary: bool = field(default=False, init=False, repr=False)
     # Frames remaining before RT-DETR recovery can fire again (prevents loop)
     _lost_cooldown: int = field(default=0, init=False, repr=False)
     # Consecutive LOST frames counter — RT-DETR only fires after N consecutive LOST
@@ -361,10 +368,24 @@ class SALTRunner:
                 drift = 0.0
 
         # ---- Step 1: run tracker (uses previous-frame TSA state for budget) ----
+        # When SALT-RD primary mode is active, the SALT-RD policy from the previous
+        # frame overrides TSA for CE routing. This mirrors the TSA deferred-routing
+        # model: policy computed on frame N routes compute on frame N+1.
+        _routing_state_int: int = self._prev_tsa_state_int
+        if self.use_saltrd_primary and self._prev_saltrd_policy is not None:
+            from uav_tracker.ml.tsa.target_state import TargetState as _TS
+            if self._prev_saltrd_policy['force_full_compute']:
+                # Force full compute: use non-CONFIRMED state so CE keep_rate→1.0
+                _routing_state_int = _TS.OCCLUDED.value
+            elif self._prev_saltrd_policy['allow_ce_pruning']:
+                # TRUSTED_TRACKING: allow CE pruning
+                _routing_state_int = _TS.CONFIRMED.value
+            # else: keep TSA routing as fallback for intermediate states
+
         t_tracker = time.perf_counter()
         try:
             track_state: TrackState = self.tracker.update_with_state(
-                frame, self._prev_tsa_state_int,
+                frame, _routing_state_int,
                 consecutive_occluded=self._consecutive_occluded,
                 prev_apce=self._prev_apce,
             )
@@ -380,6 +401,8 @@ class SALTRunner:
         _template_attempted: bool = False
         _template_updated: bool = False
         _reinit_vetoed: bool = False
+        _recovery_hint_used: bool = False
+        _recovery_hint_bbox_log: "list | None" = None
 
         # Stage 3: Get SALT-RD primary state when advisor attached
         _saltrd_policy: dict | None = None
@@ -407,6 +430,10 @@ class SALTRunner:
             self.tracker.override_search_center(cx_fr, cy_fr, bw_fr, bh_fr)
             # Note: output bbox is still the tracker's output, not the frozen bbox.
             # The freeze affects next-frame search center, not current output bbox.
+
+        # Proactive early recovery: update hint from current position/APCE after advisor ran
+        if _advisor is not None:
+            _advisor.update_recovery_hint(track_state.bbox, apce)
 
         # prev_bbox for flow warp: last confirmed position before this frame
         prev_bbox: BBox = self._trajectory[-1] if self._trajectory else track_state.bbox
@@ -463,6 +490,8 @@ class SALTRunner:
             )
         self._prev_tsa_state_int = state_int
         self._prev_apce = apce  # store for next frame's TSA temporal gating
+        # Store SALT-RD policy for next frame's CE routing (primary mode)
+        self._prev_saltrd_policy = _saltrd_policy
 
         # Guard 1: remember last good bbox for size-consistency filtering
         if state_int in (TargetState.CONFIRMED.value, TargetState.DYNAMIC.value):
@@ -595,6 +624,21 @@ class SALTRunner:
                 and _past_warmup
                 and self.detector is not None
                 and self._lost_cooldown == 0):
+            # Consume SALT-RD proactive recovery hint if available.
+            # The hint was saved at the first frame where p_fc rose above 0.45 with
+            # falling APCE_ratio5 — before TSA declared LOST. It provides a spatially
+            # constrained anchor for the recovery detector search area (Phase 7 will
+            # use it to crop the detector input; here we log it for telemetry).
+            _recovery_hint: "tuple[float,float,float,float] | None" = None
+            if _advisor is not None:
+                _recovery_hint = _advisor.consume_recovery_hint()
+            if _recovery_hint is not None:
+                _recovery_hint_used = True
+                _recovery_hint_bbox_log = list(_recovery_hint)
+                _logger.debug(
+                    "SALT-RD recovery hint: frame=%d hint_cx=%.1f hint_cy=%.1f",
+                    self._frame_idx, _recovery_hint[0], _recovery_hint[1],
+                )
             try:
                 # Bug 2 fix: use the tracker's frozen _state (last CONFIRMED position)
                 # as the detector hint, not the drifted trajectory tail (prev_bbox).
@@ -806,6 +850,7 @@ class SALTRunner:
                                 if self.motion_predictor:
                                     self.motion_predictor.reset()
                                 self._prev_tsa_state_int = TargetState.CONFIRMED.value
+                                self._prev_saltrd_policy = _saltrd_policy  # keep for next frame routing
                                 self._lost_cooldown = 0
                                 self._consecutive_lost = 0  # reset after successful recovery
                                 self._consecutive_occluded = 0  # reset so escalation restarts cleanly
@@ -921,6 +966,9 @@ class SALTRunner:
             _aux["salt_rd_template_attempted"] = _template_attempted
             _aux["salt_rd_template_updated"] = _template_updated
             _aux["salt_rd_reinit_vetoed"] = _reinit_vetoed
+            _aux["saltrd_recovery_hint_used"] = _recovery_hint_used
+            if _recovery_hint_bbox_log is not None:
+                _aux["saltrd_recovery_hint_bbox"] = _recovery_hint_bbox_log
             # Action audit telemetry fields (hard_bench Phase 1+2)
             _aux["template_update_attempted"] = _template_attempted
             _aux["template_update_blocked"] = (_template_attempted and not _template_updated and not _advisor.should_block_template_update() is False)
@@ -941,6 +989,8 @@ class SALTRunner:
                 _aux["saltrd_state"] = _saltrd_policy['state'].value
                 _aux["saltrd_allow_ce"] = _saltrd_policy['allow_ce_pruning']
                 _aux["saltrd_force_full"] = _saltrd_policy['force_full_compute']
+                if self.use_saltrd_primary:
+                    _aux["saltrd_routing_state"] = _routing_state_int
 
         return TelemetryEntry(
             frame_idx=self._frame_idx,
@@ -1144,6 +1194,7 @@ class SALTRunner:
         self._prev_frame = None
         self._frame_idx = 0
         self._prev_tsa_state_int = 0  # CONFIRMED
+        self._prev_saltrd_policy = None
         self._lost_cooldown = 0
         self._consecutive_lost = 0
         self._consecutive_occluded = 0
