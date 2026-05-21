@@ -59,13 +59,18 @@ class TestPosFeatureIndices:
 class TestCausalOrdering:
     """Verify that compute_features() is always called before step() for each frame."""
 
-    def _make_mock_tracker(self, embedding_view: str = "score_weighted"):
-        """Return a mock tracker that yields deterministic embeddings."""
-        import torch
-        tracker = MagicMock()
-        tracker.update_with_state.return_value = MagicMock()
+    def _make_mock_runner(self, embedding_view: str = "score_weighted"):
+        """Return a mock SALTRunner with a .tracker attribute that yields deterministic embeddings.
 
-        # Provide non-None tensors for embedding attrs
+        After the refactor, extract_sequence() uses runner.run() and reads
+        embeddings from runner.tracker._last_search_* attributes.  This helper
+        builds a lightweight mock runner suitable for unit tests that need to
+        exercise _get_embedding() without loading real model weights.
+        """
+        import torch
+
+        # Build a mock tracker (the SGLATracker inside the runner)
+        tracker = MagicMock()
         dim = 192
         rng = np.random.default_rng(42)
 
@@ -73,19 +78,32 @@ class TestCausalOrdering:
             v = rng.standard_normal(dim).astype(np.float32)
             return torch.from_numpy(v)
 
-        # Return a fresh tensor for each call to update_with_state
-        call_count = [0]
-        def side_effect(frame, target_state=0, **kwargs):
-            call_count[0] += 1
-            t = call_count[0]
-            tensor = _make_tensor(t)
-            tracker._last_search_score_weighted = tensor
-            tracker._last_search_peak_local = tensor
-            tracker._last_search_global = tensor
-            return MagicMock()
+        # Build a mock runner whose .run() yields TelemetryEntry-like objects
+        # and updates tracker._last_search_* on each frame after frame 0.
+        runner = MagicMock()
+        runner.tracker = tracker
 
-        tracker.update_with_state.side_effect = side_effect
-        return tracker
+        call_count = [0]
+
+        def _run_side_effect(seq_obj):
+            # Frame 0: tracker.init() called internally; search attrs remain None
+            tracker._last_search_score_weighted = None
+            tracker._last_search_peak_local = None
+            tracker._last_search_global = None
+            yield MagicMock()  # frame 0 entry
+
+            frames = list(seq_obj.frames)
+            for _frame in frames[1:]:
+                call_count[0] += 1
+                t = call_count[0]
+                tensor = _make_tensor(t)
+                tracker._last_search_score_weighted = tensor
+                tracker._last_search_peak_local = tensor
+                tracker._last_search_global = tensor
+                yield MagicMock()  # frame t entry
+
+        runner.run.side_effect = _run_side_effect
+        return runner
 
     def test_compute_features_before_step_T3(self):
         """For T=3 frames, compute_features must be called before any RAM update.

@@ -1,6 +1,6 @@
 """sgla_memory_extractor.py — SGLATracker backbone-embedding RAM sidecar builder.
 
-Runs SGLATracker over all sequences from the v2 NPZ, extracts per-frame
+Runs SALTRunner over all sequences from the v2 NPZ, extracts per-frame
 backbone embeddings via tracker hook attributes, and builds a sidecar NPZ
 with 4 pos-only RAM features per frame.
 
@@ -11,13 +11,16 @@ Design invariants
 2. GATE: RAM update uses real model predictions (preds JSON), not oracle labels.
 3. FRAME 0: all hook attrs are None after init() → zero embedding; features = zeros.
 4. SHAPE: output (T, 4) per sequence, verified by assertion before saving.
+5. TRAJECTORY: uses SALTRunner.run() so TSA state machine, CE gates, center
+   freeze, and LOST/recovery logic match the trajectory from which the v2 NPZ
+   training labels were derived (trajectory-aligned, not just frame-aligned).
 
 CLI
 ---
 python -m salt_r.sgla_memory_extractor \\
   --npz saltr/data/salt_rd_v2_labels.npz \\
   --preds saltr/results/preds_all_v2_retrained.json \\
-  --tracker-config <path> \\
+  --config-path configs/prod/salt.yaml \\
   --output saltr/data/salt_rd_sgla_pos_memory_sidecar.npz \\
   --embedding-view score_weighted \\
   --smoke-test 3
@@ -119,27 +122,50 @@ def _get_embedding(tracker: object, view: str) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
+# Minimal sequence wrapper (mirrors _TruncatedSequence in collect_features.py)
+# ---------------------------------------------------------------------------
+
+class _WrappedSequence:
+    """Minimal sequence wrapper for passing to SALTRunner.run().
+
+    Mirrors collect_features._TruncatedSequence — wraps a dataset sequence
+    object to cap frames if needed and expose .name, .frames, .ground_truth.
+    """
+
+    def __init__(self, name: str, frames: list, ground_truth: list) -> None:
+        self.name = name
+        self.frames = frames
+        self.ground_truth = ground_truth
+
+    @property
+    def init_bbox(self):
+        return self.ground_truth[0]
+
+
+# ---------------------------------------------------------------------------
 # Per-sequence extraction
 # ---------------------------------------------------------------------------
 
 def extract_sequence(
-    tracker: object,
-    frames: List[np.ndarray],
-    gt_bboxes: np.ndarray,        # (T, 4) float32 — x,y,w,h
+    runner: object,
+    seq_obj: object,
     preds_for_seq: Optional[List[dict]],
     embedding_view: str,
     feature_indices: List[int],
 ) -> np.ndarray:
-    """Run tracker on one sequence and return (T, 4) RAM feature array.
+    """Run SALTRunner on one sequence and return (T, 4) RAM feature array.
+
+    Uses SALTRunner.run() so the full TSA state machine, CE gates, center
+    freeze, and LOST/recovery logic are active — matching the trajectory that
+    was used to collect the v2 NPZ training labels.
 
     Causal ordering per frame t:
         features[t] = pos_mem.compute_features(embedding[t])   # uses < t only
         if gate_passes(t): pos_mem.step(embedding[t])          # adds t to RAM
 
     Args:
-        tracker: fresh SGLATracker instance (reset between sequences).
-        frames: list of BGR numpy frames (T total).
-        gt_bboxes: (T, 4) ground-truth bboxes in (x,y,w,h) format.
+        runner: SALTRunner instance (run() calls _reset() internally).
+        seq_obj: dataset sequence object with .frames, .ground_truth, .name.
         preds_for_seq: list of per-frame pred dicts from preds JSON,
             or None if this sequence has no predictions.
         embedding_view: 'score_weighted' | 'peak_local' | 'global'.
@@ -148,9 +174,9 @@ def extract_sequence(
     Returns:
         float32 array of shape (T, 4).
     """
-    from uav_tracker.types import BBox
     from salt_r.memory import DistractorAwareMemory
 
+    frames = list(seq_obj.frames)
     T = len(frames)
     result = np.zeros((T, 4), dtype=np.float32)
 
@@ -161,37 +187,20 @@ def extract_sequence(
     # We also need to track _current_frame for mem.compute_features() update_age.
     mem = DistractorAwareMemory(pos_slots=6, neg_slots=6, update_interval=5)
 
-    # Frame 0: init tracker, extract embedding (always None after init → zeros)
-    init_bbox_arr = gt_bboxes[0]
-    init_bbox = BBox(
-        x=float(init_bbox_arr[0]),
-        y=float(init_bbox_arr[1]),
-        w=float(init_bbox_arr[2]),
-        h=float(init_bbox_arr[3]),
-    )
-    tracker.init(frames[0], init_bbox)
-
-    # Frame 0 embedding: None after init() → zero vector
-    # Frame 0 features: empty RAM → all zeros (no compute_features call needed,
-    # np.zeros already initialised above)
-    # Update mem._current_frame so update_age computation is consistent
-    mem._current_frame = 0
-    # Frame 0: zeros output, empty RAM — no add() (zero embedding would corrupt similarities).
-    # First real backbone embedding arrives at frame 1.
-
-    # Frames 1..T-1
-    for t in range(1, T):
-        # Run tracker (update_with_state with default CONFIRMED state = 0)
-        try:
-            track_state = tracker.update_with_state(frames[t], target_state=0)
-        except Exception as exc:
-            logger.warning("update_with_state failed at t=%d: %s — using zero emb", t, exc)
-            result[t] = 0.0
+    # Iterate via SALTRunner.run() — handles frame 0 init internally and
+    # applies TSA state machine / CE gates / LOST recovery on frames 1+.
+    for t, entry in enumerate(runner.run(seq_obj)):
+        if t == 0:
+            # Frame 0: tracker.init() was called; _last_search_* are None → zero
+            # embedding.  Frame 0 output stays zeros (result already zero-init).
+            # Do NOT add to RAM — zero embedding would corrupt similarities.
+            # First real backbone embedding arrives at frame 1.
+            mem._current_frame = 0
             continue
 
-        # Extract embedding for frame t (after update, before RAM update)
-        emb_t = _get_embedding(tracker, embedding_view)
-        if emb_t is None or (emb_t == 0).all():
+        # Extract embedding for frame t from runner.tracker (the SGLATracker)
+        emb_t = _get_embedding(runner.tracker, embedding_view)
+        if (emb_t == 0).all():
             # None or zero — guard: log only when unexpected (not frame 0)
             logger.debug("embedding is zero at t=%d view=%s", t, embedding_view)
 
@@ -297,17 +306,15 @@ def build_sidecar(args: argparse.Namespace) -> None:
     feature_indices = _pos_feature_indices()
     print(f"[sgla_memory_extractor] Pos-only feature indices: {feature_indices}")
 
-    # Build SGLATracker — loaded once, reset per sequence
-    from uav_tracker.trackers.sglatrack import SGLATracker
+    # Build SALTRunner from config — loaded once, reset per sequence via run()
+    from uav_tracker.salt_runner import SALTRunner
 
-    weights_path = getattr(args, "weights_path", None)
-    tracker = SGLATracker(
-        device="auto",
-        weights_path=weights_path,
-        enable_ce=True,
+    config_path = args.config_path
+    runner = SALTRunner.from_config(config_path)
+    print(
+        f"[sgla_memory_extractor] SALTRunner loaded from {config_path} "
+        f"(tracker stub={getattr(runner.tracker, 'is_stub_mode', False)})"
     )
-    tracker._load()  # eager load so per-sequence cost is just reset
-    print(f"[sgla_memory_extractor] SGLATracker loaded (stub={tracker.is_stub_mode})")
 
     # Compute MD5 of source files
     npz_md5 = _md5_file(str(npz_path))
@@ -317,9 +324,7 @@ def build_sidecar(args: argparse.Namespace) -> None:
     tracker_ckpt_md5 = "unavailable"
     try:
         from uav_tracker.paths import weights_root
-        _w = Path(weights_path) if weights_path else (
-            weights_root() / "sglatrack" / "sglatrack_ep0297.pth.tar"
-        )
+        _w = weights_root() / "sglatrack" / "sglatrack_ep0297.pth.tar"
         if _w.exists():
             tracker_ckpt_md5 = _md5_file(str(_w))
     except Exception:
@@ -392,7 +397,9 @@ def build_sidecar(args: argparse.Namespace) -> None:
 
             seq_obj = dataset_seqs[seq_name]
 
-            # Load all frames and GT bboxes
+            # Load all frames to determine T and verify against NPZ.
+            # We load frames here (not inside extract_sequence) so we can check
+            # the frame count before running the (expensive) SALTRunner pass.
             try:
                 frames_list = list(seq_obj.frames)
                 gt_bboxes_raw = list(seq_obj.ground_truth)
@@ -402,9 +409,6 @@ def build_sidecar(args: argparse.Namespace) -> None:
                 continue
 
             T = len(frames_list)
-            gt_bboxes = np.array(
-                [[b.x, b.y, b.w, b.h] for b in gt_bboxes_raw], dtype=np.float32
-            )
 
             # Verify frame count against NPZ
             npz_T = data[f"features/{seq_key}"].shape[0]
@@ -416,26 +420,24 @@ def build_sidecar(args: argparse.Namespace) -> None:
                 n_skipped += 1
                 continue
 
-            # Reset tracker between sequences
-            tracker.reset()
-            # Also reset the loaded model state (template, etc.)
-            tracker._z_tensor = None
-            tracker._state = None
-            tracker._last_search_global = None
-            tracker._last_search_score_weighted = None
-            tracker._last_search_peak_local = None
+            # Wrap in _WrappedSequence so runner.run() sees .name/.frames/.ground_truth
+            # SALTRunner.run() calls self._reset() internally — no manual tracker reset needed.
+            seq_for_run = _WrappedSequence(
+                name=seq_name,
+                frames=frames_list,
+                ground_truth=gt_bboxes_raw,
+            )
 
             print(
                 f"  [{n_done + 1}/{len(seq_keys)}] {seq_key}  T={T}",
                 end="  ", flush=True,
             )
 
-            # Run extraction
+            # Run extraction via SALTRunner
             try:
                 mem_feats = extract_sequence(
-                    tracker=tracker,
-                    frames=frames_list,
-                    gt_bboxes=gt_bboxes,
+                    runner=runner,
+                    seq_obj=seq_for_run,
                     preds_for_seq=preds_for_seq,
                     embedding_view=args.embedding_view,
                     feature_indices=feature_indices,
@@ -508,7 +510,7 @@ def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description=(
             "Build per-frame positive-appearance RAM sidecar using real "
-            "SGLATracker backbone embeddings."
+            "SGLATracker backbone embeddings via SALTRunner."
         )
     )
     p.add_argument(
@@ -524,19 +526,22 @@ def _parse_args() -> argparse.Namespace:
         help="Output path, e.g. saltr/data/salt_rd_sgla_pos_memory_sidecar.npz",
     )
     p.add_argument(
+        "--config-path",
+        default="configs/prod/salt.yaml",
+        help=(
+            "Path to SALTRunner YAML config (e.g. configs/prod/salt.yaml). "
+            "SALTRunner.from_config() loads tracker weights, TSA, detector, etc. "
+            "The same config used when collecting the v2 NPZ labels should be used "
+            "here to ensure trajectory alignment."
+        ),
+    )
+    p.add_argument(
         "--embedding-view",
         choices=["score_weighted", "peak_local", "global"],
         default="score_weighted",
         help=(
             "Which backbone embedding view to use: "
             "score_weighted (default), peak_local, or global."
-        ),
-    )
-    p.add_argument(
-        "--weights-path", default=None,
-        help=(
-            "Path to SGLATracker weights (.pth.tar). "
-            "If omitted, auto-detected from $UAV_WEIGHTS_ROOT."
         ),
     )
     p.add_argument(
