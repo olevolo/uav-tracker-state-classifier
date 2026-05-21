@@ -239,6 +239,13 @@ class SGLATracker:
         self._last_search_peak_local: torch.Tensor | None = None
         self._last_template_embedding: torch.Tensor | None = None
 
+    def _reset_embedding_cache(self) -> None:
+        """Reset per-frame embedding cache. Call at init() and any early-return path."""
+        self._last_search_global = None
+        self._last_search_score_weighted = None
+        self._last_search_peak_local = None
+        self._last_template_embedding = None
+
     @property
     def _device(self) -> torch.device:
         if self._device_str == "auto":
@@ -283,6 +290,7 @@ class SGLATracker:
         if self._model is None:
             self._load()
 
+        self._reset_embedding_cache()
         # OpenCV delivers BGR — SGLATrack expects RGB
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         patch, _ = _sample_target(rgb, bbox, _TEMPLATE_FACTOR, _TEMPLATE_SIZE)
@@ -291,6 +299,7 @@ class SGLATracker:
 
     def update(self, frame: np.ndarray) -> TrackState:
         if self._model is None or self._z_tensor is None or self._state is None:
+            self._reset_embedding_cache()
             return TrackState(bbox=BBox(0, 0, 1, 1), confidence=0.0, status="lost")
 
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -463,6 +472,7 @@ class SGLATracker:
             ce_keep_rate = 1.0
 
         if self._model is None or self._z_tensor is None or self._state is None:
+            self._reset_embedding_cache()
             return TrackState(bbox=BBox(0, 0, 1, 1), confidence=0.0, status="lost")
 
         # Map target_state to search_factor — OCCLUDED/LOST use expanded region
