@@ -1,0 +1,32 @@
+# saltrd_visdrone_sot.yaml — SALT-RD learned controller, VisDrone-SOT dataset
+
+tracker:
+  name: sglatrack
+  device: auto
+
+detector:
+  name: yolo26m_visdrone
+  conf_threshold: 0.25
+
+appearance_memory:
+  name: cosine_memory
+  enabled: true
+  max_templates: 20
+  forgetting_factor: 0.95
+  store_interval: 10
+  min_confidence: 0.60
+  drift_threshold: 0.35
+
+motion_predictor:
+  name: lstm_online
+  enabled: false
+
+saltrd:
+  enabled: true
+  checkpoint: saltr/checkpoints/saltrd_v21_visdrone_sot/saltrd_policy_best.pt
+  reinit_threshold: 0.65
+  cosine_threshold: 0.25
+  candidate_scorer_checkpoint: saltr/checkpoints/candidate_scorer_v21_visdrone_sot/best.pt
+
+dataset: visdrone_sot
+seed: 42
