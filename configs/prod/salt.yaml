@@ -32,9 +32,10 @@ saltrd:
   # rollout_policy.py simulation (oracle hard_delta +0.215 at T=0.85).
   reinit_threshold: 0.65  # lowered from 0.85; model p(REINIT) peaks at 0.65-0.77 on hard frames
   # Cosine similarity threshold for recovery candidate acceptance.
-  # 0.25 = permissive (BUG-24: accepts wrong-class candidates on car7/truck1).
-  # 0.60 = stricter; requires stronger appearance match before reinit executes.
-  cosine_threshold: 0.60
+  # 0.25 = permissive default. Raising to 0.60 made truck1 worse (BUG-24 analysis:
+  # SGLATrack embeddings lack identity discriminability; threshold tuning is not the fix).
+  # Keep key wired for future identity-feature experiments (DINO/DAM4SAM).
+  cosine_threshold: 0.25
 
 dataset: uav123
 seed: 42
