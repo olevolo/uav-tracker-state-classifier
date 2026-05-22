@@ -11,7 +11,7 @@ Usage::
 
     python -m salt_r.rollout_policy \\
         --checkpoint saltr/checkpoints/policy_reinit_v1/saltrd_policy_best.pt \\
-        --oracle saltr/results/reinit_oracle_dataset.npz \\
+        --dataset uav123 \\
         --split val \\
         --output saltr/results/rollout_val_policy_reinit_v1.json
 """
@@ -55,18 +55,44 @@ from salt_r.train_policy import (  # noqa: E402
 )
 
 # ---------------------------------------------------------------------------
-# Hard sequences definition
+# Hard sequences definition (per-dataset)
 # ---------------------------------------------------------------------------
 
-HARD_SEQUENCES: List[str] = [
-    "uav123/bike2",
-    "uav123/uav2",
-    "uav123/uav4",
-    "uav123/uav6",
-    "dtb70/Gull2",
-    "dtb70/Sheep1",
-    "dtb70/StreetBasketball1",
-]
+#: Per-dataset hard sequences used for hard-subset delta reporting.
+#: An empty list means "treat all sequences as hard" for that dataset.
+HARD_SEQUENCES: Dict[str, List[str]] = {
+    "uav123": [
+        "features/uav123/uav2",
+        "features/uav123/uav3",
+        "features/uav123/uav4",
+        "features/uav123/uav5",
+        "features/uav123/uav6",
+        "features/uav123/uav7",
+        "features/uav123/uav8",
+        "features/uav123/car1",
+        "features/uav123/car2",
+        "features/uav123/car3",
+        "features/uav123/car4",
+        "features/uav123/car5",
+        "features/uav123/car6",
+        "features/uav123/car7",
+        "features/uav123/truck1",
+        "features/uav123/truck2",
+        "features/uav123/truck3",
+        "features/uav123/truck4",
+        "features/uav123/bike1",
+        "features/uav123/bike2",
+        "features/uav123/bike3",
+        "features/uav123/person1",
+        "features/uav123/person2",
+        "features/uav123/person3",
+    ],
+    "dtb70": [],          # empty → all sequences treated as hard
+    "visdrone_sot": [],   # empty → all sequences treated as hard
+}
+
+#: Supported dataset names (must match HARD_SEQUENCES keys).
+DATASET_CHOICES: List[str] = ["uav123", "dtb70", "visdrone_sot"]
 
 # ---------------------------------------------------------------------------
 # AUC helper (matches oracle_action_audit.py)
@@ -304,6 +330,7 @@ def rollout(
     checkpoint_path: str,
     oracle_path: str,
     split: str = "val",
+    dataset: str = "uav123",
     output_path: Optional[str] = None,
     device: str = "cpu",
     reinit_confidence_threshold: float = 0.5,
@@ -311,14 +338,26 @@ def rollout(
     reinit_duration_frames: int = 10,
     seed: int = 42,
 ) -> Dict[str, Any]:
-    """Run offline pseudo-rollout for all sequences in the split."""
+    """Run offline pseudo-rollout for all sequences in the split.
+
+    Parameters
+    ----------
+    dataset:
+        One of ``uav123``, ``dtb70``, ``visdrone_sot``.  Sequences in the
+        oracle NPZ are filtered to ``features/{dataset}/`` prefix, and
+        hard-subset delta is reported as ``hard_delta_{dataset}``.
+    """
     import random
     random.seed(seed)
     np.random.seed(seed)
     t_start = time.time()
 
+    if dataset not in DATASET_CHOICES:
+        raise ValueError(f"Unknown dataset {dataset!r}. Choose from {DATASET_CHOICES}")
+
     print(
-        f"[rollout_policy] checkpoint={checkpoint_path}  split={split}", flush=True
+        f"[rollout_policy] checkpoint={checkpoint_path}  split={split}  dataset={dataset}",
+        flush=True,
     )
 
     # Load model
@@ -330,12 +369,26 @@ def rollout(
 
     # Load oracle data
     print("[rollout_policy] Loading oracle dataset ...", flush=True)
-    seq_data = _load_oracle_raw(oracle_path, split=split, window_size=window_size)
+    seq_data_all = _load_oracle_raw(oracle_path, split=split, window_size=window_size)
+
+    # Filter to sequences belonging to this dataset (prefix features/{dataset}/)
+    dataset_prefix = f"features/{dataset}/"
+    seq_data = {
+        k: v for k, v in seq_data_all.items()
+        if k.startswith(dataset_prefix)
+    }
+
     n_seqs = len(seq_data)
-    print(f"[rollout_policy] {n_seqs} sequences in split '{split}'", flush=True)
+    print(
+        f"[rollout_policy] {n_seqs} sequences for dataset '{dataset}' in split '{split}'",
+        flush=True,
+    )
 
     if n_seqs == 0:
-        raise RuntimeError(f"Split '{split}' is empty in {oracle_path}")
+        raise RuntimeError(
+            f"No sequences with prefix '{dataset_prefix}' found in split '{split}' "
+            f"of {oracle_path}"
+        )
 
     # Per-sequence rollout
     seq_results: Dict[str, Any] = {}
@@ -365,7 +418,7 @@ def rollout(
             "changed_bbox_frames": int(res["changed_bbox_frames"]),
         }
 
-        if seq_key in HARD_SEQUENCES or len(res["reinit_frames"]) > 0:
+        if seq_key in HARD_SEQUENCES.get(dataset, []) or len(res["reinit_frames"]) > 0:
             print(
                 f"  {seq_key:<40}  "
                 f"base={res['baseline_auc']:.4f}  "
@@ -389,7 +442,13 @@ def rollout(
     mean_delta = float(np.mean(deltas)) if deltas else 0.0
 
     # Hard subset aggregation
-    hard_available = [s for s in HARD_SEQUENCES if s in seq_results]
+    dataset_hard = HARD_SEQUENCES.get(dataset, [])
+    if dataset_hard:
+        # Use the explicit hard list
+        hard_available = [s for s in dataset_hard if s in seq_results]
+    else:
+        # Empty list → treat all sequences as hard
+        hard_available = list(seq_results.keys())
     hard_baseline_aucs = [seq_results[s]["baseline_auc"] for s in hard_available]
     hard_policy_aucs = [seq_results[s]["policy_auc"] for s in hard_available]
     hard_deltas = [seq_results[s]["delta"] for s in hard_available]
@@ -405,8 +464,8 @@ def rollout(
     rate_ok = changed_bbox_rate > 0.005
     go_nogo = "GO" if (hard_delta_ok and rate_ok) else "NO-GO"
 
-    print(f"\n[rollout_policy] mean_delta={mean_delta:+.4f}", flush=True)
-    print(f"[rollout_policy] hard_delta={hard_delta:+.4f}  (need >= +0.03)", flush=True)
+    print(f"\n[rollout_policy] mean_delta_{dataset}={mean_delta:+.4f}", flush=True)
+    print(f"[rollout_policy] hard_delta_{dataset}={hard_delta:+.4f}  (need >= +0.03)", flush=True)
     print(f"[rollout_policy] changed_bbox_rate={changed_bbox_rate:.5f}  (need > 0.005)", flush=True)
     print(f"[rollout_policy] GO/NO-GO: {go_nogo}", flush=True)
 
@@ -414,22 +473,22 @@ def rollout(
     git_commit = _git_commit()
 
     aggregate: Dict[str, Any] = {
-        "mean_baseline_auc": round(mean_baseline_auc, 5),
-        "mean_policy_auc": round(mean_policy_auc, 5),
-        "mean_delta": round(mean_delta, 5),
+        f"mean_baseline_auc_{dataset}": round(mean_baseline_auc, 5),
+        f"mean_policy_auc_{dataset}": round(mean_policy_auc, 5),
+        f"mean_delta_{dataset}": round(mean_delta, 5),
         "total_changed_bbox_frames": int(total_changed),
         "total_frames": int(total_frames),
         "changed_bbox_rate": round(changed_bbox_rate, 6),
         "n_sequences": int(n_seqs),
         "hard_subset_sequences": hard_available,
-        "hard_subset_baseline_auc": round(float(hard_baseline_auc), 5) if not np.isnan(hard_baseline_auc) else None,
-        "hard_subset_policy_auc": round(float(hard_policy_auc), 5) if not np.isnan(hard_policy_auc) else None,
-        "hard_subset_delta": round(float(hard_delta), 5) if not np.isnan(hard_delta) else None,
+        f"hard_subset_baseline_auc_{dataset}": round(float(hard_baseline_auc), 5) if not np.isnan(hard_baseline_auc) else None,
+        f"hard_subset_policy_auc_{dataset}": round(float(hard_policy_auc), 5) if not np.isnan(hard_policy_auc) else None,
+        f"hard_delta_{dataset}": round(float(hard_delta), 5) if not np.isnan(hard_delta) else None,
     }
 
     go_criteria: Dict[str, Any] = {
         "hard_subset_delta_threshold": 0.03,
-        "hard_subset_delta_actual": round(float(hard_delta), 5) if not np.isnan(hard_delta) else None,
+        f"hard_subset_delta_actual_{dataset}": round(float(hard_delta), 5) if not np.isnan(hard_delta) else None,
         "hard_subset_delta_ok": bool(hard_delta_ok),
         "changed_bbox_rate_threshold": 0.005,
         "changed_bbox_rate_actual": round(changed_bbox_rate, 6),
@@ -439,6 +498,7 @@ def rollout(
     results: Dict[str, Any] = {
         "checkpoint": str(checkpoint_path),
         "oracle": str(oracle_path),
+        "dataset": dataset,
         "split": split,
         "feature_schema": feature_schema,
         "sequences": seq_results,
@@ -484,9 +544,25 @@ def main() -> None:
         help="Path to saltrd_policy_best.pt checkpoint.",
     )
     parser.add_argument(
+        "--dataset",
+        default="uav123",
+        choices=DATASET_CHOICES,
+        help="Dataset to evaluate (default: uav123).",
+    )
+    parser.add_argument(
+        "--oracle-npz",
+        default=None,
+        dest="oracle_npz",
+        help=(
+            "Path to reinit_oracle_{dataset}.npz "
+            "(default: saltr/results/reinit_oracle_{dataset}.npz)."
+        ),
+    )
+    # Keep --oracle as an alias for backwards-compat (deprecated)
+    parser.add_argument(
         "--oracle",
-        required=True,
-        help="Path to reinit_oracle_dataset.npz.",
+        default=None,
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--split",
@@ -497,7 +573,10 @@ def main() -> None:
     parser.add_argument(
         "--output",
         default=None,
-        help="Output JSON path.",
+        help=(
+            "Output JSON path "
+            "(default: saltr/results/rollout_diagnostic_{dataset}.json)."
+        ),
     )
     parser.add_argument(
         "--device", default="cpu", help="Torch device (default: cpu)."
@@ -523,11 +602,23 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
+    # Resolve oracle path: --oracle-npz > --oracle (legacy) > default
+    if args.oracle_npz is not None:
+        oracle_path = args.oracle_npz
+    elif args.oracle is not None:
+        oracle_path = args.oracle
+    else:
+        oracle_path = f"saltr/results/reinit_oracle_{args.dataset}.npz"
+
+    # Resolve output path
+    output_path = args.output or f"saltr/results/rollout_diagnostic_{args.dataset}.json"
+
     rollout(
         checkpoint_path=args.checkpoint,
-        oracle_path=args.oracle,
+        oracle_path=oracle_path,
         split=args.split,
-        output_path=args.output,
+        dataset=args.dataset,
+        output_path=output_path,
         device=args.device,
         reinit_confidence_threshold=args.reinit_threshold,
         reinit_iou_value=args.reinit_iou,
