@@ -58,9 +58,9 @@ from salt_r.actions import RecoveryAction  # noqa: E402
 FEATURE_SCHEMA: str = "saltrd_v3_no_tsa_no_flow"
 N_FEATURES: int = 28
 # Candidate features: [bbox_x/W, bbox_y/H, bbox_w/W, bbox_h/H, detector_score,
-#                      score_map_score, geometry_area_ratio, frame_area_ratio, cosine_sim]
-# (frame dimensions W/H normalize the bbox; scores/ratios are already in [0,1] range)
-CANDIDATE_FEATURE_DIM: int = 9
+#                      score_map_score, geometry_area_ratio, frame_area_ratio, cosine_sim,
+#                      dist_from_last (candidate_center to last_good_bbox / frame_diagonal)]
+CANDIDATE_FEATURE_DIM: int = 10
 
 # Recovery action class indices derived from RECOVERY_ACTION_ORDER in policy_model
 # NONE=0, SCORE_CANDIDATES=1, REINIT=2, REJECT_REINIT=3
@@ -297,6 +297,7 @@ class CandidateEventDataset(Dataset):
                 float(ev.get("geometry_area_ratio", 1.0)),
                 float(ev.get("frame_area_ratio", 0.0)),
                 float(ev.get("cosine_sim", 0.0)),
+                float(ev.get("dist_from_last", 0.0)),  # feature 9: rel. dist to last target
             ], dtype=np.float32)
 
             label = int(ev.get("label_good_candidate", 0))

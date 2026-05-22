@@ -98,18 +98,19 @@ class SALTRDController:
         return np.stack(hist[-self._window_size:], axis=0).astype(np.float32, copy=False)
 
     def _build_candidate_features(self, candidates: list, image_shape: tuple | None = None) -> Any:
-        """Build ``(n_cands, 9)`` tensor matching ``CandidateEventDataset`` feature schema.
+        """Build ``(n_cands, 10)`` tensor matching ``CandidateEventDataset`` feature schema.
 
         Feature order (must match CandidateEventDataset.__getitem__):
-            0  bbox_x / frame_w   (normalized when image_shape available, else raw px)
+            0  bbox_x / frame_w
             1  bbox_y / frame_h
             2  bbox_w / frame_w
             3  bbox_h / frame_h
             4  detector_score  (0.0 if source is score_map)
             5  score_map_score (0.0 if source is detector)
             6  geometry_area_ratio  = size_ratio_to_tracker
-            7  frame_area_ratio     (computed when image_shape available, else 0.0)
-            8  cosine_sim           = 0.0 (not available at controller step; needs BUG-27 v2)
+            7  frame_area_ratio
+            8  cosine_sim           = 0.0 (BUG-27 v2: appearance memory, future work)
+            9  dist_from_last       = distance_to_tracker / frame_diagonal  (Track A feature)
 
         Returns None if candidates is empty (model falls back to heuristic).
         """
@@ -118,6 +119,7 @@ class SALTRDController:
         try:
             import torch
             h, w = (image_shape[0], image_shape[1]) if image_shape else (1, 1)
+            frame_diag = (h ** 2 + w ** 2) ** 0.5 if (h > 1 and w > 1) else 1.0
             rows = []
             for c in candidates:
                 bbox = c.bbox  # (x, y, w, h) floats
@@ -130,8 +132,9 @@ class SALTRDController:
                     float(c.detector_score or 0.0),
                     float(c.score) if getattr(c, 'source', '') == 'score_map' else 0.0,
                     float(getattr(c, 'size_ratio_to_tracker', 1.0)),
-                    cand_area / max(float(h * w), 1.0),  # frame_area_ratio (0 when no shape)
-                    0.0,   # cosine_sim — BUG-27 v2: pass through appearance memory
+                    cand_area / max(float(h * w), 1.0),
+                    0.0,   # cosine_sim — appearance memory (future)
+                    float(getattr(c, 'distance_to_tracker', 0.0)) / max(frame_diag, 1.0),
                 ])
             return torch.tensor(rows, dtype=torch.float32)
         except Exception:

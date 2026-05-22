@@ -80,6 +80,8 @@ class CandidateEvent:
     # Frame dimensions for bbox normalization (BUG-27 fix)
     frame_h: int = 0                # frame height at event time; 0 = not recorded
     frame_w: int = 0                # frame width at event time; 0 = not recorded
+    # Relative position feature (Track A pivot — dist to last known target)
+    dist_from_last: float = 0.0     # distance(candidate_center, last_good_bbox_center) / frame_diagonal
 
     # Offline GT labels (filled by labeling pass, None at collection time)
     candidate_iou: Optional[float] = None        # IoU(candidate_bbox, gt_bbox[frame_idx])
@@ -128,6 +130,7 @@ class CandidateEventLogger:
         seq_id: Optional[str] = None,
         frame_h: int = 0,
         frame_w: int = 0,
+        dist_from_last: float = 0.0,
     ) -> None:
         if not self.enabled:
             return
@@ -147,6 +150,7 @@ class CandidateEventLogger:
             reject_reason=reject_reason,
             frame_h=frame_h,
             frame_w=frame_w,
+            dist_from_last=dist_from_last,
         ))
 
     def events(self) -> List[CandidateEvent]:
