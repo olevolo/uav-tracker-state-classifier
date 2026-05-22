@@ -71,9 +71,12 @@ def run(
 
     oracle_data = np.load(oracle_npz_path, allow_pickle=True)
     runner = SALTRunner.from_config(config_path)
-    runner.candidate_logger = CandidateEventLogger(enabled=True)
+    if runner.candidate_logger is None:
+        runner.candidate_logger = CandidateEventLogger(enabled=True)
+    else:
+        runner.candidate_logger.enabled = True
 
-    # Load dataset
+    # Load dataset — uses __iter__ protocol
     if dataset == "uav123":
         from uav_tracker.datasets.uav123 import UAV123Dataset
         ds = UAV123Dataset()
@@ -86,31 +89,31 @@ def run(
     else:
         raise ValueError(f"Unknown dataset: {dataset}")
 
-    seqs = list(ds.sequences)
-    if max_seqs > 0:
-        seqs = seqs[:max_seqs]
+    # Filter to sequences present in oracle NPZ (they have feature/label data)
+    oracle_seq_names = {
+        k.replace(f"features/{dataset}/", "")
+        for k in oracle_data.files
+        if k.startswith(f"features/{dataset}/")
+    }
 
     all_events: list[dict] = []
     t0 = time.time()
+    n_processed = 0
 
-    for seq_name in seqs:
-        seq_key = f"{dataset}/{seq_name}"
-        gt_key = f"bbox_gt/{seq_key}"
-        iou_key = f"iou_trace/{seq_key}"
+    for seq in ds:
+        if max_seqs > 0 and n_processed >= max_seqs:
+            break
+        seq_name = seq.name
+        if oracle_seq_names and seq_name not in oracle_seq_names:
+            continue  # skip sequences not in oracle (e.g. diagnostic hold-outs)
 
-        if gt_key not in oracle_data.files:
-            continue
-
-        gt_bboxes = oracle_data[gt_key]        # (T, 4) [x,y,w,h]
+        iou_key = f"iou_trace/{dataset}/{seq_name}"
         iou_trace = oracle_data[iou_key] if iou_key in oracle_data.files else None
 
-        runner.candidate_logger.reset(seq_id=seq_name)
-        try:
-            seq = ds.get_sequence(seq_name)
-        except Exception:
-            continue
+        # GT bboxes come directly from the sequence object
+        gt_bboxes = seq.ground_truth  # list or array of (x,y,w,h)
 
-        # Run tracker — collect candidate events
+        runner.candidate_logger.reset(seq_id=seq_name)
         try:
             for _ in runner.run(seq):
                 pass
@@ -118,19 +121,26 @@ def run(
             print(f"  [skip] {seq_name}: {exc}", file=sys.stderr)
             continue
 
+        n_processed += 1
+
         # Label collected events with GT IoU and future utility
         for ev in runner.candidate_logger.events():
             d = ev.to_dict()
             t = ev.frame_idx
 
             if t < len(gt_bboxes):
-                gt = tuple(float(v) for v in gt_bboxes[t])
-                d["candidate_iou"] = _iou(tuple(ev.candidate_bbox), gt)
+                gt = gt_bboxes[t]
+                # GT may be a BBox dataclass or array-like
+                if hasattr(gt, 'x'):
+                    gt_tuple = (float(gt.x), float(gt.y), float(gt.w), float(gt.h))
+                else:
+                    gt_tuple = (float(gt[0]), float(gt[1]), float(gt[2]), float(gt[3]))
+                d["candidate_iou"] = _iou(tuple(float(v) for v in ev.candidate_bbox), gt_tuple)
             else:
                 d["candidate_iou"] = 0.0
 
             if iou_trace is not None and t < len(iou_trace):
-                future = iou_trace[t + 1 : t + 21]
+                future = iou_trace[t + 1: t + 21]
                 d["future_iou_gain"] = float(np.mean(future) - iou_trace[t]) if len(future) > 0 else 0.0
             else:
                 d["future_iou_gain"] = 0.0
