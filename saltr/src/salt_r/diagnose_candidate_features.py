@@ -20,6 +20,12 @@ from pathlib import Path
 
 import numpy as np
 
+_GATE_SEQUENCES: dict[str, list[str]] = {
+    "uav123":      ["car7", "truck1"],
+    "dtb70":       ["Girl2", "StreetBasketball1", "Animal1"],
+    "visdrone_sot": [],   # no established hard sequences yet; skip gate
+}
+
 _FEATURE_NAMES = [
     "bbox_x_norm",
     "bbox_y_norm",
@@ -63,7 +69,8 @@ def _build_features(ev: dict) -> np.ndarray:
     ], dtype=np.float32)
 
 
-def diagnose(events_path: str, sequences: list[str] | None, output_path: str | None) -> dict:
+def diagnose(events_path: str, sequences: list[str] | None, output_path: str | None,
+             gate_sequences: list[str] | None = None) -> dict:
     data = np.load(events_path, allow_pickle=True)
     raw_events = data["events"]
 
@@ -108,27 +115,31 @@ def diagnose(events_path: str, sequences: list[str] | None, output_path: str | N
         per_seq[sid] = _run_subset(sid, evs)
     all_results["per_sequence"] = per_seq
 
-    # Gate check
+    # Gate check — use explicitly provided sequences or dataset default
     gate_feature = "dist_from_last"
     gate_threshold = 0.70
-    gate_seqs = ["car7", "truck1"]
-    gate_pass = True
-    gate_notes = []
-    for seq in gate_seqs:
-        if seq in per_seq:
-            auc = per_seq[seq].get("feature_auc", {}).get(gate_feature, float("nan"))
-            if np.isnan(auc) or auc < gate_threshold:
-                gate_pass = False
-                gate_notes.append(f"{seq}: {gate_feature} AUC={auc:.3f} < {gate_threshold}")
-        else:
-            gate_notes.append(f"{seq}: not in dataset")
-    all_results["gate"] = {
-        "feature": gate_feature,
-        "threshold": gate_threshold,
-        "sequences": gate_seqs,
-        "pass": gate_pass and len(gate_notes) == 0,
-        "notes": gate_notes,
-    }
+    gate_seqs = gate_sequences if gate_sequences is not None else ["car7", "truck1"]
+    if not gate_seqs:
+        all_results["gate"] = {"feature": gate_feature, "threshold": gate_threshold,
+                               "sequences": [], "pass": True, "notes": ["no gate sequences defined for this dataset"]}
+    else:
+        gate_pass = True
+        gate_notes = []
+        for seq in gate_seqs:
+            if seq in per_seq:
+                auc = per_seq[seq].get("feature_auc", {}).get(gate_feature, float("nan"))
+                if np.isnan(auc) or auc < gate_threshold:
+                    gate_pass = False
+                    gate_notes.append(f"{seq}: {gate_feature} AUC={auc:.3f} < {gate_threshold}")
+            else:
+                gate_notes.append(f"{seq}: not in dataset (run with --sequences)")
+        all_results["gate"] = {
+            "feature": gate_feature,
+            "threshold": gate_threshold,
+            "sequences": gate_seqs,
+            "pass": gate_pass and len(gate_notes) == 0,
+            "notes": gate_notes,
+        }
 
     # Print summary
     print(f"\n=== Candidate Feature Diagnostic ===")
@@ -163,12 +174,22 @@ def diagnose(events_path: str, sequences: list[str] | None, output_path: str | N
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--events", required=True, help="Path to candidate_events_v5_labeled.npz")
+    ap.add_argument("--events", required=True, help="Path to candidate_events_v5_<dataset>.npz")
+    ap.add_argument("--dataset", choices=list(_GATE_SEQUENCES), default=None,
+                    help="Dataset name — sets default gate sequences. If omitted, gate uses car7/truck1.")
     ap.add_argument("--sequences", nargs="+", default=None,
                     help="Sequences to include in per-seq breakdown (default: all)")
+    ap.add_argument("--gate-sequences", nargs="+", default=None,
+                    help="Sequences to use for AUC gate check. Overrides --dataset default.")
     ap.add_argument("--output", default=None, help="Path to save JSON results")
     args = ap.parse_args()
-    diagnose(args.events, args.sequences, args.output)
+
+    # Resolve gate sequences: explicit > dataset default > uav123 fallback
+    gate_seqs = args.gate_sequences
+    if gate_seqs is None and args.dataset is not None:
+        gate_seqs = _GATE_SEQUENCES.get(args.dataset, [])
+
+    diagnose(args.events, args.sequences, args.output, gate_sequences=gate_seqs)
 
 
 if __name__ == "__main__":
