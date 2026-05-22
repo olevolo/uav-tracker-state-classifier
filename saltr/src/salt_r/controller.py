@@ -76,7 +76,9 @@ class SALTRDController:
             # BUG-26(e): pass candidate features so the trained scorer head is active.
             # Without this, output["candidate_score"] is always None and selection
             # falls back to evidence.candidates[0] regardless of scorer training.
-            cand_tensor = self._build_candidate_features(evidence.candidates)
+            cand_tensor = self._build_candidate_features(
+                evidence.candidates, image_shape=evidence.image_shape
+            )
             output = self._policy_net(x, candidate_features=cand_tensor)
         except Exception as e:  # noqa: BLE001
             return self._safe_noop(reason=f"model_error:{e}")
@@ -95,19 +97,19 @@ class SALTRDController:
             hist = padding + hist
         return np.stack(hist[-self._window_size:], axis=0).astype(np.float32, copy=False)
 
-    def _build_candidate_features(self, candidates: list) -> Any:
+    def _build_candidate_features(self, candidates: list, image_shape: tuple | None = None) -> Any:
         """Build ``(n_cands, 9)`` tensor matching ``CandidateEventDataset`` feature schema.
 
         Feature order (must match CandidateEventDataset.__getitem__):
-            0  bbox_x          (pixels; frame_w not available at controller step → raw px)
-            1  bbox_y
-            2  bbox_w
-            3  bbox_h
+            0  bbox_x / frame_w   (normalized when image_shape available, else raw px)
+            1  bbox_y / frame_h
+            2  bbox_w / frame_w
+            3  bbox_h / frame_h
             4  detector_score  (0.0 if source is score_map)
             5  score_map_score (0.0 if source is detector)
             6  geometry_area_ratio  = size_ratio_to_tracker
-            7  frame_area_ratio     = 0.0 (frame dims not available at controller step)
-            8  cosine_sim           = 0.0 (not available at controller step)
+            7  frame_area_ratio     (computed when image_shape available, else 0.0)
+            8  cosine_sim           = 0.0 (not available at controller step; needs BUG-27 v2)
 
         Returns None if candidates is empty (model falls back to heuristic).
         """
@@ -115,19 +117,21 @@ class SALTRDController:
             return None
         try:
             import torch
+            h, w = (image_shape[0], image_shape[1]) if image_shape else (1, 1)
             rows = []
             for c in candidates:
                 bbox = c.bbox  # (x, y, w, h) floats
+                cand_area = float(bbox[2]) * float(bbox[3])
                 rows.append([
-                    float(bbox[0]),
-                    float(bbox[1]),
-                    float(bbox[2]),
-                    float(bbox[3]),
+                    float(bbox[0]) / max(w, 1),
+                    float(bbox[1]) / max(h, 1),
+                    float(bbox[2]) / max(w, 1),
+                    float(bbox[3]) / max(h, 1),
                     float(c.detector_score or 0.0),
                     float(c.score) if getattr(c, 'source', '') == 'score_map' else 0.0,
                     float(getattr(c, 'size_ratio_to_tracker', 1.0)),
-                    0.0,   # frame_area_ratio — not available
-                    0.0,   # cosine_sim — not available
+                    cand_area / max(float(h * w), 1.0),  # frame_area_ratio (0 when no shape)
+                    0.0,   # cosine_sim — BUG-27 v2: pass through appearance memory
                 ])
             return torch.tensor(rows, dtype=torch.float32)
         except Exception:

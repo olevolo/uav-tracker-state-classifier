@@ -633,6 +633,8 @@ class SALTRunner:
                                         cosine_sim=winner_sim,
                                         accepted=False,
                                         reject_reason="guard5",
+                                        frame_h=_fh_l,
+                                        frame_w=_fw_l,
                                     )
                             else:
                                 if self.candidate_logger is not None:
@@ -650,6 +652,8 @@ class SALTRunner:
                                         cosine_sim=winner_sim,
                                         accepted=True,
                                         reject_reason=None,
+                                        frame_h=_fh_l,
+                                        frame_w=_fw_l,
                                     )
                                 self.tracker.init(frame, winner)
                                 track_state = TrackState(
@@ -779,6 +783,8 @@ class SALTRunner:
                             cosine_sim=0.0,
                             accepted=True,
                             reject_reason=None,
+                            frame_h=_fh,
+                            frame_w=_fw,
                         )
                 except Exception as e:
                     _logger.debug("Score-map fallback reinit failed: %s", e)
@@ -811,6 +817,8 @@ class SALTRunner:
                         cosine_sim=0.0,
                         accepted=False,
                         reject_reason=_reject_reason,
+                        frame_h=_fh,
+                        frame_w=_fw,
                     )
 
         self._trajectory.append(track_state.bbox)

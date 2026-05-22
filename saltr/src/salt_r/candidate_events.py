@@ -77,6 +77,10 @@ class CandidateEvent:
     accepted: bool                  # True if geometry guard and cosine guard passed
     reject_reason: Optional[str]    # "size_ratio" | "frame_area" | "in_frame" | "cosine" | None
 
+    # Frame dimensions for bbox normalization (BUG-27 fix)
+    frame_h: int = 0                # frame height at event time; 0 = not recorded
+    frame_w: int = 0                # frame width at event time; 0 = not recorded
+
     # Offline GT labels (filled by labeling pass, None at collection time)
     candidate_iou: Optional[float] = None        # IoU(candidate_bbox, gt_bbox[frame_idx])
     future_iou_gain: Optional[float] = None      # mean IoU[+1..+20] - IoU[frame]
@@ -122,6 +126,8 @@ class CandidateEventLogger:
         accepted: bool,
         reject_reason: Optional[str] = None,
         seq_id: Optional[str] = None,
+        frame_h: int = 0,
+        frame_w: int = 0,
     ) -> None:
         if not self.enabled:
             return
@@ -139,6 +145,8 @@ class CandidateEventLogger:
             cosine_sim=cosine_sim,
             accepted=accepted,
             reject_reason=reject_reason,
+            frame_h=frame_h,
+            frame_w=frame_w,
         ))
 
     def events(self) -> List[CandidateEvent]:

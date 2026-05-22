@@ -78,6 +78,7 @@ class EvidenceFrame:
     candidates: list[CandidateEvidence]     # top-k candidates
     template_context: TemplateContext
     recovery_context: RecoveryContext
+    image_shape: tuple[int, int] | None = None  # (height, width) for bbox normalization
 
 
 class EvidenceExtractor:
@@ -159,6 +160,7 @@ class EvidenceExtractor:
                 last_reinit_age=self._recovery_ctx.last_reinit_age,
                 total_reinit_count=self._recovery_ctx.total_reinit_count,
             ),
+            image_shape=image_shape,
         )
 
         self._frame_idx += 1

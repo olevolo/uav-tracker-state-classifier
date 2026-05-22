@@ -288,10 +288,10 @@ class CandidateEventDataset(Dataset):
                 continue  # not labeled yet
             # Candidate feature vector (CANDIDATE_FEATURE_DIM)
             cand_feat = np.array([
-                float(ev.get("candidate_bbox", [0, 0, 0, 0])[0]) / max(float(ev.get("frame_w", 1)), 1),
-                float(ev.get("candidate_bbox", [0, 0, 0, 0])[1]) / max(float(ev.get("frame_h", 1)), 1),
-                float(ev.get("candidate_bbox", [0, 0, 0, 0])[2]) / max(float(ev.get("frame_w", 1)), 1),
-                float(ev.get("candidate_bbox", [0, 0, 0, 0])[3]) / max(float(ev.get("frame_h", 1)), 1),
+                float(ev.get("candidate_bbox", [0, 0, 0, 0])[0]) / max(float(ev.get("frame_w") or 1), 1),
+                float(ev.get("candidate_bbox", [0, 0, 0, 0])[1]) / max(float(ev.get("frame_h") or 1), 1),
+                float(ev.get("candidate_bbox", [0, 0, 0, 0])[2]) / max(float(ev.get("frame_w") or 1), 1),
+                float(ev.get("candidate_bbox", [0, 0, 0, 0])[3]) / max(float(ev.get("frame_h") or 1), 1),
                 float(ev.get("detector_score") or 0.0),
                 float(ev.get("score_map_score") or 0.0),
                 float(ev.get("geometry_area_ratio", 1.0)),
