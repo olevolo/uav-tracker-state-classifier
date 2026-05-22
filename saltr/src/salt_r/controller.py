@@ -130,11 +130,20 @@ class SALTRDController:
         # Candidate selection: pick highest-scored candidate if reinit is requested
         selected_candidate = None
         if recovery == RecoveryAction.REINIT and evidence.candidates:
-            candidate_scores = output.get("candidate_scores", [])
-            if candidate_scores and len(candidate_scores) == len(evidence.candidates):
-                best_idx = int(np.argmax(candidate_scores))
-                selected_candidate = evidence.candidates[best_idx]
-            elif evidence.candidates:
+            # BUG-26 fix (a): key was "candidate_scores" (plural) but model emits
+            # "candidate_score" (singular). Also, candidate scoring requires
+            # candidate_features to be passed to forward() — not yet wired.
+            # Until candidate scorer is trained/wired, fall back to candidates[0].
+            candidate_score = output.get("candidate_score")
+            if candidate_score is not None:
+                try:
+                    scores = np.asarray(candidate_score).flatten()
+                    if len(scores) == len(evidence.candidates):
+                        best_idx = int(np.argmax(scores))
+                        selected_candidate = evidence.candidates[best_idx]
+                except Exception:
+                    pass
+            if selected_candidate is None and evidence.candidates:
                 selected_candidate = evidence.candidates[0]
 
         # Safety: if recovery=REINIT but no candidate available, fall back to SCORE_CANDIDATES

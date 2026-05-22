@@ -624,7 +624,11 @@ def train(
                     "lambda_candidate": lambda_candidate,
                     "feature_schema": FEATURE_SCHEMA,
                     "model_family": "saltrd_policy",
-                    "trained_heads": ["recovery_action", "candidate_score"],
+                    # BUG-26 fix (d): candidate_score head is NOT supervised in this
+                    # training run — candidate_features are never passed to forward()
+                    # and OracleReinitDataset returns no per-candidate labels.
+                    # Remove from trained_heads to stop misleading downstream code.
+                    "trained_heads": ["recovery_action"],
                     "oracle_source": str(oracle_path),
                     "git_commit": _git_commit(),
                     "created_at": datetime.utcnow().isoformat(),
@@ -653,7 +657,7 @@ def train(
     summary = {
         "model_family": "saltrd_policy",
         "feature_schema": FEATURE_SCHEMA,
-        "trained_heads": ["recovery_action", "candidate_score"],
+        "trained_heads": ["recovery_action"],  # BUG-26: candidate_score not supervised
         "oracle_source": str(oracle_path),
         "output_dir": str(output_dir),
         "checkpoint": str(ckpt_path),
