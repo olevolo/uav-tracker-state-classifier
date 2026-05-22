@@ -133,7 +133,7 @@ class SALTRunner:
     # Frames since tracker last had good-quality output (conf >= threshold).
     # Score-map fallback only fires after extended failure to prevent false reinits.
     _frames_since_good_bbox: int = field(default=0, init=False, repr=False)
-    _FALLBACK_MIN_FAILURE_FRAMES: int = field(default=25, init=False, repr=False)
+    _FALLBACK_MIN_FAILURE_FRAMES: int = field(default=50, init=False, repr=False)
     # Guard 3: reference appearance embedding from frame 0 for cosine similarity check
     # at recovery time. Set at init, updated slowly during confirmed tracking via EMA.
     _ref_embedding: Optional[np.ndarray] = field(default=None, init=False, repr=False)
@@ -673,8 +673,31 @@ class SALTRunner:
             candidate_bbox = decision.selected_candidate.bbox  # (x, y, w, h)
             _fh, _fw = frame.shape[:2]
             cx, cy = candidate_bbox[0] + candidate_bbox[2] / 2, candidate_bbox[1] + candidate_bbox[3] / 2
+
+            # BUG-19 fix: candidate validity guards before accepting score-map reinit.
+            # Full-frame / border score-map peaks (score ≈ 0.97) would destroy tracking.
+            _cand_area = candidate_bbox[2] * candidate_bbox[3]
+            _frame_area = float(_fh * _fw)
+            _last_area = float(
+                self._last_good_bbox.w * self._last_good_bbox.h
+                if self._last_good_bbox else _cand_area
+            )
+            _area_ratio = _cand_area / max(_last_area, 1e-6)
+            # Clipped area to estimate out-of-frame extent
+            _cx1 = max(candidate_bbox[0], 0.0)
+            _cy1 = max(candidate_bbox[1], 0.0)
+            _cx2 = min(candidate_bbox[0] + candidate_bbox[2], float(_fw))
+            _cy2 = min(candidate_bbox[1] + candidate_bbox[3], float(_fh))
+            _clipped_area = max(_cx2 - _cx1, 0.0) * max(_cy2 - _cy1, 0.0)
+            _in_frame_ratio = _clipped_area / max(_cand_area, 1e-6)
+
+            _guard_size = 0.25 <= _area_ratio <= 4.0        # area within [0.25×, 4×] of last target
+            _guard_frame = (_cand_area / max(_frame_area, 1e-6)) <= 0.05  # < 5% of frame area
+            _guard_extent = _in_frame_ratio >= 0.80         # <= 20% of bbox outside frame
+
             if (candidate_bbox[2] > 0 and candidate_bbox[3] > 0
-                    and 0 <= cx <= _fw and 0 <= cy <= _fh):
+                    and 0 <= cx <= _fw and 0 <= cy <= _fh
+                    and _guard_size and _guard_frame and _guard_extent):
                 try:
                     bbox_obj = BBox(x=candidate_bbox[0], y=candidate_bbox[1],
                                    w=candidate_bbox[2], h=candidate_bbox[3])
@@ -690,14 +713,31 @@ class SALTRunner:
                         self.evidence_extractor.notify_reinit()
                     _logger.warning(
                         "SALT recovery (score-map fallback): frame=%d  "
-                        "bbox=(%.0f,%.0f %.0fx%.0f)  score=%.3f",
+                        "bbox=(%.0f,%.0f %.0fx%.0f)  score=%.3f  area_ratio=%.2f",
                         self._frame_idx,
                         candidate_bbox[0], candidate_bbox[1],
                         candidate_bbox[2], candidate_bbox[3],
                         getattr(decision.selected_candidate, 'score', 0.0),
+                        _area_ratio,
                     )
                 except Exception as e:
                     _logger.debug("Score-map fallback reinit failed: %s", e)
+            else:
+                _reject_reason = (
+                    "size_ratio=%.2f" % _area_ratio if not _guard_size else
+                    "frame_area_ratio=%.3f" % (_cand_area / max(_frame_area, 1e-6)) if not _guard_frame else
+                    "in_frame_ratio=%.2f" % _in_frame_ratio if not _guard_extent else
+                    "center_outside_frame"
+                )
+                _logger.warning(
+                    "SALT score-map fallback REJECTED: frame=%d  "
+                    "bbox=(%.0f,%.0f %.0fx%.0f)  score=%.3f  reason=%s",
+                    self._frame_idx,
+                    candidate_bbox[0], candidate_bbox[1],
+                    candidate_bbox[2], candidate_bbox[3],
+                    getattr(decision.selected_candidate, 'score', 0.0),
+                    _reject_reason,
+                )
 
         self._trajectory.append(track_state.bbox)
         if len(self._trajectory) > 200:
