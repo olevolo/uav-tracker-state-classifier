@@ -158,8 +158,10 @@ class SALTRunner:
         from uav_tracker.ml.appearance_memory.cosine_memory import CosineAppearanceMemory
         from uav_tracker.ml.motion_predictor.lstm_predictor import OnlineLSTMMotionPredictor
 
-        tracker_name = cfg.get("tracker", {}).get("name", "sglatrack")
-        tracker = TRACKERS.build(tracker_name, enable_ce=cfg.get("enable_ce", True))
+        tracker_cfg = cfg.get("tracker", {})
+        tracker_name = tracker_cfg.get("name", "sglatrack")
+        tracker_kwargs = {k: v for k, v in tracker_cfg.items() if k != "name"}
+        tracker = TRACKERS.build(tracker_name, **tracker_kwargs)
 
         det_cfg = cfg.get("detector", {})
         det_name = det_cfg.get("name")

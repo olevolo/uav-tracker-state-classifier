@@ -1,0 +1,32 @@
+# SALT — OSTrack-256 + SALT-RD learned controller (ablation config)
+# Mirrors salt.yaml but swaps SGLATrack for OSTrack-256 to measure
+# whether the SALT-RD policy benefit transfers across tracker backbones.
+
+tracker:
+  name: ostrack_256
+  device: auto
+
+detector:
+  name: yolo26m_visdrone
+  conf_threshold: 0.25
+
+appearance_memory:
+  name: cosine_memory
+  enabled: true
+  max_templates: 20
+  forgetting_factor: 0.95
+  store_interval: 10
+  min_confidence: 0.60
+  drift_threshold: 0.35
+
+motion_predictor:
+  name: lstm_online
+  enabled: false
+
+saltrd:
+  enabled: true
+  checkpoint: saltr/checkpoints/policy_reinit_v2/saltrd_policy_best.pt
+  reinit_threshold: 0.65
+
+dataset: uav123
+seed: 42

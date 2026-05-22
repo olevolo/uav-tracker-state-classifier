@@ -3,14 +3,9 @@
 tracker:
   name: sglatrack
   device: auto
-  # CE token pruning at layer 3 (only reachable pruning point: i < start_layer=5).
-  # Three fixes applied to base_backbone.py before CE worked correctly:
-  #   Q1: _CE_LOC={3} (was {3,6,9} — layers 6,9 unreachable)
-  #   Q2: scores current block i's output with block i's own QKV (was i+1)
-  #   Q4: CTEM uses center 4×4 template (was mean of all 64)
-  # CE at kr=0.50 gives MEAN=0.616 (+0.006 vs no-pruning 0.610).
-  ce_loc: [3]
-  ce_keep_ratio: 0.50   # single value — no state-based routing
+  # CE token pruning: kr=0.50 at layer 3 gives +0.006 vs no-pruning.
+  # ce_loc and ce_keep_ratio are applied inside the tracker at load time; not
+  # passed as constructor kwargs (those are controlled by the weights config).
 
 detector:
   name: yolo26m_visdrone   # VisDrone fine-tuned YOLO26m — UAV-specific, 55% mAP@0.5
