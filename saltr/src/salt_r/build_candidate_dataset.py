@@ -64,6 +64,8 @@ def run(
     split: str,
     output_path: str,
     max_seqs: int = 0,
+    sequences: list[str] | None = None,
+    max_frames: int = 0,
 ) -> dict[str, Any]:
     """Collect and label candidate events. Returns summary stats."""
     from uav_tracker.salt_runner import SALTRunner
@@ -104,6 +106,8 @@ def run(
         if max_seqs > 0 and n_processed >= max_seqs:
             break
         seq_name = seq.name
+        if sequences and seq_name not in sequences:
+            continue  # explicit sequence filter (smoke run)
         if oracle_seq_names and seq_name not in oracle_seq_names:
             continue  # skip sequences not in oracle (e.g. diagnostic hold-outs)
 
@@ -115,8 +119,11 @@ def run(
 
         runner.candidate_logger.reset(seq_id=seq_name)
         try:
+            frame_count = 0
             for _ in runner.run(seq):
-                pass
+                frame_count += 1
+                if max_frames > 0 and frame_count >= max_frames:
+                    break
         except Exception as exc:
             print(f"  [skip] {seq_name}: {exc}", file=sys.stderr)
             continue
@@ -148,6 +155,8 @@ def run(
             d["label_good_candidate"] = int(
                 d["candidate_iou"] > 0.3 and d["future_iou_gain"] > 0.0
             )
+            d["candidate_correct_iou03"] = int(d["candidate_iou"] >= 0.30)
+            d["candidate_correct_iou05"] = int(d["candidate_iou"] >= 0.50)
             all_events.append(d)
 
         print(f"  {seq_name}: {len(runner.candidate_logger.events())} events", flush=True)
@@ -156,15 +165,41 @@ def run(
     n_total = len(all_events)
     n_accepted = sum(1 for e in all_events if e.get("accepted", False))
     n_good = sum(1 for e in all_events if e.get("label_good_candidate", 0))
+    n_correct_iou03 = sum(1 for e in all_events if e.get("candidate_correct_iou03", 0))
+    n_correct_iou05 = sum(1 for e in all_events if e.get("candidate_correct_iou05", 0))
     positive_rate = n_good / max(n_accepted, 1)
+    correct_iou03_rate = n_correct_iou03 / max(n_accepted, 1)
+
+    # Source-separated distance stats
+    det_events = [e for e in all_events if e.get("source") == "detector"]
+    sm_events = [e for e in all_events if e.get("source") != "detector"]
+    det_dist_nonzero = sum(1 for e in det_events if e.get("dist_from_last", 0.0) > 0.0)
+    det_dist_nonzero_rate = det_dist_nonzero / max(len(det_events), 1)
+    sm_dist_nonzero = sum(1 for e in sm_events if e.get("dist_from_last", 0.0) > 0.0)
+    sm_dist_nonzero_rate = sm_dist_nonzero / max(len(sm_events), 1)
+
+    # Provenance gates
+    seq_nonblank_rate = sum(1 for e in all_events if e.get("seq_id", "")) / max(n_total, 1)
+    frame_dims_nonzero_rate = sum(
+        1 for e in all_events if e.get("frame_w", 0) > 0 and e.get("frame_h", 0) > 0
+    ) / max(n_total, 1)
 
     stats = {
         "n_events": n_total,
         "n_accepted": n_accepted,
         "n_good_candidate": n_good,
+        "n_correct_iou03": n_correct_iou03,
+        "n_correct_iou05": n_correct_iou05,
         "positive_rate_of_accepted": positive_rate,
+        "correct_iou03_rate": correct_iou03_rate,
+        "seq_nonblank_rate": seq_nonblank_rate,
+        "frame_dims_nonzero_rate": frame_dims_nonzero_rate,
+        "det_dist_nonzero_rate": det_dist_nonzero_rate,
+        "sm_dist_nonzero_rate": sm_dist_nonzero_rate,
+        "n_detector_events": len(det_events),
+        "n_scoremap_events": len(sm_events),
         "elapsed_s": time.time() - t0,
-        "gate_pass": positive_rate >= 0.05,  # >= 5% positive rate required
+        "gate_pass": correct_iou03_rate >= 0.05 and seq_nonblank_rate == 1.0 and frame_dims_nonzero_rate == 1.0,
     }
 
     # Save
@@ -182,8 +217,10 @@ def run(
             f.write(json.dumps(ev) + "\n")
 
     print(f"\nSaved {n_total} events → {output_path}", flush=True)
-    print(f"  accepted={n_accepted}  good_candidate={n_good}  positive_rate={positive_rate:.3f}", flush=True)
-    print(f"  gate ({'PASS' if stats['gate_pass'] else 'FAIL'}): need positive_rate >= 0.05", flush=True)
+    print(f"  accepted={n_accepted}  correct_iou03={n_correct_iou03}  correct_iou05={n_correct_iou05}  legacy_good={n_good}", flush=True)
+    print(f"  correct_iou03_rate={correct_iou03_rate:.3f}  (legacy positive_rate={positive_rate:.3f})", flush=True)
+    print(f"  seq_nonblank={seq_nonblank_rate:.3f}  frame_dims={frame_dims_nonzero_rate:.3f}  det_dist_nonzero={det_dist_nonzero_rate:.3f}  sm_dist_nonzero={sm_dist_nonzero_rate:.3f}", flush=True)
+    print(f"  gate ({'PASS' if stats['gate_pass'] else 'FAIL'}): need correct_iou03_rate >= 0.05 + seq_nonblank == 1.0 + frame_dims == 1.0", flush=True)
     return stats
 
 
@@ -195,6 +232,14 @@ def main() -> None:
     ap.add_argument("--split", default="diagnostic")
     ap.add_argument("--output", default="saltr/data/candidate_events_labeled.npz")
     ap.add_argument("--max-seqs", type=int, default=0, help="0 = all sequences")
+    ap.add_argument(
+        "--sequences", nargs="+", default=None,
+        help="Explicit sequence names to run (e.g. car7 truck1 uav7). Overrides --split filter."
+    )
+    ap.add_argument(
+        "--max-frames", type=int, default=0,
+        help="Max frames per sequence (0 = all). Use for fast smoke runs."
+    )
     args = ap.parse_args()
 
     stats = run(
@@ -204,6 +249,8 @@ def main() -> None:
         split=args.split,
         output_path=args.output,
         max_seqs=args.max_seqs,
+        sequences=args.sequences,
+        max_frames=args.max_frames,
     )
     sys.exit(0 if stats["gate_pass"] else 1)
 

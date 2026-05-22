@@ -84,9 +84,11 @@ class CandidateEvent:
     dist_from_last: float = 0.0     # distance(candidate_center, last_good_bbox_center) / frame_diagonal
 
     # Offline GT labels (filled by labeling pass, None at collection time)
-    candidate_iou: Optional[float] = None        # IoU(candidate_bbox, gt_bbox[frame_idx])
-    future_iou_gain: Optional[float] = None      # mean IoU[+1..+20] - IoU[frame]
-    label_good_candidate: Optional[int] = None  # 1 if IoU>0.3 AND gain>0, else 0
+    candidate_iou: Optional[float] = None           # IoU(candidate_bbox, gt_bbox[frame_idx])
+    future_iou_gain: Optional[float] = None         # mean IoU[+1..+20] - IoU[frame]; may be 0 when oracle absent
+    label_good_candidate: Optional[int] = None      # legacy: 1 if IoU>0.3 AND gain>0 — do NOT use as training gate
+    candidate_correct_iou03: Optional[int] = None   # 1 if candidate_iou >= 0.30 (primary training label)
+    candidate_correct_iou05: Optional[int] = None   # 1 if candidate_iou >= 0.50 (stricter report)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

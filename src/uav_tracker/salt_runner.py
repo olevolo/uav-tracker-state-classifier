@@ -635,10 +635,9 @@ class SALTRunner:
                                         reject_reason="guard5",
                                         frame_h=_fh_l,
                                         frame_w=_fw_l,
-                                        dist_from_last=((winner.x+winner.w/2-(self._last_good_bbox.x+self._last_good_bbox.w/2))**2+
-                                                        (winner.y+winner.h/2-(self._last_good_bbox.y+self._last_good_bbox.h/2))**2)**0.5
-                                                       /max((_fh_l**2+_fw_l**2)**0.5,1.0)
-                                                       if self._last_good_bbox else 0.0,
+                                        dist_from_last=((winner.x+winner.w/2-(track_state.bbox.x+track_state.bbox.w/2))**2+
+                                                        (winner.y+winner.h/2-(track_state.bbox.y+track_state.bbox.h/2))**2)**0.5
+                                                       /max((_fh_l**2+_fw_l**2)**0.5,1.0),
                                     )
                             else:
                                 if self.candidate_logger is not None:
@@ -658,10 +657,9 @@ class SALTRunner:
                                         reject_reason=None,
                                         frame_h=_fh_l,
                                         frame_w=_fw_l,
-                                        dist_from_last=((winner.x+winner.w/2-(self._last_good_bbox.x+self._last_good_bbox.w/2))**2+
-                                                        (winner.y+winner.h/2-(self._last_good_bbox.y+self._last_good_bbox.h/2))**2)**0.5
-                                                       /max((_fh_l**2+_fw_l**2)**0.5,1.0)
-                                                       if self._last_good_bbox else 0.0,
+                                        dist_from_last=((winner.x+winner.w/2-(track_state.bbox.x+track_state.bbox.w/2))**2+
+                                                        (winner.y+winner.h/2-(track_state.bbox.y+track_state.bbox.h/2))**2)**0.5
+                                                       /max((_fh_l**2+_fw_l**2)**0.5,1.0),
                                     )
                                 self.tracker.init(frame, winner)
                                 track_state = TrackState(
@@ -793,10 +791,9 @@ class SALTRunner:
                             reject_reason=None,
                             frame_h=_fh,
                             frame_w=_fw,
-                            dist_from_last=((candidate_bbox[0]+candidate_bbox[2]/2-(self._last_good_bbox.x+self._last_good_bbox.w/2))**2+
-                                            (candidate_bbox[1]+candidate_bbox[3]/2-(self._last_good_bbox.y+self._last_good_bbox.h/2))**2)**0.5
-                                           /max((_fh**2+_fw**2)**0.5,1.0)
-                                           if self._last_good_bbox else 0.0,
+                            dist_from_last=((candidate_bbox[0]+candidate_bbox[2]/2-(track_state.bbox.x+track_state.bbox.w/2))**2+
+                                            (candidate_bbox[1]+candidate_bbox[3]/2-(track_state.bbox.y+track_state.bbox.h/2))**2)**0.5
+                                           /max((_fh**2+_fw**2)**0.5,1.0),
                         )
                 except Exception as e:
                     _logger.debug("Score-map fallback reinit failed: %s", e)
@@ -831,6 +828,9 @@ class SALTRunner:
                         reject_reason=_reject_reason,
                         frame_h=_fh,
                         frame_w=_fw,
+                        dist_from_last=((candidate_bbox[0]+candidate_bbox[2]/2-(track_state.bbox.x+track_state.bbox.w/2))**2+
+                                        (candidate_bbox[1]+candidate_bbox[3]/2-(track_state.bbox.y+track_state.bbox.h/2))**2)**0.5
+                                       /max((_fh**2+_fw**2)**0.5,1.0),
                     )
 
         self._trajectory.append(track_state.bbox)
@@ -1119,7 +1119,7 @@ class SALTRunner:
         if self.evidence_extractor is not None:
             self.evidence_extractor.reset()
         if self.candidate_logger is not None:
-            self.candidate_logger.reset()
+            self.candidate_logger.reset(seq_id=self.candidate_logger._current_seq_id)
         # Reset tracker template counters and advisor rolling buffers so they
         # do not leak between sequences.  tracker.reset() calls advisor.reset()
         # internally, so this is the single authoritative reset point.
