@@ -4,13 +4,17 @@ Post-hoc calibration of the policy model's output heads using temperature
 scaling on the validation split.  Optimises Expected Calibration Error (ECE)
 via grid + ternary search (no scipy dependency).
 
+Per-dataset calibration: use ``--dataset`` to scope the val split to a single
+benchmark dataset (uav123, dtb70, or visdrone_sot).  This exposes per-dataset
+miscalibration that a pooled val split would hide.
+
 Usage::
 
     python -m salt_r.calibrate_policy \\
         --checkpoint saltr/checkpoints/policy_reinit_v1/saltrd_policy_best.pt \\
-        --oracle saltr/results/reinit_oracle_dataset.npz \\
+        --dataset uav123 \\
         --split val \\
-        --output saltr/results/calibration_val_policy_reinit_v1.json
+        --output saltr/results/calibration_val_uav123.json
 """
 
 from __future__ import annotations
@@ -51,6 +55,12 @@ from salt_r.train_policy import (  # noqa: E402
     _REINIT_CLASS_IDX,
     _REJECT_REINIT_CLASS_IDX,
 )
+
+# ---------------------------------------------------------------------------
+# Dataset constants
+# ---------------------------------------------------------------------------
+
+_VALID_DATASETS = ("uav123", "dtb70", "visdrone_sot")
 
 # ---------------------------------------------------------------------------
 # ECE helper
@@ -263,6 +273,72 @@ def _run_inference(
 
 
 # ---------------------------------------------------------------------------
+# Dataset loading with per-dataset filtering
+# ---------------------------------------------------------------------------
+
+def _load_dataset_filtered(
+    oracle_path: str,
+    split: str,
+    dataset: str,
+    window_size: int,
+) -> OracleReinitDataset:
+    """Return an OracleReinitDataset restricted to ``splits/{dataset}/{split}``.
+
+    The oracle NPZ stores ``splits`` (M,) and ``datasets`` (M,) as parallel
+    arrays.  This helper writes a temporary NPZ that contains only rows where
+    both conditions hold, then constructs an OracleReinitDataset from it.
+    The temporary file is written to a NamedTemporaryFile and cleaned up after
+    the dataset is fully initialised (all numpy data is copied in __init__).
+    """
+    import tempfile
+    import os
+
+    data = np.load(oracle_path, allow_pickle=True)
+
+    # Build row mask: split == split AND dataset == dataset
+    splits_all: np.ndarray = data["splits"]
+    if "datasets" in data:
+        datasets_all: np.ndarray = data["datasets"]
+        mask = np.array(
+            [str(s) == split and str(d) == dataset
+             for s, d in zip(splits_all, datasets_all)]
+        )
+    else:
+        # Fallback: NPZ has no 'datasets' column — filter by split only and warn
+        import warnings
+        warnings.warn(
+            f"Oracle NPZ has no 'datasets' array; cannot filter to dataset={dataset!r}. "
+            "Falling back to full split.",
+            stacklevel=3,
+        )
+        mask = np.array([str(s) == split for s in splits_all])
+
+    # Slice all arrays to the filtered subset; override 'splits' so
+    # OracleReinitDataset's assert passes (it checks split in {"train","val","diagnostic"})
+    sliced: Dict[str, Any] = {}
+    for key in data.files:
+        arr = data[key]
+        if arr.shape and arr.shape[0] == len(splits_all):
+            sliced[key] = arr[mask]
+        else:
+            sliced[key] = arr
+    # All kept rows have the right split tag already; nothing to override.
+
+    # Write to a temp NPZ, load as OracleReinitDataset, then delete.
+    tmp_fd, tmp_path = tempfile.mkstemp(suffix=".npz")
+    os.close(tmp_fd)
+    try:
+        np.savez_compressed(tmp_path, **sliced)
+        ds = OracleReinitDataset(tmp_path, split=split, window_size=window_size)
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+    return ds
+
+
+# ---------------------------------------------------------------------------
 # Calibration entry point
 # ---------------------------------------------------------------------------
 
@@ -270,29 +346,58 @@ def calibrate(
     checkpoint_path: str,
     oracle_path: str,
     split: str = "val",
+    dataset: Optional[str] = None,
     output_path: Optional[str] = None,
     window_size: Optional[int] = None,
     batch_size: int = 256,
     device: str = "cpu",
     seed: int = 42,
 ) -> Dict[str, Any]:
-    """Run temperature calibration and return results dict."""
+    """Run temperature calibration and return results dict.
+
+    Parameters
+    ----------
+    dataset:
+        When set, restrict the val split to this benchmark dataset only
+        (one of ``uav123``, ``dtb70``, ``visdrone_sot``).  Reads
+        ``splits/{dataset}/val`` semantics by filtering both the ``splits``
+        and ``datasets`` parallel arrays in the oracle NPZ.  If ``None``,
+        calibrates on the pooled val split (legacy behaviour).
+    """
     import random
     random.seed(seed)
     np.random.seed(seed)
     t_start = time.time()
 
-    print(f"[calibrate_policy] checkpoint={checkpoint_path}  split={split}", flush=True)
+    dataset_label = dataset if dataset is not None else "all"
+    print(
+        f"[calibrate_policy] checkpoint={checkpoint_path}  split={split}  dataset={dataset_label}",
+        flush=True,
+    )
 
     # Load model
     model, ckpt_meta = _load_policy_model(checkpoint_path, device=device)
     ckpt_window_size = window_size or int(ckpt_meta.get("window_size", 20))
     feature_schema = str(ckpt_meta.get("feature_schema", FEATURE_SCHEMA))
 
-    # Load dataset
-    ds = OracleReinitDataset(oracle_path, split=split, window_size=ckpt_window_size)
+    # Load dataset — optionally filter to a single benchmark dataset
+    if dataset is not None:
+        if dataset not in _VALID_DATASETS:
+            raise ValueError(
+                f"Unknown dataset {dataset!r}. Valid choices: {_VALID_DATASETS}"
+            )
+        ds = _load_dataset_filtered(
+            oracle_path,
+            split=split,
+            dataset=dataset,
+            window_size=ckpt_window_size,
+        )
+    else:
+        ds = OracleReinitDataset(oracle_path, split=split, window_size=ckpt_window_size)
     if len(ds) == 0:
-        raise RuntimeError(f"Split '{split}' is empty in {oracle_path}")
+        raise RuntimeError(
+            f"Split '{split}' (dataset={dataset_label}) is empty in {oracle_path}"
+        )
 
     loader = torch.utils.data.DataLoader(
         ds, batch_size=batch_size, shuffle=False, num_workers=0
@@ -375,6 +480,7 @@ def calibrate(
         "oracle": str(oracle_path),
         "feature_schema": feature_schema,
         "split": split,
+        "dataset": dataset_label,
         "n_samples": int(len(ds)),
         "heads": {
             "recovery_action": {
@@ -420,9 +526,17 @@ def calibrate(
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    """CLI entry point for SALT-RD policy model calibration."""
+    """CLI entry point for SALT-RD policy model calibration.
+
+    Use ``--dataset`` to scope calibration to a single benchmark dataset's val
+    split (uav123, dtb70, or visdrone_sot).  This reveals per-dataset
+    miscalibration that a pooled val split would obscure.
+    """
     parser = argparse.ArgumentParser(
-        description="Temperature-scale SALTRDPolicyNet heads on the val split."
+        description=(
+            "Temperature-scale SALTRDPolicyNet heads on the val split. "
+            "Use --dataset to restrict to a single benchmark dataset."
+        )
     )
     parser.add_argument(
         "--checkpoint",
@@ -430,9 +544,22 @@ def main() -> None:
         help="Path to saltrd_policy_best.pt checkpoint.",
     )
     parser.add_argument(
-        "--oracle",
-        required=True,
-        help="Path to reinit_oracle_dataset.npz.",
+        "--dataset",
+        default="uav123",
+        choices=list(_VALID_DATASETS),
+        help=(
+            "Benchmark dataset to calibrate on (default: uav123). "
+            "Filters val sequences to splits/{dataset}/val in the oracle NPZ."
+        ),
+    )
+    parser.add_argument(
+        "--oracle-npz",
+        default=None,
+        dest="oracle_npz",
+        help=(
+            "Path to oracle NPZ (default: saltr/results/reinit_oracle_{dataset}.npz). "
+            "Resolved relative to the project root."
+        ),
     )
     parser.add_argument(
         "--split",
@@ -443,7 +570,10 @@ def main() -> None:
     parser.add_argument(
         "--output",
         default=None,
-        help="Output JSON path.",
+        help=(
+            "Output JSON path "
+            "(default: saltr/results/calibration_val_{dataset}.json)."
+        ),
     )
     parser.add_argument(
         "--device", default="cpu", help="Torch device (default: cpu)."
@@ -454,11 +584,20 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
+    # Resolve defaults that depend on --dataset
+    oracle_path: str = args.oracle_npz or str(
+        _project_root() / f"saltr/results/reinit_oracle_{args.dataset}.npz"
+    )
+    output_path: str = args.output or str(
+        _project_root() / f"saltr/results/calibration_val_{args.dataset}.json"
+    )
+
     calibrate(
         checkpoint_path=args.checkpoint,
-        oracle_path=args.oracle,
+        oracle_path=oracle_path,
         split=args.split,
-        output_path=args.output,
+        dataset=args.dataset,
+        output_path=output_path,
         batch_size=args.batch_size,
         device=args.device,
         seed=args.seed,
