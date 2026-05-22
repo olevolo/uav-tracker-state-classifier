@@ -226,11 +226,19 @@ def run(
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--config", default="configs/prod/salt.yaml")
-    ap.add_argument("--oracle-npz", default="saltr/data/salt_rd_v2_labels.npz")
+    ap.add_argument("--config", default=None,
+                    help="SALTRunner config YAML. Defaults to configs/prod/saltrd_<dataset>.yaml.")
+    ap.add_argument(
+        "--oracle-npz", default=None,
+        help="Per-dataset oracle NPZ. Defaults to saltr/results/reinit_oracle_<dataset>.npz. "
+             "Fall back to saltr/results/reinit_oracle_dataset.npz if per-dataset file absent."
+    )
     ap.add_argument("--dataset", default="uav123", choices=["uav123", "dtb70", "visdrone_sot"])
     ap.add_argument("--split", default="diagnostic")
-    ap.add_argument("--output", default="saltr/data/candidate_events_labeled.npz")
+    ap.add_argument(
+        "--output", default=None,
+        help="Output NPZ path. Defaults to saltr/data/candidate_events_v5_<dataset>.npz."
+    )
     ap.add_argument("--max-seqs", type=int, default=0, help="0 = all sequences")
     ap.add_argument(
         "--sequences", nargs="+", default=None,
@@ -242,12 +250,32 @@ def main() -> None:
     )
     args = ap.parse_args()
 
+    # Auto-resolve per-dataset oracle path
+    oracle_npz = args.oracle_npz
+    if oracle_npz is None:
+        per_ds = Path(f"saltr/results/reinit_oracle_{args.dataset}.npz")
+        combined = Path("saltr/results/reinit_oracle_dataset.npz")
+        oracle_npz = str(per_ds) if per_ds.exists() else str(combined)
+        print(f"[build_candidate_dataset] oracle: {oracle_npz}", flush=True)
+
+    # Auto-resolve config path
+    config = args.config
+    if config is None:
+        config = f"configs/prod/saltrd_{args.dataset}.yaml"
+        print(f"[build_candidate_dataset] config: {config}", flush=True)
+
+    # Auto-resolve output path
+    output = args.output
+    if output is None:
+        output = f"saltr/data/candidate_events_v5_{args.dataset}.npz"
+        print(f"[build_candidate_dataset] output: {output}", flush=True)
+
     stats = run(
-        config_path=args.config,
-        oracle_npz_path=args.oracle_npz,
+        config_path=config,
+        oracle_npz_path=oracle_npz,
         dataset=args.dataset,
         split=args.split,
-        output_path=args.output,
+        output_path=output,
         max_seqs=args.max_seqs,
         sequences=args.sequences,
         max_frames=args.max_frames,
