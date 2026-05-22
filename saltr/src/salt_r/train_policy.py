@@ -33,7 +33,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch import Tensor
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 
 
 # ---------------------------------------------------------------------------
@@ -230,6 +230,14 @@ class OracleReinitDataset(Dataset):
             torch.tensor(target, dtype=torch.long),
         )
 
+    @property
+    def labels(self) -> np.ndarray:
+        """Flat array of integer class labels, one per sample (in index order)."""
+        result = np.empty(len(self._index), dtype=np.int64)
+        for i, (seq_idx, t) in enumerate(self._index):
+            result[i] = self._sequences[seq_idx][1][t]
+        return result
+
     def compute_class_distribution(self) -> Dict[str, int]:
         """Count frames per recovery action class."""
         counts = {0: 0, 1: 0, 2: 0, 3: 0}
@@ -365,11 +373,33 @@ def _validate(
     reinit_recall = _recall_for_class(labels_np, pred_classes, _REINIT_CLASS_IDX)
     reject_precision = _precision_for_class(labels_np, pred_classes, _REJECT_REINIT_CLASS_IDX)
 
+    # REINIT AUPRC: binary classification REINIT vs rest (pure numpy, no sklearn)
+    reinit_labels = (labels_np == _REINIT_CLASS_IDX).astype(int)
+    # softmax logits → REINIT prob
+    logits_shifted = logits_np - logits_np.max(axis=1, keepdims=True)
+    exp_logits = np.exp(logits_shifted)
+    reinit_scores = exp_logits[:, _REINIT_CLASS_IDX] / exp_logits.sum(axis=1)
+    if reinit_labels.sum() > 0:
+        # Sort by descending score to build PR curve
+        sort_idx = np.argsort(-reinit_scores)
+        sorted_labels = reinit_labels[sort_idx]
+        tp_cumsum = np.cumsum(sorted_labels)
+        n_pos = reinit_labels.sum()
+        precision_curve = tp_cumsum / np.arange(1, len(sorted_labels) + 1)
+        recall_curve = tp_cumsum / n_pos
+        # Prepend (recall=0, precision=1) sentinel
+        precision_curve = np.concatenate([[1.0], precision_curve])
+        recall_curve = np.concatenate([[0.0], recall_curve])
+        reinit_auprc = float(np.trapz(precision_curve, recall_curve))
+    else:
+        reinit_auprc = 0.0
+
     return {
         "val_loss": avg_loss,
         "macro_f1": macro_f1,
         "reinit_recall": float(reinit_recall) if not np.isnan(reinit_recall) else 0.0,
         "reject_precision": float(reject_precision) if not np.isnan(reject_precision) else 0.0,
+        "reinit_auprc": float(reinit_auprc),
     }
 
 
@@ -387,7 +417,7 @@ def train(
     device: str = "auto",
     lambda_recovery: float = 1.0,
     lambda_candidate: float = 0.5,
-    patience: int = 10,
+    patience: int = 15,
     seed: int = 42,
     hidden_size: int = 64,
     n_layers: int = 2,
@@ -421,10 +451,22 @@ def train(
     if len(train_ds) == 0:
         raise RuntimeError("Training split is empty — check the NPZ file.")
 
+    # Event-balanced sampler: oversample REINIT 10× to ensure ~20-30% per batch
+    sample_weights = np.where(
+        train_ds.labels == _REINIT_CLASS_IDX,   # _REINIT_CLASS_IDX = 2
+        10.0,   # oversample REINIT 10×
+        1.0     # baseline weight for others
+    )
+    sampler = WeightedRandomSampler(
+        weights=torch.tensor(sample_weights, dtype=torch.float32),
+        num_samples=len(train_ds),
+        replacement=True,
+    )
+
     train_loader = DataLoader(
         train_ds,
         batch_size=batch_size,
-        shuffle=True,
+        sampler=sampler,
         num_workers=0,
         pin_memory=(dev.type == "cuda"),
         drop_last=len(train_ds) > batch_size,
@@ -462,7 +504,7 @@ def train(
     w_reject   = n_reinit / n_reject        # ≈ 0.023 (down-weight majority)
     w_none     = 1.0
     w_sc       = 0.0
-    w_reinit   = min(n_reject / n_reinit, 50.0)  # inverse freq, capped at 50
+    w_reinit   = min(n_reject / n_reinit, 8.0)  # cap at 8× to prevent over-prediction
     weights_list = [w_none, w_sc, w_reinit, w_reject]
     class_weights = torch.tensor(weights_list, dtype=torch.float32, device=dev)
     print(
@@ -489,7 +531,7 @@ def train(
     # ------------------------------------------------------------------
     # Training loop
     # ------------------------------------------------------------------
-    best_macro_f1 = -1.0
+    best_reinit_auprc = -1.0
     patience_counter = 0
     best_epoch = 0
     best_val_metrics: Dict[str, float] = {}
@@ -497,10 +539,10 @@ def train(
 
     print(
         f"\n{'Epoch':>5} | {'TrainLoss':>9} | {'ValLoss':>8} | "
-        f"{'ReinitRecall':>12} | {'RejectPrec':>10} | {'MacroF1':>7}",
+        f"{'ReinitRecall':>12} | {'RejectPrec':>10} | {'MacroF1':>7} | {'ReinitAUPRC':>11}",
         flush=True,
     )
-    print("-" * 65, flush=True)
+    print("-" * 80, flush=True)
 
     for epoch in range(1, epochs + 1):
         # Train
@@ -541,10 +583,11 @@ def train(
         macro_f1 = val_metrics.get("macro_f1", float("nan"))
         reinit_recall = val_metrics.get("reinit_recall", float("nan"))
         reject_prec = val_metrics.get("reject_precision", float("nan"))
+        reinit_auprc = val_metrics.get("reinit_auprc", float("nan"))
 
         print(
             f"{epoch:>5} | {avg_train_loss:>9.4f} | {val_loss:>8.4f} | "
-            f"{reinit_recall:>12.4f} | {reject_prec:>10.4f} | {macro_f1:>7.4f}",
+            f"{reinit_recall:>12.4f} | {reject_prec:>10.4f} | {macro_f1:>7.4f} | {reinit_auprc:>11.4f}",
             flush=True,
         )
 
@@ -555,12 +598,13 @@ def train(
             "macro_f1": float(macro_f1),
             "reinit_recall": float(reinit_recall),
             "reject_precision": float(reject_prec),
+            "reinit_auprc": float(reinit_auprc),
         })
 
-        # Early stopping on val recovery action macro-F1
-        metric_val = macro_f1 if not np.isnan(macro_f1) else (-val_loss)
-        if metric_val > best_macro_f1:
-            best_macro_f1 = metric_val
+        # Early stopping on val REINIT AUPRC
+        metric_val = reinit_auprc if not np.isnan(reinit_auprc) else (-val_loss)
+        if metric_val > best_reinit_auprc:
+            best_reinit_auprc = metric_val
             patience_counter = 0
             best_epoch = epoch
             best_val_metrics = dict(val_metrics)
@@ -569,6 +613,7 @@ def train(
                 {
                     "model_state_dict": model.state_dict(),
                     "epoch": epoch,
+                    "val_reinit_auprc": float(reinit_auprc),
                     "val_macro_f1": float(macro_f1),
                     "val_metrics": {k: float(v) for k, v in val_metrics.items()},
                     "window_size": window_size,
@@ -591,13 +636,13 @@ def train(
             if patience_counter >= patience:
                 print(
                     f"[train_policy] Early stopping at epoch {epoch} "
-                    f"(patience={patience}, best_macro_f1={best_macro_f1:.4f})",
+                    f"(patience={patience}, best_reinit_auprc={best_reinit_auprc:.4f})",
                     flush=True,
                 )
                 break
 
     print(f"\n[train_policy] Best checkpoint: {ckpt_path}  (epoch={best_epoch})", flush=True)
-    print(f"[train_policy] Best val macro-F1: {best_macro_f1:.4f}", flush=True)
+    print(f"[train_policy] Best val REINIT AUPRC: {best_reinit_auprc:.4f}", flush=True)
 
     # ------------------------------------------------------------------
     # Save training summary
@@ -613,7 +658,7 @@ def train(
         "output_dir": str(output_dir),
         "checkpoint": str(ckpt_path),
         "best_epoch": best_epoch,
-        "best_val_macro_f1": float(best_macro_f1),
+        "best_val_reinit_auprc": float(best_reinit_auprc),
         "best_val_metrics": {k: float(v) for k, v in best_val_metrics.items()},
         "train_class_distribution": dist,
         "hyperparameters": {
@@ -679,7 +724,7 @@ def main() -> None:
         default=0.5,
         help="Weight for candidate score loss term.",
     )
-    parser.add_argument("--patience", type=int, default=10, help="Early stopping patience.")
+    parser.add_argument("--patience", type=int, default=15, help="Early stopping patience.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
     parser.add_argument("--hidden-size", type=int, default=64, help="GRU hidden size.")
     parser.add_argument("--n-layers", type=int, default=2, help="GRU layers.")

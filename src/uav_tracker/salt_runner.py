@@ -128,6 +128,8 @@ class SALTRunner:
     _recovery_votes: list = field(default_factory=list, init=False, repr=False)
     _RECOVERY_VOTE_FRAMES: int = field(default=2, init=False, repr=False)
     _RECOVERY_VOTE_THRESHOLD: int = field(default=2, init=False, repr=False)
+    # Cooldown applied after a successful score-map fallback reinit
+    _RECOVERY_COOLDOWN: int = field(default=30, init=False, repr=False)
     # Guard 3: reference appearance embedding from frame 0 for cosine similarity check
     # at recovery time. Set at init, updated slowly during confirmed tracking via EMA.
     _ref_embedding: Optional[np.ndarray] = field(default=None, init=False, repr=False)
@@ -451,6 +453,7 @@ class SALTRunner:
             self._consecutive_recovery_frames >= self._RECOVERY_MIN_FRAMES
         )
         _past_warmup = (self._frame_idx >= self._RECOVERY_WARMUP_FRAMES)
+        _reinit_executed = False  # set to True if any recovery path reinits the tracker
         if (_genuine_recovery_request
                 and _past_warmup
                 and self.detector is not None
@@ -640,6 +643,44 @@ class SALTRunner:
             except Exception as exc:
                 _logger.debug("SALT recovery failed: %s", exc)
                 self._lost_cooldown = 10
+
+        # ---- Score-map fallback recovery — works even without detector ----
+        # Fires when the YOLO detector path did not execute (no detector, or
+        # detector found no usable candidates) and the controller has already
+        # selected a score-map candidate to reinit to.
+        if (_genuine_recovery_request
+                and _past_warmup
+                and self._lost_cooldown == 0
+                and not _reinit_executed
+                and decision.selected_candidate is not None):
+            candidate_bbox = decision.selected_candidate.bbox  # (x, y, w, h)
+            _fh, _fw = frame.shape[:2]
+            cx, cy = candidate_bbox[0] + candidate_bbox[2] / 2, candidate_bbox[1] + candidate_bbox[3] / 2
+            if (candidate_bbox[2] > 0 and candidate_bbox[3] > 0
+                    and 0 <= cx <= _fw and 0 <= cy <= _fh):
+                try:
+                    bbox_obj = BBox(x=candidate_bbox[0], y=candidate_bbox[1],
+                                   w=candidate_bbox[2], h=candidate_bbox[3])
+                    self.tracker.init(frame, bbox_obj)
+                    track_state = TrackState(bbox=bbox_obj, confidence=1.0, status="locked")
+                    if self.motion_predictor:
+                        self.motion_predictor.reset()
+                    self._lost_cooldown = self._RECOVERY_COOLDOWN
+                    self._consecutive_recovery_frames = 0
+                    _saltrd_changed_bbox = True
+                    _reinit_executed = True
+                    if self.evidence_extractor is not None:
+                        self.evidence_extractor.notify_reinit()
+                    _logger.warning(
+                        "SALT recovery (score-map fallback): frame=%d  "
+                        "bbox=(%.0f,%.0f %.0fx%.0f)  score=%.3f",
+                        self._frame_idx,
+                        candidate_bbox[0], candidate_bbox[1],
+                        candidate_bbox[2], candidate_bbox[3],
+                        getattr(decision.selected_candidate, 'score', 0.0),
+                    )
+                except Exception as e:
+                    _logger.debug("Score-map fallback reinit failed: %s", e)
 
         self._trajectory.append(track_state.bbox)
         if len(self._trajectory) > 200:
