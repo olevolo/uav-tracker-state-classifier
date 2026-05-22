@@ -558,6 +558,7 @@ def train(
     # BUG-26(c): optional candidate scorer training
     candidate_events_path: str | None = None,
     dataset: str | None = None,
+    reinit_oversample: int = 10,
 ) -> None:
     """Train SALTRDPolicyNet on a single-dataset oracle reinit NPZ.
 
@@ -610,11 +611,14 @@ def train(
     if len(train_ds) == 0:
         raise RuntimeError("Training split is empty — check the NPZ file.")
 
-    # Event-balanced sampler: oversample REINIT 10× to ensure ~20-30% per batch
+    # Event-balanced sampler: oversample REINIT to ensure ~20-30% per batch
+    # Default 10× for combined/uav123; reduce for datasets with extreme REJECT_REINIT
+    # dominance (dtb70: 91%, visdrone_sot: 98%) to avoid double-boost collapse.
+    reinit_oversample_factor = float(reinit_oversample)
     sample_weights = np.where(
-        train_ds.labels == _REINIT_CLASS_IDX,   # _REINIT_CLASS_IDX = 2
-        10.0,   # oversample REINIT 10×
-        1.0     # baseline weight for others
+        train_ds.labels == _REINIT_CLASS_IDX,
+        reinit_oversample_factor,
+        1.0,
     )
     sampler = WeightedRandomSampler(
         weights=torch.tensor(sample_weights, dtype=torch.float32),
@@ -664,24 +668,38 @@ def train(
     print(f"[train_policy] SALTRDPolicyNet  params={total_params:,}", flush=True)
 
     # ------------------------------------------------------------------
-    # Loss weights — inverse frequency, REINIT boosted to aid recall
+    # Loss weights — inverse frequency on the EFFECTIVE (post-oversample)
+    # distribution to avoid double-boost collapse.
+    #
+    # Bug in prior approach: raw-count inverse weights × sampler oversample
+    # multiplicatively over-boosted REINIT (up to 80×), causing the model to
+    # predict REINIT everywhere (recall=1, reject_prec=0 on dtb70/visdrone_sot).
+    # Fix: compute weights on the effective batch distribution after oversampling.
     # ------------------------------------------------------------------
     dist = train_ds.compute_class_distribution()
-    # Class order: NONE=0, SCORE_CANDIDATES=1, REINIT=2, REJECT_REINIT=3
     class_names = ["NONE", "SCORE_CANDIDATES", "REINIT", "REJECT_REINIT"]
     n_reinit   = max(dist.get("REINIT", 1), 1)
     n_reject   = max(dist.get("REJECT_REINIT", 1), 1)
     n_none     = max(dist.get("NONE", 1), 1)
-    # SCORE_CANDIDATES has 0 training examples — set weight to 0 to ignore
-    w_reject   = n_reinit / n_reject        # ≈ 0.023 (down-weight majority)
-    w_none     = 1.0
-    w_sc       = 0.0
-    w_reinit   = min(n_reject / n_reinit, 8.0)  # cap at 8× to prevent over-prediction
+    # Effective counts after the sampler oversample
+    n_reinit_eff = n_reinit * reinit_oversample_factor
+    n_total_eff  = n_reinit_eff + n_reject + n_none
+    # Inverse-frequency weights on effective distribution; SCORE_CANDIDATES ignored
+    w_reinit_raw = n_total_eff / n_reinit_eff
+    w_reject_raw = n_total_eff / n_reject
+    w_none_raw   = n_total_eff / n_none
+    # Normalise so the minimum weight is 1.0
+    min_w    = min(w_reinit_raw, w_reject_raw, w_none_raw)
+    w_reinit = w_reinit_raw / min_w
+    w_reject = w_reject_raw / min_w
+    w_none   = w_none_raw   / min_w
+    w_sc     = 0.0  # SCORE_CANDIDATES has 0 training examples — ignore
     weights_list = [w_none, w_sc, w_reinit, w_reject]
     class_weights = torch.tensor(weights_list, dtype=torch.float32, device=dev)
     print(
-        f"[train_policy] class weights  NONE={w_none:.2f}  SC={w_sc:.2f}"
-        f"  REINIT={w_reinit:.2f}  REJECT={w_reject:.4f}",
+        f"[train_policy] class weights (effective-dist)  NONE={w_none:.2f}  SC={w_sc:.2f}"
+        f"  REINIT={w_reinit:.2f}  REJECT={w_reject:.2f}"
+        f"  (oversample={reinit_oversample_factor:.0f}×)",
         flush=True,
     )
 
@@ -877,6 +895,7 @@ def train(
             "lambda_recovery": lambda_recovery,
             "lambda_candidate": lambda_candidate,
             "patience": patience,
+            "reinit_oversample": reinit_oversample,
         },
         "epoch_history": epoch_history,
         "git_commit": git_commit,
@@ -968,6 +987,15 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
     parser.add_argument("--hidden-size", type=int, default=64, help="GRU hidden size.")
     parser.add_argument("--n-layers", type=int, default=2, help="GRU layers.")
+    parser.add_argument(
+        "--reinit-oversample", type=int, default=10,
+        help=(
+            "REINIT class oversample factor in WeightedRandomSampler (default 10). "
+            "Class weights are computed on the effective post-oversample distribution "
+            "to avoid double-boost collapse. Reduce to 2-4 for datasets with extreme "
+            "REJECT_REINIT dominance (dtb70: 92%%, visdrone_sot: 98%%)."
+        ),
+    )
     args = parser.parse_args()
 
     # ------------------------------------------------------------------
@@ -1000,6 +1028,7 @@ def main() -> None:
         hidden_size=args.hidden_size,
         n_layers=args.n_layers,
         dataset=args.dataset,
+        reinit_oversample=args.reinit_oversample,
     )
 
 
