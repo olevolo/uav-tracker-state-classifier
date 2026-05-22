@@ -393,6 +393,7 @@ class SALTRunner:
                     bbox=bbox_tuple,
                     score_map_stats=score_map_stats,
                     candidates=candidates_raw,
+                    image_shape=frame.shape[:2],
                 )
                 decision = self.saltrd_controller.step(evidence_frame)
             except Exception as exc:
@@ -416,6 +417,9 @@ class SALTRunner:
         _template_updated: bool = False
         _reinit_vetoed: bool = False
         _saltrd_changed_bbox: bool = False
+        # BUG-18 fix: track whether YOLO ran but produced no reinit, so the
+        # score-map fallback is not blocked by cooldown set after a failed YOLO attempt.
+        _yolo_attempted: bool = False
 
         # ---- Guard 1: remember last good bbox for size-consistency filtering ----
         if track_state.confidence >= 0.14:
@@ -466,6 +470,7 @@ class SALTRunner:
                 and self.detector is not None
                 and self._lost_cooldown == 0):
             try:
+                _yolo_attempted = True
                 _frozen_hint = getattr(self.tracker, '_state', None) or prev_bbox
                 _logger.warning(
                     "SALT recovery: frame=%d hint=(%s) consecutive_recovery=%d",
@@ -659,7 +664,7 @@ class SALTRunner:
         # to prevent false reinits on sequences where tracking is still working.
         if (_genuine_recovery_request
                 and _past_warmup
-                and self._lost_cooldown == 0
+                and (self._lost_cooldown == 0 or _yolo_attempted)
                 and not _reinit_executed
                 and decision.selected_candidate is not None
                 and self._frames_since_good_bbox >= self._FALLBACK_MIN_FAILURE_FRAMES):
