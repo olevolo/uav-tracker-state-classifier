@@ -6,6 +6,15 @@ e-process alert escalation, and memory margin gating.
 Based on v2-aware policy (uses ifd10/20 heads, not just ifd5).
 Also incorporates SAMURAI-inspired KF residual idea as a cheap
 spatial discontinuity feature.
+
+Per-dataset sweep purpose
+--------------------------
+Each dataset (uav123, dtb70, visdrone_sot) has distinct tracking difficulty,
+scene density, and failure modes.  A single global threshold derived from a
+pooled val set is too coarse: uav123 hard scenes (occlusion-heavy) require
+different fc/reinit thresholds than dtb70 (aggressive motion) or visdrone_sot
+(small targets).  Use ``--dataset`` to scope the sweep to one dataset's val
+split, producing ``saltr/results/policy_sweep_{dataset}.json`` per dataset.
 """
 from __future__ import annotations
 import argparse
@@ -305,14 +314,80 @@ def simulate_policy_step(
 # Full sweep over policy configs
 # ---------------------------------------------------------------------------
 
+_VALID_DATASETS: tuple = ("uav123", "dtb70", "visdrone_sot")
+
+
+def _load_val_sequence_keys(
+    oracle_npz_path: str,
+    dataset: str | None = None,
+) -> set[str] | None:
+    """Return the set of val-split sequence keys from the oracle NPZ.
+
+    Applies the same dataset-prefix filtering logic as ``OracleReinitDataset``
+    in ``train_policy.py``:
+
+    - If ``dataset`` is provided and any ``sequence_keys`` starts with
+      ``"{dataset}/"``, only those rows are retained (combined-oracle format).
+    - If no prefixed keys are found the NPZ is already per-dataset; no
+      filtering is applied.
+    - Returns ``None`` when the oracle NPZ does not exist (sweep will use
+      all sequences from preds/labels as before).
+
+    Parameters
+    ----------
+    oracle_npz_path:
+        Path to the per-dataset (or combined) oracle reinit NPZ.
+    dataset:
+        One of ``uav123``, ``dtb70``, ``visdrone_sot``, or ``None`` to skip
+        prefix filtering.
+    """
+    p = Path(oracle_npz_path)
+    if not p.exists():
+        return None
+
+    data = np.load(oracle_npz_path, allow_pickle=True)
+    if "sequence_keys" not in data.files or "splits" not in data.files:
+        return None
+
+    seq_keys_all: np.ndarray = data["sequence_keys"]
+    splits_all: np.ndarray = data["splits"]
+
+    # Apply dataset-prefix filter (same logic as OracleReinitDataset)
+    if dataset is not None:
+        prefix = f"{dataset}/"
+        dataset_mask = np.array(
+            [str(k).startswith(prefix) for k in seq_keys_all]
+        )
+        if dataset_mask.any():
+            # Combined-oracle format: filter to matching rows only
+            seq_keys_all = seq_keys_all[dataset_mask]
+            splits_all = splits_all[dataset_mask]
+        # else: per-dataset NPZ — no prefix in keys, already scoped; skip filter
+
+    # Collect val-split sequence keys
+    val_keys: set[str] = set()
+    for k, s in zip(seq_keys_all, splits_all):
+        if str(s) == "val":
+            val_keys.add(str(k))
+
+    return val_keys if val_keys else None
+
+
 def run_policy_sweep(
     preds_json_path: str,
     labels_npz_path: str,
     eprocess_json_path: str | None = None,
     memory_sidecar_path: str | None = None,
     output_path: str = "saltr/results/policy_sweep_v2.json",
+    oracle_npz_path: str | None = None,
+    dataset: str | None = None,
 ) -> dict:
     """Run full threshold sweep over policy configs.
+
+    When ``dataset`` is provided, the sweep is scoped to sequences in that
+    dataset's val split.  The oracle NPZ (``oracle_npz_path``) is used to
+    look up which sequence keys belong to the val split for that dataset.
+    This produces per-dataset thresholds instead of a pooled global threshold.
 
     Metrics:
       template_corruption_rate: allowed updates when IoU < 0.5
@@ -322,6 +397,11 @@ def run_policy_sweep(
       failure_event_recall: events with alert before failure
       lead_time_median: median frames between first alert and failure
     """
+    if dataset is not None and dataset not in _VALID_DATASETS:
+        raise ValueError(
+            f"dataset must be one of {_VALID_DATASETS}, got {dataset!r}"
+        )
+
     # Load predictions
     with open(preds_json_path) as f:
         all_preds: dict[str, list[dict[str, float]]] = json.load(f)
@@ -339,6 +419,16 @@ def run_policy_sweep(
         if k.startswith("bbox_pred/"):
             seq = k[len("bbox_pred/"):]
             bbox_pred_data[seq] = data[k]
+
+    # Filter to the requested dataset's val split when --dataset is given.
+    # Uses oracle NPZ to identify which sequence keys belong to the val split
+    # for this dataset (same prefix-filtering logic as OracleReinitDataset).
+    if dataset is not None and oracle_npz_path is not None:
+        val_keys = _load_val_sequence_keys(oracle_npz_path, dataset)
+        if val_keys is not None:
+            all_preds = {k: v for k, v in all_preds.items() if k in val_keys}
+            iou_traces = {k: v for k, v in iou_traces.items() if k in val_keys}
+            bbox_pred_data = {k: v for k, v in bbox_pred_data.items() if k in val_keys}
 
     # Load e-process values if provided
     eprocess_data: dict[str, list[float]] = {}
@@ -571,8 +661,38 @@ def _evaluate_config(
 def _parse_args() -> "argparse.Namespace":
     import argparse
     p = argparse.ArgumentParser(
-        description="Phase 2E: Policy threshold sweep for SALT-RD interventions."
+        description=(
+            "Phase 2E: Policy threshold sweep for SALT-RD interventions. "
+            "Use --dataset to scope the sweep to a single dataset's val split, "
+            "producing per-dataset thresholds instead of a pooled global threshold."
+        )
     )
+    # -----------------------------------------------------------------
+    # Per-dataset arguments (new)
+    # -----------------------------------------------------------------
+    p.add_argument(
+        "--dataset",
+        choices=["uav123", "dtb70", "visdrone_sot"],
+        default="uav123",
+        help=(
+            "Dataset whose val split is used for the threshold sweep. "
+            "One of: uav123, dtb70, visdrone_sot. Default: uav123. "
+            "Controls the default oracle NPZ path and output file name."
+        ),
+    )
+    p.add_argument(
+        "--oracle-npz",
+        default=None,
+        dest="oracle_npz",
+        help=(
+            "Path to the per-dataset oracle reinit NPZ used to identify val-split "
+            "sequences for the given dataset. Defaults to "
+            "saltr/results/reinit_oracle_{dataset}.npz when not provided."
+        ),
+    )
+    # -----------------------------------------------------------------
+    # Existing arguments (preserved)
+    # -----------------------------------------------------------------
     p.add_argument("--preds", required=True,
                    help="Path to preds_val_*.json (calibrated model predictions)")
     p.add_argument("--labels", required=True,
@@ -583,25 +703,50 @@ def _parse_args() -> "argparse.Namespace":
     p.add_argument("--memory", default=None,
                    help="Optional path to salt_rd_memory_sidecar.npz (for memory_margin per sequence). "
                         "When omitted, memory contribution is zeroed out.")
-    p.add_argument("--output", default="saltr/results/policy_sweep_v2.json",
-                   help="Output path for sweep results JSON")
+    p.add_argument(
+        "--output",
+        default=None,
+        help=(
+            "Output path for sweep results JSON. Defaults to "
+            "saltr/results/policy_sweep_{dataset}.json when not provided."
+        ),
+    )
     return p.parse_args()
 
 
 def main() -> None:
     args = _parse_args()
-    print(f"[policy_sweep] Preds:    {args.preds}", flush=True)
-    print(f"[policy_sweep] Labels:   {args.labels}", flush=True)
-    print(f"[policy_sweep] E-process:{args.eprocess or '(none)'}", flush=True)
-    print(f"[policy_sweep] Memory:   {args.memory or '(none)'}", flush=True)
-    print(f"[policy_sweep] Output:   {args.output}", flush=True)
+
+    # Resolve oracle NPZ path: --oracle-npz > auto
+    oracle_npz = (
+        args.oracle_npz
+        if args.oracle_npz is not None
+        else f"saltr/results/reinit_oracle_{args.dataset}.npz"
+    )
+
+    # Resolve output path: --output > auto
+    output = (
+        args.output
+        if args.output is not None
+        else f"saltr/results/policy_sweep_{args.dataset}.json"
+    )
+
+    print(f"[policy_sweep] Dataset:   {args.dataset}", flush=True)
+    print(f"[policy_sweep] Oracle NPZ:{oracle_npz}", flush=True)
+    print(f"[policy_sweep] Preds:     {args.preds}", flush=True)
+    print(f"[policy_sweep] Labels:    {args.labels}", flush=True)
+    print(f"[policy_sweep] E-process: {args.eprocess or '(none)'}", flush=True)
+    print(f"[policy_sweep] Memory:    {args.memory or '(none)'}", flush=True)
+    print(f"[policy_sweep] Output:    {output}", flush=True)
 
     summary = run_policy_sweep(
         preds_json_path=args.preds,
         labels_npz_path=args.labels,
         eprocess_json_path=args.eprocess,
         memory_sidecar_path=args.memory,
-        output_path=args.output,
+        output_path=output,
+        oracle_npz_path=oracle_npz,
+        dataset=args.dataset,
     )
     n = summary.get("n_configs", 0)
     configs = summary.get("configs", [])
@@ -634,7 +779,7 @@ def main() -> None:
         print(f"  failure_event_recall:             {best['failure_event_recall']:.4f}", flush=True)
         print(f"  config: fc={best['fc_threshold']} reinit={best['reinit_threshold']} "
               f"ep_a={best['eprocess_alpha']} mem_t={best['mem_margin_threshold']}", flush=True)
-    print(f"[policy_sweep] Results written to {args.output}", flush=True)
+    print(f"[policy_sweep] Results written to {output}", flush=True)
 
 
 if __name__ == "__main__":

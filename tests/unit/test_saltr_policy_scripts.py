@@ -6,6 +6,9 @@ Tests:
 3. rollout_policy module is importable
 4. No TSA imports in any of the three modules
 5. All three modules have a main() function
+6. policy_sweep._parse_args exposes --dataset, --oracle-npz, --output flags
+7. policy_sweep._load_val_sequence_keys filters to dataset val split
+8. run_policy_sweep dataset kwarg filters preds and iou_traces
 """
 
 from __future__ import annotations
@@ -197,3 +200,129 @@ def test_candidate_event_dataset_fails_on_legacy_schema(tmp_path):
 
     with pytest.raises(ValueError, match="candidate_correct_iou03"):
         CandidateEventDataset(str(npz_path), window_size=4)
+
+
+# ---------------------------------------------------------------------------
+# Test 7: policy_sweep._parse_args exposes --dataset, --oracle-npz, --output
+# ---------------------------------------------------------------------------
+
+def test_policy_sweep_argparser_has_dataset_flag():
+    """policy_sweep._parse_args must expose --dataset, --oracle-npz, and --output."""
+    import argparse
+    from salt_r.policy_sweep import _parse_args
+
+    # Patch sys.argv to supply required arguments so argparse doesn't exit
+    import sys
+    old_argv = sys.argv
+    try:
+        sys.argv = [
+            "policy_sweep",
+            "--dataset", "dtb70",
+            "--preds", "fake_preds.json",
+            "--labels", "fake_labels.npz",
+        ]
+        args = _parse_args()
+    finally:
+        sys.argv = old_argv
+
+    assert args.dataset == "dtb70", f"Expected dataset='dtb70', got {args.dataset!r}"
+    # --oracle-npz not provided → should be None (resolved in main)
+    assert args.oracle_npz is None, f"Expected oracle_npz=None, got {args.oracle_npz!r}"
+    # --output not provided → should be None (resolved in main)
+    assert args.output is None, f"Expected output=None, got {args.output!r}"
+
+
+def test_policy_sweep_dataset_default_is_uav123():
+    """policy_sweep --dataset default must be uav123."""
+    import sys
+    from salt_r.policy_sweep import _parse_args
+
+    old_argv = sys.argv
+    try:
+        sys.argv = [
+            "policy_sweep",
+            "--preds", "fake_preds.json",
+            "--labels", "fake_labels.npz",
+        ]
+        args = _parse_args()
+    finally:
+        sys.argv = old_argv
+
+    assert args.dataset == "uav123", (
+        f"Default dataset should be 'uav123', got {args.dataset!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test 8: policy_sweep._load_val_sequence_keys filters dataset val split
+# ---------------------------------------------------------------------------
+
+def test_load_val_sequence_keys_combined_oracle(tmp_path):
+    """_load_val_sequence_keys returns only val-split keys for the requested dataset."""
+    import numpy as np
+    from salt_r.policy_sweep import _load_val_sequence_keys
+
+    # Build a minimal combined oracle NPZ with two datasets
+    seq_keys = np.array([
+        "uav123/bike1", "uav123/car3", "uav123/uav2",
+        "dtb70/Gull1",  "dtb70/Sheep1",
+    ], dtype=object)
+    splits = np.array([
+        "val",   "train", "val",
+        "val",   "train",
+    ], dtype=object)
+
+    npz_path = tmp_path / "oracle_combined.npz"
+    np.savez_compressed(
+        npz_path,
+        sequence_keys=seq_keys,
+        splits=splits,
+        features=np.zeros((5, 28), dtype=np.float32),
+        label_reinit=np.zeros(5, dtype=np.int64),
+        label_reject=np.zeros(5, dtype=np.int64),
+        frame_indices=np.arange(5, dtype=np.int64),
+    )
+
+    # Filter to uav123 val split
+    val_keys = _load_val_sequence_keys(str(npz_path), dataset="uav123")
+    assert val_keys is not None, "_load_val_sequence_keys returned None"
+    assert "uav123/bike1" in val_keys, "bike1 (val) should be included"
+    assert "uav123/uav2" in val_keys,  "uav2 (val) should be included"
+    assert "uav123/car3" not in val_keys, "car3 (train) should be excluded"
+    assert "dtb70/Gull1" not in val_keys, "dtb70 sequences should be excluded"
+
+
+def test_load_val_sequence_keys_missing_npz(tmp_path):
+    """_load_val_sequence_keys returns None when oracle NPZ does not exist."""
+    from salt_r.policy_sweep import _load_val_sequence_keys
+
+    result = _load_val_sequence_keys(str(tmp_path / "nonexistent.npz"), dataset="uav123")
+    assert result is None, "Should return None for missing NPZ"
+
+
+def test_load_val_sequence_keys_per_dataset_npz(tmp_path):
+    """_load_val_sequence_keys works for per-dataset NPZ (no dataset prefix in keys)."""
+    import numpy as np
+    from salt_r.policy_sweep import _load_val_sequence_keys
+
+    # Per-dataset NPZ: bare sequence names, no dataset/ prefix
+    seq_keys = np.array(["bike1", "car3", "uav2"], dtype=object)
+    splits = np.array(["val", "train", "val"], dtype=object)
+
+    npz_path = tmp_path / "oracle_uav123.npz"
+    np.savez_compressed(
+        npz_path,
+        sequence_keys=seq_keys,
+        splits=splits,
+        features=np.zeros((3, 28), dtype=np.float32),
+        label_reinit=np.zeros(3, dtype=np.int64),
+        label_reject=np.zeros(3, dtype=np.int64),
+        frame_indices=np.arange(3, dtype=np.int64),
+    )
+
+    # Per-dataset file: no prefixed keys, filter is a no-op
+    val_keys = _load_val_sequence_keys(str(npz_path), dataset="uav123")
+    assert val_keys is not None, "_load_val_sequence_keys returned None"
+    assert "bike1" in val_keys, "bike1 (val) should be included"
+    assert "uav2" in val_keys,  "uav2 (val) should be included"
+    assert "car3" not in val_keys, "car3 (train) should be excluded"
