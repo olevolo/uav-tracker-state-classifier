@@ -3,11 +3,16 @@
 Trains SALTRDPolicyNet on the oracle reinit dataset produced by oracle_actions.py.
 Uses weighted cross-entropy to handle severe class imbalance (most frames = NONE).
 
+IMPORTANT: Training is strictly per-dataset. Never combine datasets (uav123,
+dtb70, visdrone_sot) in a single training run. Each dataset has a very different
+frame count (uav123 ~109k, visdrone_sot ~32k, dtb70 ~13k) and mixing them
+corrupts class weight computation and training distribution. Always train one
+checkpoint per dataset using --dataset.
+
 Usage::
 
     python -m salt_r.train_policy \\
-        --oracle saltr/results/reinit_oracle_dataset.npz \\
-        --output saltr/checkpoints/policy_reinit_v1/ \\
+        --dataset uav123 \\
         --epochs 80 \\
         --batch-size 64 \\
         --lr 3e-4 \\
@@ -15,6 +20,12 @@ Usage::
         --device auto \\
         --lambda-recovery 1.0 \\
         --lambda-candidate 0.5
+
+    # Equivalent explicit form:
+    python -m salt_r.train_policy \\
+        --dataset uav123 \\
+        --oracle-npz saltr/results/reinit_oracle_uav123.npz \\
+        --output saltr/checkpoints/saltrd_v21_uav123/
 """
 
 from __future__ import annotations
@@ -127,7 +138,7 @@ def _json_safe(obj):
 # ---------------------------------------------------------------------------
 
 class OracleReinitDataset(Dataset):
-    """Windowed sequence dataset from reinit_oracle_dataset.npz.
+    """Windowed sequence dataset from a per-dataset reinit oracle NPZ.
 
     The NPZ has flat arrays (M,) keyed by:
         features (M, 28), label_reinit (M,), label_reject (M,),
@@ -135,17 +146,41 @@ class OracleReinitDataset(Dataset):
 
     Each sample is a (window_size, 28) feature window for the last frame in
     the window.  Sequences are grouped to avoid cross-sequence windows.
+
+    Parameters
+    ----------
+    npz_path:
+        Path to the per-dataset oracle NPZ file.
+    split:
+        One of "train", "val", "diagnostic".
+    window_size:
+        Number of frames in the GRU input window.
+    dataset:
+        When provided, only rows whose ``sequence_keys`` start with
+        ``"{dataset}/"`` are loaded.  This guard is a safety net when the NPZ
+        happens to contain mixed keys; for per-dataset NPZ files it is a no-op.
+        Must be one of ``uav123``, ``dtb70``, ``visdrone_sot`` (or None to
+        disable filtering).  Never pass multiple datasets — training is
+        strictly per-dataset.
     """
+
+    _VALID_DATASETS: tuple = ("uav123", "dtb70", "visdrone_sot")
 
     def __init__(
         self,
         npz_path: str,
         split: str,
         window_size: int = 20,
+        dataset: str | None = None,
     ) -> None:
         assert split in {"train", "val", "diagnostic"}, f"Unknown split: {split!r}"
+        if dataset is not None and dataset not in self._VALID_DATASETS:
+            raise ValueError(
+                f"dataset must be one of {self._VALID_DATASETS}, got {dataset!r}"
+            )
         self.split = split
         self.window_size = window_size
+        self.dataset = dataset
 
         data = np.load(npz_path, allow_pickle=True)
         features_all: np.ndarray = data["features"].astype(np.float32)  # (M, 28)
@@ -163,6 +198,27 @@ class OracleReinitDataset(Dataset):
         # Where both are set, prefer REINIT
         both = (label_reinit == 1) & (label_reject == 1)
         recovery_label[both] = _REINIT_CLASS_IDX
+
+        # Filter to the requested dataset prefix — ensures we never accidentally
+        # mix cross-dataset sequences even if the NPZ contains rows for multiple
+        # datasets.  Class weights are then computed from this filtered subset only.
+        # NOTE: per-dataset NPZ files store bare sequence names (e.g. "bike1")
+        # while the combined oracle uses prefixed names (e.g. "uav123/bike1").
+        # When the NPZ has no prefixed keys the filter is a no-op (the file is
+        # already scoped to a single dataset).
+        if dataset is not None:
+            prefix = f"{dataset}/"
+            dataset_mask = np.array(
+                [str(k).startswith(prefix) for k in seq_keys_all]
+            )
+            if dataset_mask.any():
+                # Combined-oracle format: filter to matching rows only
+                features_all = features_all[dataset_mask]
+                recovery_label = recovery_label[dataset_mask]
+                splits_all = splits_all[dataset_mask]
+                seq_keys_all = seq_keys_all[dataset_mask]
+                frame_idx_all = frame_idx_all[dataset_mask]
+            # else: per-dataset NPZ — no prefix in keys, already scoped; skip filter
 
         # Filter to requested split
         mask = np.array([str(s) == split for s in splits_all])
@@ -501,8 +557,26 @@ def train(
     n_layers: int = 2,
     # BUG-26(c): optional candidate scorer training
     candidate_events_path: str | None = None,
+    dataset: str | None = None,
 ) -> None:
-    """Train SALTRDPolicyNet on oracle reinit dataset.
+    """Train SALTRDPolicyNet on a single-dataset oracle reinit NPZ.
+
+    Training is strictly per-dataset (uav123 / dtb70 / visdrone_sot).
+    Never combine datasets in one training run — doing so corrupts class weight
+    computation because uav123 (~109k frames) would dominate dtb70 (13k) and
+    visdrone_sot (32k), skewing the REINIT/NONE ratio.
+
+    Parameters
+    ----------
+    oracle_path:
+        Path to the per-dataset reinit oracle NPZ (e.g.
+        ``saltr/results/reinit_oracle_uav123.npz``).
+    output_dir:
+        Directory where the checkpoint and training summary are written.
+    dataset:
+        Dataset name used to filter sequence keys in the NPZ.  Must be one of
+        ``uav123``, ``dtb70``, ``visdrone_sot``, or ``None`` to load all rows
+        (legacy behaviour — not recommended for new runs).
 
     If candidate_events_path is provided (output of build_candidate_dataset.py),
     the candidate_score head is jointly supervised with candidate utility labels.
@@ -516,7 +590,7 @@ def train(
     torch.manual_seed(seed)
 
     dev = _resolve_device(device)
-    print(f"[train_policy] device={dev}  oracle={oracle_path}", flush=True)
+    print(f"[train_policy] device={dev}  oracle={oracle_path}  dataset={dataset}", flush=True)
 
     # ------------------------------------------------------------------
     # Datasets / loaders
@@ -524,13 +598,13 @@ def train(
     # Oracle dataset labels: 'diagnostic' = training pool; 'val' = held-out validation.
     # Sequences in the NPZ are stored under their fold-selection priority split.
     print("[train_policy] Loading train split (diagnostic) ...", flush=True)
-    train_ds = OracleReinitDataset(oracle_path, split="diagnostic", window_size=window_size)
+    train_ds = OracleReinitDataset(oracle_path, split="diagnostic", window_size=window_size, dataset=dataset)
     print(f"[train_policy] train samples: {len(train_ds):,}", flush=True)
     dist = train_ds.compute_class_distribution()
     print(f"[train_policy] train class distribution: {dist}", flush=True)
 
     print("[train_policy] Loading val split ...", flush=True)
-    val_ds = OracleReinitDataset(oracle_path, split="val", window_size=window_size)
+    val_ds = OracleReinitDataset(oracle_path, split="val", window_size=window_size, dataset=dataset)
     print(f"[train_policy] val samples:   {len(val_ds):,}", flush=True)
 
     if len(train_ds) == 0:
@@ -742,6 +816,7 @@ def train(
                     "lambda_candidate": lambda_candidate,
                     "feature_schema": FEATURE_SCHEMA,
                     "model_family": "saltrd_policy",
+                    "dataset": dataset,
                     # BUG-26 fix (d): candidate_score head is NOT supervised in this
                     # training run — candidate_features are never passed to forward()
                     # and OracleReinitDataset returns no per-candidate labels.
@@ -784,6 +859,7 @@ def train(
             if candidate_loader is not None
             else ["recovery_action"]  # BUG-26: candidate_score not supervised
         ),
+        "dataset": dataset,
         "oracle_source": str(oracle_path),
         "output_dir": str(output_dir),
         "checkpoint": str(ckpt_path),
@@ -821,19 +897,53 @@ def train(
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    """CLI entry point for SALT-RD policy model training."""
+    """CLI entry point for SALT-RD policy model training (per-dataset)."""
     parser = argparse.ArgumentParser(
-        description="Train SALTRDPolicyNet on oracle reinit dataset."
+        description=(
+            "Train SALTRDPolicyNet on a single-dataset oracle reinit NPZ. "
+            "Training is strictly per-dataset — never combine datasets in one run."
+        )
+    )
+    # -----------------------------------------------------------------
+    # Per-dataset arguments (new)
+    # -----------------------------------------------------------------
+    parser.add_argument(
+        "--dataset",
+        choices=["uav123", "dtb70", "visdrone_sot"],
+        default="uav123",
+        help=(
+            "Dataset to train on. Controls the default oracle NPZ path and output "
+            "directory, and filters the NPZ to only this dataset's sequences. "
+            "One of: uav123, dtb70, visdrone_sot. Default: uav123."
+        ),
     )
     parser.add_argument(
+        "--oracle-npz",
+        default=None,
+        dest="oracle_npz",
+        help=(
+            "Path to per-dataset reinit oracle NPZ. Defaults to "
+            "saltr/results/reinit_oracle_{dataset}.npz when not provided."
+        ),
+    )
+    # -----------------------------------------------------------------
+    # Existing arguments (preserved)
+    # -----------------------------------------------------------------
+    parser.add_argument(
         "--oracle",
-        required=True,
-        help="Path to reinit_oracle_dataset.npz produced by oracle_actions.py.",
+        default=None,
+        help=(
+            "Legacy alias for --oracle-npz. Deprecated: prefer --oracle-npz. "
+            "Ignored when --oracle-npz is given."
+        ),
     )
     parser.add_argument(
         "--output",
-        default="saltr/checkpoints/policy_reinit_v1/",
-        help="Output directory for checkpoint and summary.",
+        default=None,
+        help=(
+            "Output directory for checkpoint and summary. Defaults to "
+            "saltr/checkpoints/saltrd_v21_{dataset}/ when not provided."
+        ),
     )
     parser.add_argument("--epochs", type=int, default=80, help="Max training epochs.")
     parser.add_argument("--batch-size", type=int, default=64, help="Mini-batch size.")
@@ -860,9 +970,24 @@ def main() -> None:
     parser.add_argument("--n-layers", type=int, default=2, help="GRU layers.")
     args = parser.parse_args()
 
+    # ------------------------------------------------------------------
+    # Resolve oracle NPZ path: --oracle-npz > --oracle (legacy) > auto
+    # ------------------------------------------------------------------
+    if args.oracle_npz is not None:
+        oracle_path = args.oracle_npz
+    elif args.oracle is not None:
+        oracle_path = args.oracle
+    else:
+        oracle_path = f"saltr/results/reinit_oracle_{args.dataset}.npz"
+
+    # ------------------------------------------------------------------
+    # Resolve output directory: --output > auto
+    # ------------------------------------------------------------------
+    output_dir = args.output if args.output is not None else f"saltr/checkpoints/saltrd_v21_{args.dataset}/"
+
     train(
-        oracle_path=args.oracle,
-        output_dir=args.output,
+        oracle_path=oracle_path,
+        output_dir=output_dir,
         epochs=args.epochs,
         batch_size=args.batch_size,
         lr=args.lr,
@@ -874,6 +999,7 @@ def main() -> None:
         seed=args.seed,
         hidden_size=args.hidden_size,
         n_layers=args.n_layers,
+        dataset=args.dataset,
     )
 
 
