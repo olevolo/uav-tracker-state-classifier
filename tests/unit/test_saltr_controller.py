@@ -262,3 +262,30 @@ def test_default_action_fields():
     assert action.search == SearchAction.KEEP
     assert action.template == TemplateAction.KEEP_CURRENT
     assert action.bbox_hint is None
+
+
+# ---------------------------------------------------------------------------
+# Test 12 — _build_candidate_features returns (n_cands, 10) with non-zero feature 9
+# ---------------------------------------------------------------------------
+
+def test_candidate_features_10_dim_with_dist_from_last():
+    """BUG-29 validation: controller builds (n,10) tensor; feature 9 (dist_from_last) is non-zero."""
+    from unittest.mock import MagicMock
+    ctrl = SALTRDController()
+    cand = MagicMock()
+    cand.bbox = (400.0, 300.0, 40.0, 30.0)
+    cand.detector_score = 0.7
+    cand.score = 0.0
+    cand.source = "detector"
+    cand.size_ratio_to_tracker = 1.2
+    cand.distance_to_tracker = 250.0  # non-zero → feature 9 should be non-zero
+
+    t = ctrl._build_candidate_features([cand], image_shape=(720, 1280))
+    assert t is not None, "expected tensor, got None"
+    assert t.shape == (1, 10), f"expected (1, 10), got {t.shape}"
+    assert float(t[0, 9]) > 0.0, f"feature 9 (dist_from_last) should be non-zero, got {t[0, 9]}"
+
+    # Feature 9 = distance_to_tracker / frame_diagonal = 250 / sqrt(720²+1280²) ≈ 0.170
+    import math
+    expected = 250.0 / math.sqrt(720**2 + 1280**2)
+    assert abs(float(t[0, 9]) - expected) < 0.001, f"feature 9 mismatch: {float(t[0,9]):.4f} vs {expected:.4f}"
