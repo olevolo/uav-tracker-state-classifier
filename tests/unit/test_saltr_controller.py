@@ -64,7 +64,7 @@ def _make_candidate(bbox=(20.0, 20.0, 30.0, 30.0), score=0.9) -> CandidateEviden
     )
 
 
-def mock_model(features):
+def mock_model(features, candidate_features=None):
     return {
         "risk_probs": {"false_confirmed": 0.1},
         "action_logits": {
@@ -83,7 +83,7 @@ class _SpyPolicy:
     def __init__(self) -> None:
         self.calls = []
 
-    def __call__(self, x):
+    def __call__(self, x, candidate_features=None):
         self.calls.append(x.detach().cpu().numpy())
         return {
             "risk_probs": {"false_confirmed": torch.tensor([0.1])},
@@ -241,7 +241,7 @@ def test_policy_receives_left_padded_temporal_window():
 # ---------------------------------------------------------------------------
 
 def test_model_error_returns_safe_noop():
-    def broken_model(features):
+    def broken_model(features, candidate_features=None):
         raise RuntimeError("GPU out of memory")
 
     ctrl = SALTRDController(policy_net=broken_model)

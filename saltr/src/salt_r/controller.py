@@ -73,7 +73,11 @@ class SALTRDController:
             import torch
             window = self._build_feature_window(features)
             x = torch.tensor(window, dtype=torch.float32).unsqueeze(0)
-            output = self._policy_net(x)
+            # BUG-26(e): pass candidate features so the trained scorer head is active.
+            # Without this, output["candidate_score"] is always None and selection
+            # falls back to evidence.candidates[0] regardless of scorer training.
+            cand_tensor = self._build_candidate_features(evidence.candidates)
+            output = self._policy_net(x, candidate_features=cand_tensor)
         except Exception as e:  # noqa: BLE001
             return self._safe_noop(reason=f"model_error:{e}")
 
@@ -90,6 +94,44 @@ class SALTRDController:
             padding = [np.zeros_like(feat) for _ in range(pad_len)]
             hist = padding + hist
         return np.stack(hist[-self._window_size:], axis=0).astype(np.float32, copy=False)
+
+    def _build_candidate_features(self, candidates: list) -> Any:
+        """Build ``(n_cands, 9)`` tensor matching ``CandidateEventDataset`` feature schema.
+
+        Feature order (must match CandidateEventDataset.__getitem__):
+            0  bbox_x          (pixels; frame_w not available at controller step → raw px)
+            1  bbox_y
+            2  bbox_w
+            3  bbox_h
+            4  detector_score  (0.0 if source is score_map)
+            5  score_map_score (0.0 if source is detector)
+            6  geometry_area_ratio  = size_ratio_to_tracker
+            7  frame_area_ratio     = 0.0 (frame dims not available at controller step)
+            8  cosine_sim           = 0.0 (not available at controller step)
+
+        Returns None if candidates is empty (model falls back to heuristic).
+        """
+        if not candidates:
+            return None
+        try:
+            import torch
+            rows = []
+            for c in candidates:
+                bbox = c.bbox  # (x, y, w, h) floats
+                rows.append([
+                    float(bbox[0]),
+                    float(bbox[1]),
+                    float(bbox[2]),
+                    float(bbox[3]),
+                    float(c.detector_score or 0.0),
+                    float(c.score) if getattr(c, 'source', '') == 'score_map' else 0.0,
+                    float(getattr(c, 'size_ratio_to_tracker', 1.0)),
+                    0.0,   # frame_area_ratio — not available
+                    0.0,   # cosine_sim — not available
+                ])
+            return torch.tensor(rows, dtype=torch.float32)
+        except Exception:
+            return None
 
     def _decode_output(self, output: dict[str, Any], evidence: EvidenceFrame) -> SALTRDDecision:
         """Decode raw model output dict into a SALTRDDecision."""
