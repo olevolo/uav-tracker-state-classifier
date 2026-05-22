@@ -27,10 +27,10 @@ motion_predictor:
 # SALT-RD learned controller
 saltrd:
   enabled: true
-  checkpoint: saltr/checkpoints/policy_with_candidate_scorer/saltrd_policy_best.pt
+  checkpoint: saltr/checkpoints/saltrd_v22_uav123/saltrd_policy_best.pt
   # Fire REINIT when p(REINIT) >= threshold — aligns live controller with
   # rollout_policy.py simulation (oracle hard_delta +0.215 at T=0.85).
-  reinit_threshold: 0.65  # lowered from 0.85; model p(REINIT) peaks at 0.65-0.77 on hard frames
+  reinit_threshold: 0.95  # raised from 0.65 — protects car7/truck1 from over-firing policy
   # Cosine similarity threshold for recovery candidate acceptance.
   # 0.25 = permissive default. Raising to 0.60 made truck1 worse (BUG-24 analysis:
   # SGLATrack embeddings lack identity discriminability; threshold tuning is not the fix).

@@ -68,10 +68,12 @@ from salt_r.actions import RecoveryAction  # noqa: E402
 
 FEATURE_SCHEMA: str = "saltrd_v3_no_tsa_no_flow"
 N_FEATURES: int = 28
-# Candidate features: [bbox_x/W, bbox_y/H, bbox_w/W, bbox_h/H, detector_score,
-#                      score_map_score, geometry_area_ratio, frame_area_ratio, cosine_sim,
-#                      dist_from_last (candidate_center to last_good_bbox / frame_diagonal)]
-CANDIDATE_FEATURE_DIM: int = 10
+# Candidate feature schema v2 (8-dim) — matches candidate_events.to_feature_vector()
+# and feature_schema.FEATURE_NAMES order:
+#   0: score_map_score  1: bbox_h  2: frame_area_ratio  3: bbox_w
+#   4: dist_from_last   5: crop_sim (MobileNetV3, offline)
+#   6: aspect_ratio_delta  7: size_delta_ratio
+CANDIDATE_FEATURE_DIM: int = 8
 
 # Recovery action class indices derived from RECOVERY_ACTION_ORDER in policy_model
 # NONE=0, SCORE_CANDIDATES=1, REINIT=2, REJECT_REINIT=3
@@ -330,7 +332,13 @@ class CandidateEventDataset(Dataset):
     artifacts which have label_good_candidate=0 by construction.
     """
 
-    def __init__(self, events_npz_path: str, window_size: int = 20) -> None:
+    def __init__(
+        self,
+        events_npz_path: str,
+        window_size: int = 20,
+        crop_sim_dropout_p: float = 0.3,
+    ) -> None:
+        self._crop_sim_dropout_p = crop_sim_dropout_p
         data = np.load(events_npz_path, allow_pickle=True)
         raw_events = data["events"]
         self._window_size = window_size
@@ -352,18 +360,18 @@ class CandidateEventDataset(Dataset):
             ev = dict(ev) if not isinstance(ev, dict) else ev
             if ev.get("candidate_iou") is None:
                 continue  # not labeled yet
-            # Candidate feature vector (CANDIDATE_FEATURE_DIM)
+            # Candidate feature vector (CANDIDATE_FEATURE_DIM = 8)
+            # Order matches candidate_events.to_feature_vector() and feature_schema.FEATURE_NAMES:
+            bb = ev.get("candidate_bbox", [0, 0, 0, 0])
             cand_feat = np.array([
-                float(ev.get("candidate_bbox", [0, 0, 0, 0])[0]) / max(float(ev.get("frame_w") or 1), 1),
-                float(ev.get("candidate_bbox", [0, 0, 0, 0])[1]) / max(float(ev.get("frame_h") or 1), 1),
-                float(ev.get("candidate_bbox", [0, 0, 0, 0])[2]) / max(float(ev.get("frame_w") or 1), 1),
-                float(ev.get("candidate_bbox", [0, 0, 0, 0])[3]) / max(float(ev.get("frame_h") or 1), 1),
-                float(ev.get("detector_score") or 0.0),
-                float(ev.get("score_map_score") or 0.0),
-                float(ev.get("geometry_area_ratio", 1.0)),
-                float(ev.get("frame_area_ratio", 0.0)),
-                float(ev.get("cosine_sim", 0.0)),
-                float(ev.get("dist_from_last", 0.0)),  # feature 9: rel. dist to last target
+                float(ev.get("score_map_score") or 0.0),      # 0: score_map_score
+                float(bb[3]) if len(bb) > 3 else 0.0,          # 1: bbox_h (raw pixels)
+                float(ev.get("frame_area_ratio", 0.0)),         # 2: frame_area_ratio
+                float(bb[2]) if len(bb) > 2 else 0.0,          # 3: bbox_w (raw pixels)
+                float(ev.get("dist_from_last", 0.0)),           # 4: dist_from_last
+                float(ev.get("crop_sim", 0.0)),                 # 5: crop_sim (MobileNetV3)
+                float(ev.get("aspect_ratio_delta", 0.0)),       # 6: aspect_ratio_delta
+                float(ev.get("size_delta_ratio", 0.0)),         # 7: size_delta_ratio
             ], dtype=np.float32)
 
             label = int(ev.get("candidate_correct_iou03", 0))  # V5 label: IoU >= 0.30
@@ -378,6 +386,11 @@ class CandidateEventDataset(Dataset):
 
     def __getitem__(self, idx: int):
         window, rec_label, cand_feat, cand_label = self._samples[idx]
+        # crop_sim dropout: randomly zero out index 5 during training so the scorer
+        # learns to work without it (crop_sim=0.0 at runtime — never computed in pipeline).
+        if self._crop_sim_dropout_p > 0.0 and np.random.random() < self._crop_sim_dropout_p:
+            cand_feat = cand_feat.copy()
+            cand_feat[5] = 0.0
         return (
             torch.from_numpy(window),
             torch.tensor(rec_label, dtype=torch.long),
@@ -558,7 +571,7 @@ def train(
     # BUG-26(c): optional candidate scorer training
     candidate_events_path: str | None = None,
     dataset: str | None = None,
-    reinit_oversample: int = 10,
+    reinit_oversample: int = 45,
 ) -> None:
     """Train SALTRDPolicyNet on a single-dataset oracle reinit NPZ.
 
@@ -996,6 +1009,11 @@ def main() -> None:
             "REJECT_REINIT dominance (dtb70: 92%%, visdrone_sot: 98%%)."
         ),
     )
+    parser.add_argument(
+        "--candidate-events", type=str, default=None,
+        help="Path to candidate events NPZ (V6+). Enables joint candidate scorer training. "
+             "Defaults to saltr/data/candidate_events_v6_{dataset}.npz when not provided.",
+    )
     args = parser.parse_args()
 
     # ------------------------------------------------------------------
@@ -1007,6 +1025,14 @@ def main() -> None:
         oracle_path = args.oracle
     else:
         oracle_path = f"saltr/results/reinit_oracle_{args.dataset}.npz"
+
+    # Resolve candidate events path
+    if args.candidate_events is not None:
+        candidate_events_path = args.candidate_events
+    else:
+        default_cand = f"saltr/data/candidate_events_v6_{args.dataset}.npz"
+        from pathlib import Path
+        candidate_events_path = default_cand if Path(default_cand).exists() else None
 
     # ------------------------------------------------------------------
     # Resolve output directory: --output > auto
@@ -1029,6 +1055,7 @@ def main() -> None:
         n_layers=args.n_layers,
         dataset=args.dataset,
         reinit_oversample=args.reinit_oversample,
+        candidate_events_path=candidate_events_path,
     )
 
 

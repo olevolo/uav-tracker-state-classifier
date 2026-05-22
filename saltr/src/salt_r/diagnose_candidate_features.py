@@ -23,20 +23,19 @@ import numpy as np
 _GATE_SEQUENCES: dict[str, list[str]] = {
     "uav123":      ["car7", "truck1"],
     "dtb70":       ["Girl2", "StreetBasketball1", "Animal1"],
-    "visdrone_sot": [],   # no established hard sequences yet; skip gate
+    "visdrone_sot": [],
 }
 
+# v2 candidate schema — matches feature_schema.FEATURE_NAMES and to_feature_vector()
 _FEATURE_NAMES = [
-    "bbox_x_norm",
-    "bbox_y_norm",
-    "bbox_w_norm",
-    "bbox_h_norm",
-    "detector_score",
     "score_map_score",
-    "geometry_area_ratio",
+    "bbox_h",
     "frame_area_ratio",
-    "cosine_sim",
+    "bbox_w",
     "dist_from_last",
+    "crop_sim",
+    "aspect_ratio_delta",
+    "size_delta_ratio",
 ]
 
 
@@ -52,20 +51,16 @@ def _compute_auc(scores: np.ndarray, labels: np.ndarray) -> float:
 
 
 def _build_features(ev: dict) -> np.ndarray:
-    fw = float(ev.get("frame_w") or 1)
-    fh = float(ev.get("frame_h") or 1)
     bb = ev.get("candidate_bbox", [0, 0, 0, 0])
     return np.array([
-        float(bb[0]) / max(fw, 1),
-        float(bb[1]) / max(fh, 1),
-        float(bb[2]) / max(fw, 1),
-        float(bb[3]) / max(fh, 1),
-        float(ev.get("detector_score") or 0.0),
-        float(ev.get("score_map_score") or 0.0),
-        float(ev.get("geometry_area_ratio", 1.0)),
-        float(ev.get("frame_area_ratio", 0.0)),
-        float(ev.get("cosine_sim", 0.0)),
-        float(ev.get("dist_from_last", 0.0)),
+        float(ev.get("score_map_score") or 0.0),       # 0
+        float(bb[3]) if len(bb) > 3 else 0.0,           # 1 bbox_h
+        float(ev.get("frame_area_ratio", 0.0)),          # 2
+        float(bb[2]) if len(bb) > 2 else 0.0,           # 3 bbox_w
+        float(ev.get("dist_from_last", 0.0)),            # 4
+        float(ev.get("crop_sim", 0.0)),                  # 5
+        float(ev.get("aspect_ratio_delta", 0.0)),        # 6
+        float(ev.get("size_delta_ratio", 0.0)),          # 7
     ], dtype=np.float32)
 
 

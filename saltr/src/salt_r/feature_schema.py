@@ -10,6 +10,11 @@ Flow features remain reserved/zero in production; indices are kept so that v2
 checkpoints trained on the same 28-dim layout remain backward-compatible.
 
 No imports from TSA or tracker state modules.  No thresholds of any kind.
+
+Candidate feature schema v2 (8-dim) is defined separately at the bottom of
+this file.  It is used only by offline collection (build_candidate_dataset.py)
+and training (train_candidate_scorer.py / train_policy.py).  It must NOT be
+imported into any runtime path.
 """
 from __future__ import annotations
 
@@ -155,3 +160,35 @@ def schema_metadata() -> dict[str, Any]:
         "zero_indices": PRODUCTION_ZERO_FEATURE_INDICES,
         "names": list(BASE_FEATURE_NAMES),
     }
+
+
+# ---------------------------------------------------------------------------
+# Candidate feature schema v2 (8 features) — OFFLINE USE ONLY
+# Used by build_candidate_dataset.py and train_candidate_scorer.py.
+# Must NOT be imported into controller.py or any other runtime path.
+# ---------------------------------------------------------------------------
+
+# Feature indices — v2 (8 features)
+IDX_SCORE_MAP_SCORE    = 0
+IDX_BBOX_H             = 1
+IDX_FRAME_AREA_RATIO   = 2
+IDX_BBOX_W             = 3
+IDX_DIST_FROM_LAST     = 4
+IDX_CROP_SIM           = 5
+IDX_ASPECT_RATIO_DELTA = 6
+IDX_SIZE_DELTA_RATIO   = 7
+
+FEATURE_DIM = 8
+
+FEATURE_NAMES = [
+    "score_map_score",
+    "bbox_h",
+    "frame_area_ratio",
+    "bbox_w",
+    "dist_from_last",
+    "crop_sim",
+    "aspect_ratio_delta",
+    "size_delta_ratio",
+]
+
+assert len(FEATURE_NAMES) == FEATURE_DIM, "FEATURE_NAMES must have exactly 8 entries"

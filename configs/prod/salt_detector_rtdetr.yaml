@@ -28,28 +28,9 @@ _meta:
 tracker:
   name: sglatrack
   device: auto
-  ce_loc: [3, 6, 9]
-  ce_keep_ratio_by_state:
-    CONFIRMED:       [0.5, 0.5, 0.5]
-    LOW_RES:         [1.0, 1.0, 1.0]
-    DYNAMIC:         [1.0, 1.0, 1.0]
-    OCCLUDED:        [1.0, 1.0, 1.0]
-    DISTRACTOR_RISK: [1.0, 1.0, 1.0]
-    LOST:            null
-
-tsa:
-  name: mobilenetv3_tiny
-  classify_interval: 5
-  confidence_threshold: 0.60
-  device: auto
-  adapt_interval: 20
-  adapt_steps: 3
-  adapt_enabled: false
-  buffer_size: 100
-  iou_threshold_confirmed: 0.7
-  iou_threshold_occluded: 0.3
-  motion_residual_threshold: 0.5
-  weights_path: weights/tsa_head_uav123.pth
+  # CE token pruning: kr=0.50 at layer 3 gives +0.006 vs no-pruning.
+  # ce_loc and ce_keep_ratio are applied inside the tracker at load time; not
+  # passed as constructor kwargs (those are controlled by the weights config).
 
 detector:
   name: rtdetrv2_s                # RT-DETRv2-S, COCO pre-trained
@@ -68,10 +49,11 @@ appearance_memory:
 
 motion_predictor:
   name: lstm_online
-  enabled: false
+  enabled: false  # confirmed zero AUC benefit
 
-head_adaptor:
-  enabled: false
+# SALT-RD learned controller
+saltrd:
+  enabled: false  # disabled for pure detector ablation — measures RT-DETRv2 detector impact only
 
 dataset: uav123
 seed: 42

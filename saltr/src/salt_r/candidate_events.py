@@ -19,13 +19,14 @@ Usage (in SALTRunner._step, around recovery execution)
         seq_id=current_seq_id,
         candidate_bbox=candidate_bbox,   # (x, y, w, h)
         source=candidate.source,         # "score_map" | "detector"
-        detector_score=candidate.score,
         score_map_score=candidate.score if source=="score_map" else None,
-        geometry_ratio=_area_ratio,
-        cosine_sim=best_sim,
+        frame_area_ratio=_area_ratio,
         accepted=True,                   # geometry guard passed
         tracker_bbox=track_state.bbox,
-        frame_idx_post_reinit=self._frame_idx,
+        dist_from_last=_dist_from_last,
+        crop_sim=_crop_sim,
+        aspect_ratio_delta=_aspect_ratio_delta,
+        size_delta_ratio=_size_delta_ratio,
     )
 
 Offline labeling
@@ -63,15 +64,10 @@ class CandidateEvent:
 
     # Candidate source and scores
     source: str                     # "score_map" | "detector"
-    detector_score: Optional[float]    # YOLO/RT-DETR confidence, None if score_map
     score_map_score: Optional[float]   # score-map peak value, None if detector-only
 
     # Geometry guard features (from BUG-19 fix)
-    geometry_area_ratio: float      # candidate_area / last_good_bbox_area
     frame_area_ratio: float         # candidate_area / frame_area
-
-    # Appearance guard (cosine sim from _best_detection)
-    cosine_sim: float               # cosine sim between candidate embed and ref embed
 
     # Execution outcome
     accepted: bool                  # True if geometry guard and cosine guard passed
@@ -82,6 +78,10 @@ class CandidateEvent:
     frame_w: int = 0                # frame width at event time; 0 = not recorded
     # Relative position feature (Track A pivot — dist to last known target)
     dist_from_last: float = 0.0     # distance(candidate_center, last_good_bbox_center) / frame_diagonal
+    # Identity signal features (v2 candidate schema — crop_sim via MobileNetV3)
+    crop_sim: float = 0.0           # cosine sim between MobileNetV3 embeddings of candidate and template crops
+    aspect_ratio_delta: float = 0.0 # |cand_w/cand_h - tmpl_w/tmpl_h|
+    size_delta_ratio: float = 0.0   # |cand_area - tmpl_area| / tmpl_area, clipped to [0, 1]
 
     # Offline GT labels (filled by labeling pass, None at collection time)
     candidate_iou: Optional[float] = None           # IoU(candidate_bbox, gt_bbox[frame_idx])
@@ -92,6 +92,36 @@ class CandidateEvent:
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+    def to_feature_vector(self) -> "np.ndarray":
+        """Return v2 candidate feature vector (8-dim) matching FEATURE_NAMES order.
+
+        Index layout (matches feature_schema.FEATURE_NAMES):
+            0: score_map_score
+            1: bbox_h
+            2: frame_area_ratio
+            3: bbox_w
+            4: dist_from_last
+            5: crop_sim
+            6: aspect_ratio_delta
+            7: size_delta_ratio
+        """
+        import numpy as np
+        bb = self.candidate_bbox  # [x, y, w, h]
+        return np.array([
+            float(self.score_map_score or 0.0),  # 0: score_map_score
+            float(bb[3]) if len(bb) > 3 else 0.0,  # 1: bbox_h
+            float(self.frame_area_ratio),            # 2: frame_area_ratio
+            float(bb[2]) if len(bb) > 2 else 0.0,  # 3: bbox_w
+            float(self.dist_from_last),              # 4: dist_from_last
+            float(self.crop_sim),                    # 5: crop_sim
+            float(self.aspect_ratio_delta),          # 6: aspect_ratio_delta
+            float(self.size_delta_ratio),            # 7: size_delta_ratio
+        ], dtype=np.float32)
+
+    def as_array(self) -> "np.ndarray":
+        """Alias for to_feature_vector()."""
+        return self.to_feature_vector()
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "CandidateEvent":
@@ -122,17 +152,21 @@ class CandidateEventLogger:
         candidate_bbox: tuple[float, float, float, float],
         tracker_bbox: tuple[float, float, float, float],
         source: str,
-        detector_score: Optional[float],
         score_map_score: Optional[float],
-        geometry_area_ratio: float,
         frame_area_ratio: float,
-        cosine_sim: float,
         accepted: bool,
         reject_reason: Optional[str] = None,
         seq_id: Optional[str] = None,
         frame_h: int = 0,
         frame_w: int = 0,
         dist_from_last: float = 0.0,
+        crop_sim: float = 0.0,
+        aspect_ratio_delta: float = 0.0,
+        size_delta_ratio: float = 0.0,
+        # Legacy parameters kept for backward compatibility (ignored)
+        detector_score: Optional[float] = None,
+        geometry_area_ratio: Optional[float] = None,
+        cosine_sim: Optional[float] = None,
     ) -> None:
         if not self.enabled:
             return
@@ -143,16 +177,16 @@ class CandidateEventLogger:
             candidate_bbox=list(candidate_bbox),
             tracker_bbox=list(tracker_bbox),
             source=source,
-            detector_score=detector_score,
             score_map_score=score_map_score,
-            geometry_area_ratio=geometry_area_ratio,
             frame_area_ratio=frame_area_ratio,
-            cosine_sim=cosine_sim,
             accepted=accepted,
             reject_reason=reject_reason,
             frame_h=frame_h,
             frame_w=frame_w,
             dist_from_last=dist_from_last,
+            crop_sim=crop_sim,
+            aspect_ratio_delta=aspect_ratio_delta,
+            size_delta_ratio=size_delta_ratio,
         ))
 
     def events(self) -> List[CandidateEvent]:

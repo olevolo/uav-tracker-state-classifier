@@ -24,7 +24,7 @@ motion_predictor:
 saltrd:
   enabled: true
   checkpoint: saltr/checkpoints/saltrd_v21_uav123/saltrd_policy_best.pt
-  reinit_threshold: 0.65
+  reinit_threshold: 0.95  # synced with salt.yaml
   cosine_threshold: 0.25
   candidate_scorer_checkpoint: saltr/checkpoints/candidate_scorer_v21_uav123/best.pt
 

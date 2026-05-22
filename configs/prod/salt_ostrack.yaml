@@ -26,7 +26,7 @@ motion_predictor:
 saltrd:
   enabled: true
   checkpoint: saltr/checkpoints/policy_reinit_v2/saltrd_policy_best.pt
-  reinit_threshold: 0.65
+  reinit_threshold: 0.95
 
 dataset: uav123
 seed: 42

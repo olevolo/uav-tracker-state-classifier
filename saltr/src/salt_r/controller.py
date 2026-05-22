@@ -77,7 +77,9 @@ class SALTRDController:
             # Without this, output["candidate_score"] is always None and selection
             # falls back to evidence.candidates[0] regardless of scorer training.
             cand_tensor = self._build_candidate_features(
-                evidence.candidates, image_shape=evidence.image_shape
+                evidence.candidates,
+                image_shape=evidence.image_shape,
+                tracker_bbox=evidence.bbox,
             )
             output = self._policy_net(x, candidate_features=cand_tensor)
         except Exception as e:  # noqa: BLE001
@@ -97,20 +99,23 @@ class SALTRDController:
             hist = padding + hist
         return np.stack(hist[-self._window_size:], axis=0).astype(np.float32, copy=False)
 
-    def _build_candidate_features(self, candidates: list, image_shape: tuple | None = None) -> Any:
-        """Build ``(n_cands, 10)`` tensor matching ``CandidateEventDataset`` feature schema.
+    def _build_candidate_features(
+        self,
+        candidates: list,
+        image_shape: tuple | None = None,
+        tracker_bbox: tuple | None = None,
+    ) -> Any:
+        """Build ``(n_cands, 8)`` tensor matching candidate_events.to_feature_vector() schema.
 
-        Feature order (must match CandidateEventDataset.__getitem__):
-            0  bbox_x / frame_w
-            1  bbox_y / frame_h
-            2  bbox_w / frame_w
-            3  bbox_h / frame_h
-            4  detector_score  (0.0 if source is score_map)
-            5  score_map_score (0.0 if source is detector)
-            6  geometry_area_ratio  = size_ratio_to_tracker
-            7  frame_area_ratio
-            8  cosine_sim           = 0.0 (BUG-27 v2: appearance memory, future work)
-            9  dist_from_last       = distance_to_tracker / frame_diagonal  (Track A feature)
+        Feature order (must match CandidateEventDataset and feature_schema.FEATURE_NAMES):
+            0  score_map_score       (0.0 if source is detector)
+            1  bbox_h                raw pixels
+            2  frame_area_ratio      cand_area / frame_area
+            3  bbox_w                raw pixels
+            4  dist_from_last        distance_to_tracker / frame_diagonal
+            5  crop_sim              0.0 at runtime (offline MobileNetV3 — never in runtime)
+            6  aspect_ratio_delta    |cand_w/cand_h - tracker_w/tracker_h|
+            7  size_delta_ratio      |size_ratio_to_tracker - 1.0| proxy
 
         Returns None if candidates is empty (model falls back to heuristic).
         """
@@ -120,21 +125,35 @@ class SALTRDController:
             import torch
             h, w = (image_shape[0], image_shape[1]) if image_shape else (1, 1)
             frame_diag = (h ** 2 + w ** 2) ** 0.5 if (h > 1 and w > 1) else 1.0
+            frame_area = max(float(h * w), 1.0)
+            # Tracker aspect ratio — same formula as build_candidate_dataset.py
+            if tracker_bbox is not None:
+                tkr_w = float(getattr(tracker_bbox, 'w', None) or
+                              (tracker_bbox[2] if hasattr(tracker_bbox, '__getitem__') else 1.0))
+                tkr_h = float(getattr(tracker_bbox, 'h', None) or
+                              (tracker_bbox[3] if hasattr(tracker_bbox, '__getitem__') else 1.0))
+                tkr_ar = tkr_w / max(tkr_h, 1e-6)
+            else:
+                tkr_ar = 1.0  # fallback: assume square
             rows = []
             for c in candidates:
-                bbox = c.bbox  # (x, y, w, h) floats
-                cand_area = float(bbox[2]) * float(bbox[3])
+                bbox = c.bbox  # BBox dataclass with .x .y .w .h
+                bw = float(getattr(bbox, 'w', None) or
+                           (bbox[2] if hasattr(bbox, '__getitem__') else 1.0))
+                bh = float(getattr(bbox, 'h', None) or
+                           (bbox[3] if hasattr(bbox, '__getitem__') else 1.0))
+                cand_area = bw * bh
+                cand_ar = bw / max(bh, 1e-6)
+                size_ratio = float(getattr(c, 'size_ratio_to_tracker', 1.0))
                 rows.append([
-                    float(bbox[0]) / max(w, 1),
-                    float(bbox[1]) / max(h, 1),
-                    float(bbox[2]) / max(w, 1),
-                    float(bbox[3]) / max(h, 1),
-                    float(c.detector_score or 0.0),
-                    float(c.score) if getattr(c, 'source', '') == 'score_map' else 0.0,
-                    float(getattr(c, 'size_ratio_to_tracker', 1.0)),
-                    cand_area / max(float(h * w), 1.0),
-                    0.0,   # cosine_sim — appearance memory (future)
-                    float(getattr(c, 'distance_to_tracker', 0.0)) / max(frame_diag, 1.0),
+                    float(c.score) if getattr(c, 'source', '') == 'score_map' else 0.0,  # 0
+                    bh,                                                                    # 1
+                    cand_area / frame_area,                                               # 2
+                    bw,                                                                    # 3
+                    float(getattr(c, 'distance_to_tracker', 0.0)) / max(frame_diag, 1.0), # 4
+                    0.0,                                                                   # 5 crop_sim offline
+                    abs(cand_ar - tkr_ar),                                                # 6 aspect_ratio_delta vs tracker
+                    abs(size_ratio - 1.0),                                                # 7 size_delta_ratio proxy
                 ])
             return torch.tensor(rows, dtype=torch.float32)
         except Exception:
