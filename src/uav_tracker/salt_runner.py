@@ -143,6 +143,10 @@ class SALTRunner:
     # Cosine similarity of the last accepted recovery candidate — set by
     # _best_detection() and read in _step() for the displacement+cosine check.
     _last_recovery_sim: float = field(default=0.0, init=False, repr=False)
+    # Cosine similarity threshold for recovery candidate acceptance in _best_detection().
+    # Set from saltrd.cosine_threshold in config (default 0.25 = permissive).
+    # Raise to 0.60+ to require stronger appearance match before accepting a candidate.
+    _cosine_threshold: float = field(default=0.25, init=False, repr=False)
 
     # ---------------------------------------------------------------------------
     # Factory
@@ -228,6 +232,7 @@ class SALTRunner:
             evidence_extractor=evidence_extractor,
             seed=cfg.get("seed", 42),
         )
+        runner._cosine_threshold = float(saltrd_cfg.get("cosine_threshold", 0.25))
 
         # Eagerly warm up components so the first sequence bears no cold-start cost.
         # prepare() loads tracker weights; detector warmup() pays JIT/CUDA-graph init.
@@ -842,7 +847,7 @@ class SALTRunner:
         for the correct target). Also falls through to proximity-only scoring
         when _ref_embedding is None.
         """
-        _SIM_THRESHOLD = 0.25  # reject only clearly-wrong appearance
+        _SIM_THRESHOLD = self._cosine_threshold  # configurable via saltrd.cosine_threshold
 
         if not detections:
             return None

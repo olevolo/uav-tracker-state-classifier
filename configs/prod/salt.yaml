@@ -31,6 +31,10 @@ saltrd:
   # Fire REINIT when p(REINIT) >= threshold — aligns live controller with
   # rollout_policy.py simulation (oracle hard_delta +0.215 at T=0.85).
   reinit_threshold: 0.65  # lowered from 0.85; model p(REINIT) peaks at 0.65-0.77 on hard frames
+  # Cosine similarity threshold for recovery candidate acceptance.
+  # 0.25 = permissive (BUG-24: accepts wrong-class candidates on car7/truck1).
+  # 0.60 = stricter; requires stronger appearance match before reinit executes.
+  cosine_threshold: 0.60
 
 dataset: uav123
 seed: 42
