@@ -325,6 +325,10 @@ class OSTrackTracker:
 
         return TrackState(bbox=new_bbox, confidence=confidence, status=status)
 
+    def update_with_action(self, frame: "np.ndarray", action: "Any") -> "TrackState":
+        """Action routing stub — OSTrack does not support CE/search overrides."""
+        return self.update(frame)
+
     def reset(self) -> None:
         self._template = None
         self._last_bbox = None
