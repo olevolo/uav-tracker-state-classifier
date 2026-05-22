@@ -130,6 +130,10 @@ class SALTRunner:
     _RECOVERY_VOTE_THRESHOLD: int = field(default=2, init=False, repr=False)
     # Cooldown applied after a successful score-map fallback reinit
     _RECOVERY_COOLDOWN: int = field(default=30, init=False, repr=False)
+    # Frames since tracker last had good-quality output (conf >= threshold).
+    # Score-map fallback only fires after extended failure to prevent false reinits.
+    _frames_since_good_bbox: int = field(default=0, init=False, repr=False)
+    _FALLBACK_MIN_FAILURE_FRAMES: int = field(default=25, init=False, repr=False)
     # Guard 3: reference appearance embedding from frame 0 for cosine similarity check
     # at recovery time. Set at init, updated slowly during confirmed tracking via EMA.
     _ref_embedding: Optional[np.ndarray] = field(default=None, init=False, repr=False)
@@ -416,6 +420,9 @@ class SALTRunner:
         # ---- Guard 1: remember last good bbox for size-consistency filtering ----
         if track_state.confidence >= 0.14:
             self._last_good_bbox = track_state.bbox
+            self._frames_since_good_bbox = 0
+        else:
+            self._frames_since_good_bbox += 1
 
         # ---- Guard 3: EMA update of reference embedding on stable frames every 50 ----
         if (track_state.confidence >= 0.014
@@ -648,11 +655,14 @@ class SALTRunner:
         # Fires when the YOLO detector path did not execute (no detector, or
         # detector found no usable candidates) and the controller has already
         # selected a score-map candidate to reinit to.
+        # Guard: only fire after extended tracker failure (_frames_since_good_bbox)
+        # to prevent false reinits on sequences where tracking is still working.
         if (_genuine_recovery_request
                 and _past_warmup
                 and self._lost_cooldown == 0
                 and not _reinit_executed
-                and decision.selected_candidate is not None):
+                and decision.selected_candidate is not None
+                and self._frames_since_good_bbox >= self._FALLBACK_MIN_FAILURE_FRAMES):
             candidate_bbox = decision.selected_candidate.bbox  # (x, y, w, h)
             _fh, _fw = frame.shape[:2]
             cx, cy = candidate_bbox[0] + candidate_bbox[2] / 2, candidate_bbox[1] + candidate_bbox[3] / 2
@@ -954,6 +964,7 @@ class SALTRunner:
         self._lost_cooldown = 0
         self._consecutive_recovery_frames = 0
         self._last_good_bbox = None
+        self._frames_since_good_bbox = 0
         self._recovery_votes = []
         self._ref_embedding = None
         self._target_class = None
