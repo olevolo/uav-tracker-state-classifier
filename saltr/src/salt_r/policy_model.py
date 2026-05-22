@@ -296,7 +296,17 @@ class SALTRDPolicyNet(nn.Module):
             )
         init_kwargs: dict[str, Any] = ckpt.get("init_kwargs", {})
         model = cls(**init_kwargs)
-        model.load_state_dict(ckpt["model_state_dict"])
+        state = ckpt["model_state_dict"]
+        # Pre-initialize candidate scorer head if checkpoint includes trained scorer
+        # weights (added by train_candidate_scorer.py). Without this, the lazily-created
+        # Linear would be ignored by load_state_dict even with strict=False.
+        scorer_w_key = "_candidate_scorer.weight"
+        if scorer_w_key in state:
+            import torch as _torch
+            feat_dim = state[scorer_w_key].shape[1]
+            model._candidate_scorer = _torch.nn.Linear(feat_dim, 1)
+            model._candidate_feat_dim = feat_dim
+        model.load_state_dict(state, strict=False)
         return model
 
     # ------------------------------------------------------------------

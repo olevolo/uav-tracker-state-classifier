@@ -87,19 +87,9 @@ def train_candidate_scorer(
         dev = torch.device(device)
     print(f"[train_candidate_scorer] device={dev}", flush=True)
 
-    # Load base policy and freeze recovery head
-    ckpt = torch.load(policy_checkpoint, map_location="cpu", weights_only=False)
-    model_state = ckpt.get("model_state_dict") or ckpt.get("state_dict") or ckpt
-    meta = ckpt.get("metadata", {})
-    window_size = meta.get("window_size", 20) or 20
-
-    model = SALTRDPolicyNet(
-        n_features=meta.get("n_features", 28),
-        hidden_size=meta.get("hidden_size", 64),
-        n_layers=meta.get("n_layers", 2),
-        window_size=window_size,
-    ).to(dev)
-    model.load_state_dict(model_state, strict=False)
+    # Load base policy using the standard loader (handles top-level metadata format)
+    model = SALTRDPolicyNet.load(policy_checkpoint).to(dev)
+    window_size = model.window_size
 
     # Freeze everything except the candidate scorer linear
     for name, param in model.named_parameters():
@@ -224,21 +214,15 @@ def train_candidate_scorer(
             best_auprc = val_auprc
             best_epoch = epoch
             patience_counter = 0
-            # Save checkpoint — full model state so recovery head is preserved
-            torch.save(
-                {
-                    "model_state_dict": model.state_dict(),
-                    "metadata": {
-                        **meta,
-                        "trained_heads": ["recovery_action", "candidate_score"],
-                        "candidate_scorer_epoch": epoch,
-                        "candidate_scorer_auprc": val_auprc,
-                        "candidate_feature_dim": CANDIDATE_FEATURE_DIM,
-                        "created_at": datetime.utcnow().isoformat(),
-                    },
-                },
-                ckpt_path,
-            )
+            # Save using model.save() — writes top-level metadata compatible with
+            # SALTRDPolicyNet.load() (fixes BUG: nested "metadata" key rejected at load)
+            model.save(ckpt_path, extra_metadata={
+                "trained_heads": ["recovery_action", "candidate_score"],
+                "candidate_scorer_epoch": epoch,
+                "candidate_scorer_auprc": val_auprc,
+                "candidate_feature_dim": CANDIDATE_FEATURE_DIM,
+                "created_at": datetime.utcnow().isoformat(),
+            })
         else:
             patience_counter += 1
             if patience_counter >= patience:

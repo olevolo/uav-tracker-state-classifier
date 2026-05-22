@@ -27,7 +27,7 @@ motion_predictor:
 # SALT-RD learned controller
 saltrd:
   enabled: true
-  checkpoint: saltr/checkpoints/policy_reinit_v2/saltrd_policy_best.pt
+  checkpoint: saltr/checkpoints/policy_with_candidate_scorer/saltrd_policy_best.pt
   # Fire REINIT when p(REINIT) >= threshold — aligns live controller with
   # rollout_policy.py simulation (oracle hard_delta +0.215 at T=0.85).
   reinit_threshold: 0.65  # lowered from 0.85; model p(REINIT) peaks at 0.65-0.77 on hard frames
