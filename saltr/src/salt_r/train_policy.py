@@ -264,16 +264,14 @@ class OracleReinitDataset(Dataset):
 class CandidateEventDataset(Dataset):
     """Per-reinit candidate event dataset for training the candidate scorer head.
 
-    Reads from `saltr/data/candidate_events_labeled.npz` produced by
+    Reads from `saltr/data/candidate_events_v5_labeled.npz` produced by
     `build_candidate_dataset.py`. Each sample is a (window_features, recovery_label,
     candidate_features, candidate_label) tuple.
 
     candidate_features shape: (CANDIDATE_FEATURE_DIM,)
-    candidate_label: 1 if IoU > 0.3 AND future_iou_gain > 0, else 0.
-
-    This dataset is intentionally separate from OracleReinitDataset so that
-    the candidate scorer can be trained independently and evaluated before
-    re-enabling live reinit.
+    candidate_label: 1 if candidate_iou >= 0.30 (candidate_correct_iou03 field).
+    Fails fast if the NPZ lacks candidate_correct_iou03 — do NOT use V1/V2/V3/V4
+    artifacts which have label_good_candidate=0 by construction.
     """
 
     def __init__(self, events_npz_path: str, window_size: int = 20) -> None:
@@ -281,6 +279,18 @@ class CandidateEventDataset(Dataset):
         raw_events = data["events"]
         self._window_size = window_size
         self._samples: list[tuple] = []
+
+        # Fail fast: require V5 schema with candidate_correct_iou03
+        sample_ev = dict(raw_events[0]) if len(raw_events) > 0 else {}
+        if not isinstance(sample_ev, dict):
+            sample_ev = dict(sample_ev)
+        if "candidate_correct_iou03" not in sample_ev:
+            raise ValueError(
+                f"{events_npz_path} lacks 'candidate_correct_iou03' field. "
+                "Use a V5+ artifact from build_candidate_dataset.py. "
+                "Do NOT use V1/V2/V3/V4 artifacts — their label_good_candidate is "
+                "always 0 (future_iou_gain gate was broken)."
+            )
 
         for ev in raw_events:
             ev = dict(ev) if not isinstance(ev, dict) else ev
@@ -300,7 +310,7 @@ class CandidateEventDataset(Dataset):
                 float(ev.get("dist_from_last", 0.0)),  # feature 9: rel. dist to last target
             ], dtype=np.float32)
 
-            label = int(ev.get("label_good_candidate", 0))
+            label = int(ev.get("candidate_correct_iou03", 0))  # V5 label: IoU >= 0.30
             # Recovery label: placeholder (NONE class) until joint recovery+candidate training
             recovery_label = _NONE_CLASS_IDX
             # Window features: zero-padded (no sequence context available per event)
