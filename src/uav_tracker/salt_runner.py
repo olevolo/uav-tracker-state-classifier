@@ -101,6 +101,9 @@ class SALTRunner:
     motion_predictor: Any | None = None   # OnlineLSTMMotionPredictor
     saltrd_controller: Any | None = None  # SALTRDController (optional)
     evidence_extractor: Any | None = None # EvidenceExtractor (optional)
+    # Candidate event logger — disabled by default; set .enabled=True before run()
+    # to collect training data for BUG-26(b)/(c) candidate scorer.
+    candidate_logger: Any | None = field(default=None, init=False, repr=False)
     seed: int = 42
 
     # Center-freeze disabled by default — oracle showed 0.000 AUC gain and it
@@ -233,6 +236,12 @@ class SALTRunner:
             seed=cfg.get("seed", 42),
         )
         runner._cosine_threshold = float(saltrd_cfg.get("cosine_threshold", 0.25))
+
+        try:
+            from salt_r.candidate_events import CandidateEventLogger
+            runner.candidate_logger = CandidateEventLogger(enabled=False)
+        except ImportError:
+            pass
 
         # Eagerly warm up components so the first sequence bears no cold-start cost.
         # prepare() loads tracker weights; detector warmup() pays JIT/CUDA-graph init.
@@ -609,7 +618,39 @@ class SALTRunner:
                                 )
                                 self._lost_cooldown = 40
                                 _reinit_vetoed = True
+                                if self.candidate_logger is not None:
+                                    _fh_l, _fw_l = frame.shape[:2]
+                                    _la = float(self._last_good_bbox.w * self._last_good_bbox.h) if self._last_good_bbox else 1.0
+                                    self.candidate_logger.record(
+                                        frame_idx=self._frame_idx,
+                                        candidate_bbox=(winner.x, winner.y, winner.w, winner.h),
+                                        tracker_bbox=(track_state.bbox.x, track_state.bbox.y, track_state.bbox.w, track_state.bbox.h),
+                                        source="detector",
+                                        detector_score=None,
+                                        score_map_score=None,
+                                        geometry_area_ratio=(winner.w * winner.h) / max(_la, 1e-6),
+                                        frame_area_ratio=(winner.w * winner.h) / max(float(_fh_l * _fw_l), 1e-6),
+                                        cosine_sim=winner_sim,
+                                        accepted=False,
+                                        reject_reason="guard5",
+                                    )
                             else:
+                                if self.candidate_logger is not None:
+                                    _fh_l, _fw_l = frame.shape[:2]
+                                    _la = float(self._last_good_bbox.w * self._last_good_bbox.h) if self._last_good_bbox else 1.0
+                                    self.candidate_logger.record(
+                                        frame_idx=self._frame_idx,
+                                        candidate_bbox=(winner.x, winner.y, winner.w, winner.h),
+                                        tracker_bbox=(track_state.bbox.x, track_state.bbox.y, track_state.bbox.w, track_state.bbox.h),
+                                        source="detector",
+                                        detector_score=None,
+                                        score_map_score=None,
+                                        geometry_area_ratio=(winner.w * winner.h) / max(_la, 1e-6),
+                                        frame_area_ratio=(winner.w * winner.h) / max(float(_fh_l * _fw_l), 1e-6),
+                                        cosine_sim=winner_sim,
+                                        accepted=True,
+                                        reject_reason=None,
+                                    )
                                 self.tracker.init(frame, winner)
                                 track_state = TrackState(
                                     bbox=winner,
@@ -725,6 +766,20 @@ class SALTRunner:
                         getattr(decision.selected_candidate, 'score', 0.0),
                         _area_ratio,
                     )
+                    if self.candidate_logger is not None:
+                        self.candidate_logger.record(
+                            frame_idx=self._frame_idx,
+                            candidate_bbox=tuple(float(v) for v in candidate_bbox),
+                            tracker_bbox=(track_state.bbox.x, track_state.bbox.y, track_state.bbox.w, track_state.bbox.h),
+                            source=getattr(decision.selected_candidate, 'source', 'score_map'),
+                            detector_score=getattr(decision.selected_candidate, 'detector_score', None),
+                            score_map_score=getattr(decision.selected_candidate, 'score', None),
+                            geometry_area_ratio=_area_ratio,
+                            frame_area_ratio=_cand_area / max(_frame_area, 1e-6),
+                            cosine_sim=0.0,
+                            accepted=True,
+                            reject_reason=None,
+                        )
                 except Exception as e:
                     _logger.debug("Score-map fallback reinit failed: %s", e)
             else:
@@ -743,6 +798,20 @@ class SALTRunner:
                     getattr(decision.selected_candidate, 'score', 0.0),
                     _reject_reason,
                 )
+                if self.candidate_logger is not None:
+                    self.candidate_logger.record(
+                        frame_idx=self._frame_idx,
+                        candidate_bbox=tuple(float(v) for v in candidate_bbox),
+                        tracker_bbox=(track_state.bbox.x, track_state.bbox.y, track_state.bbox.w, track_state.bbox.h),
+                        source=getattr(decision.selected_candidate, 'source', 'score_map'),
+                        detector_score=getattr(decision.selected_candidate, 'detector_score', None),
+                        score_map_score=getattr(decision.selected_candidate, 'score', None),
+                        geometry_area_ratio=_area_ratio,
+                        frame_area_ratio=_cand_area / max(_frame_area, 1e-6),
+                        cosine_sim=0.0,
+                        accepted=False,
+                        reject_reason=_reject_reason,
+                    )
 
         self._trajectory.append(track_state.bbox)
         if len(self._trajectory) > 200:
@@ -1029,6 +1098,8 @@ class SALTRunner:
             self.saltrd_controller.reset()
         if self.evidence_extractor is not None:
             self.evidence_extractor.reset()
+        if self.candidate_logger is not None:
+            self.candidate_logger.reset()
         # Reset tracker template counters and advisor rolling buffers so they
         # do not leak between sequences.  tracker.reset() calls advisor.reset()
         # internally, so this is the single authoritative reset point.

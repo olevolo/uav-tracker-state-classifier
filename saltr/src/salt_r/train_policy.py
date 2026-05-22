@@ -57,6 +57,10 @@ from salt_r.actions import RecoveryAction  # noqa: E402
 
 FEATURE_SCHEMA: str = "saltrd_v3_no_tsa_no_flow"
 N_FEATURES: int = 28
+# Candidate features: [bbox_x/W, bbox_y/H, bbox_w/W, bbox_h/H, detector_score,
+#                      score_map_score, geometry_area_ratio, frame_area_ratio, cosine_sim]
+# (frame dimensions W/H normalize the bbox; scores/ratios are already in [0,1] range)
+CANDIDATE_FEATURE_DIM: int = 9
 
 # Recovery action class indices derived from RECOVERY_ACTION_ORDER in policy_model
 # NONE=0, SCORE_CANDIDATES=1, REINIT=2, REJECT_REINIT=3
@@ -252,6 +256,69 @@ class OracleReinitDataset(Dataset):
         }
 
 
+
+# ---------------------------------------------------------------------------
+# Candidate event dataset (BUG-26 b) — reads from build_candidate_dataset.py output
+# ---------------------------------------------------------------------------
+
+class CandidateEventDataset(Dataset):
+    """Per-reinit candidate event dataset for training the candidate scorer head.
+
+    Reads from `saltr/data/candidate_events_labeled.npz` produced by
+    `build_candidate_dataset.py`. Each sample is a (window_features, recovery_label,
+    candidate_features, candidate_label) tuple.
+
+    candidate_features shape: (CANDIDATE_FEATURE_DIM,)
+    candidate_label: 1 if IoU > 0.3 AND future_iou_gain > 0, else 0.
+
+    This dataset is intentionally separate from OracleReinitDataset so that
+    the candidate scorer can be trained independently and evaluated before
+    re-enabling live reinit.
+    """
+
+    def __init__(self, events_npz_path: str, window_size: int = 20) -> None:
+        data = np.load(events_npz_path, allow_pickle=True)
+        raw_events = data["events"]
+        self._window_size = window_size
+        self._samples: list[tuple] = []
+
+        for ev in raw_events:
+            ev = dict(ev) if not isinstance(ev, dict) else ev
+            if ev.get("candidate_iou") is None:
+                continue  # not labeled yet
+            # Candidate feature vector (CANDIDATE_FEATURE_DIM)
+            cand_feat = np.array([
+                float(ev.get("candidate_bbox", [0, 0, 0, 0])[0]) / max(float(ev.get("frame_w", 1)), 1),
+                float(ev.get("candidate_bbox", [0, 0, 0, 0])[1]) / max(float(ev.get("frame_h", 1)), 1),
+                float(ev.get("candidate_bbox", [0, 0, 0, 0])[2]) / max(float(ev.get("frame_w", 1)), 1),
+                float(ev.get("candidate_bbox", [0, 0, 0, 0])[3]) / max(float(ev.get("frame_h", 1)), 1),
+                float(ev.get("detector_score") or 0.0),
+                float(ev.get("score_map_score") or 0.0),
+                float(ev.get("geometry_area_ratio", 1.0)),
+                float(ev.get("frame_area_ratio", 0.0)),
+                float(ev.get("cosine_sim", 0.0)),
+            ], dtype=np.float32)
+
+            label = int(ev.get("label_good_candidate", 0))
+            # Recovery label: placeholder (NONE class) until joint recovery+candidate training
+            recovery_label = _NONE_CLASS_IDX
+            # Window features: zero-padded (no sequence context available per event)
+            window = np.zeros((window_size, N_FEATURES), dtype=np.float32)
+            self._samples.append((window, recovery_label, cand_feat, label))
+
+    def __len__(self) -> int:
+        return len(self._samples)
+
+    def __getitem__(self, idx: int):
+        window, rec_label, cand_feat, cand_label = self._samples[idx]
+        return (
+            torch.from_numpy(window),
+            torch.tensor(rec_label, dtype=torch.long),
+            torch.from_numpy(cand_feat),
+            torch.tensor(cand_label, dtype=torch.float32),
+        )
+
+
 # ---------------------------------------------------------------------------
 # Device resolution
 # ---------------------------------------------------------------------------
@@ -421,8 +488,15 @@ def train(
     seed: int = 42,
     hidden_size: int = 64,
     n_layers: int = 2,
+    # BUG-26(c): optional candidate scorer training
+    candidate_events_path: str | None = None,
 ) -> None:
-    """Train SALTRDPolicyNet on oracle reinit dataset."""
+    """Train SALTRDPolicyNet on oracle reinit dataset.
+
+    If candidate_events_path is provided (output of build_candidate_dataset.py),
+    the candidate_score head is jointly supervised with candidate utility labels.
+    This satisfies BUG-26(c): candidate scoring becomes truly learned.
+    """
     t_start = time.time()
 
     # Seed
@@ -478,6 +552,19 @@ def train(
         num_workers=0,
         pin_memory=(dev.type == "cuda"),
     ) if len(val_ds) > 0 else None
+
+    # BUG-26(c): optional candidate scorer dataloader
+    candidate_loader = None
+    if candidate_events_path is not None:
+        try:
+            cand_ds = CandidateEventDataset(candidate_events_path, window_size=window_size)
+            if len(cand_ds) > 0:
+                candidate_loader = DataLoader(
+                    cand_ds, batch_size=batch_size, shuffle=True, num_workers=0,
+                )
+                print(f"[train_policy] candidate events: {len(cand_ds)} samples", flush=True)
+        except Exception as exc:
+            print(f"[train_policy] WARNING: could not load candidate events: {exc}", flush=True)
 
     # ------------------------------------------------------------------
     # Model
@@ -567,6 +654,26 @@ def train(
             total_train_loss += loss.item()
             n_train_batches += 1
 
+        # BUG-26(c): candidate scorer supervised training step
+        # Activates only when build_candidate_dataset.py output is available.
+        if candidate_loader is not None:
+            for x_w, _y_r, x_cand, y_cand in candidate_loader:
+                x_w = x_w.to(dev)
+                x_cand = x_cand.to(dev)
+                y_cand = y_cand.to(dev)
+                optimizer.zero_grad()
+                outputs_c = model(x_w, candidate_features=x_cand)
+                cand_score = outputs_c.get("candidate_score")
+                if cand_score is not None:
+                    cand_loss = lambda_candidate * torch.nn.functional.binary_cross_entropy_with_logits(
+                        cand_score, y_cand
+                    )
+                    cand_loss.backward()
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    optimizer.step()
+                    total_train_loss += cand_loss.item()
+                    n_train_batches += 1
+
         scheduler.step()
         avg_train_loss = total_train_loss / max(n_train_batches, 1)
 
@@ -628,7 +735,11 @@ def train(
                     # training run — candidate_features are never passed to forward()
                     # and OracleReinitDataset returns no per-candidate labels.
                     # Remove from trained_heads to stop misleading downstream code.
-                    "trained_heads": ["recovery_action"],
+                    "trained_heads": (
+                        ["recovery_action", "candidate_score"]
+                        if candidate_loader is not None
+                        else ["recovery_action"]
+                    ),
                     "oracle_source": str(oracle_path),
                     "git_commit": _git_commit(),
                     "created_at": datetime.utcnow().isoformat(),
@@ -657,7 +768,11 @@ def train(
     summary = {
         "model_family": "saltrd_policy",
         "feature_schema": FEATURE_SCHEMA,
-        "trained_heads": ["recovery_action"],  # BUG-26: candidate_score not supervised
+        "trained_heads": (
+            ["recovery_action", "candidate_score"]
+            if candidate_loader is not None
+            else ["recovery_action"]  # BUG-26: candidate_score not supervised
+        ),
         "oracle_source": str(oracle_path),
         "output_dir": str(output_dir),
         "checkpoint": str(ckpt_path),
