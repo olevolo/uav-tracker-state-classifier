@@ -1,0 +1,20 @@
+# OSTrack-256 baseline — no SALT-RD, no detector, pure tracker inference.
+# Used to isolate OSTrack backbone contribution from SALT-RD policy contribution.
+
+tracker:
+  name: ostrack_256
+  device: auto
+
+appearance_memory:
+  name: cosine_memory
+  enabled: false
+
+motion_predictor:
+  name: lstm_online
+  enabled: false
+
+saltrd:
+  enabled: false
+
+dataset: uav123
+seed: 42
