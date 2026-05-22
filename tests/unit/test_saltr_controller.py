@@ -7,6 +7,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+import torch
 
 from salt_r.actions import (
     ComputeAction,
@@ -74,6 +75,24 @@ def mock_model(features):
         },
         "confidence": 0.8,
     }
+
+
+class _SpyPolicy:
+    window_size = 4
+
+    def __init__(self) -> None:
+        self.calls = []
+
+    def __call__(self, x):
+        self.calls.append(x.detach().cpu().numpy())
+        return {
+            "risk_probs": {"false_confirmed": torch.tensor([0.1])},
+            "action_logits": {
+                "compute": torch.tensor([[1.0, 0.0, 0.0]]),
+                "recovery": torch.tensor([[1.0, 0.0, 0.0, 0.0]]),
+            },
+            "confidence": 0.8,
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -193,7 +212,32 @@ def test_wrong_feature_dim_returns_safe_noop():
 
 
 # ---------------------------------------------------------------------------
-# Test 9 — Model error → safe NOOP (not exception propagated)
+# Test 9 — Runtime uses the same temporal window shape as training
+# ---------------------------------------------------------------------------
+
+def test_policy_receives_left_padded_temporal_window():
+    spy = _SpyPolicy()
+    ctrl = SALTRDController(policy_net=spy)
+
+    for value in (1.0, 2.0, 3.0):
+        ctrl.step(_make_evidence(features=_make_features(value=value)))
+
+    assert spy.calls[-1].shape == (1, 4, 28)
+    window = spy.calls[-1][0]
+    assert np.allclose(window[0], 0.0)
+    assert np.allclose(window[1], 1.0)
+    assert np.allclose(window[2], 2.0)
+    assert np.allclose(window[3], 3.0)
+
+    ctrl.reset()
+    ctrl.step(_make_evidence(features=_make_features(value=9.0)))
+    window_after_reset = spy.calls[-1][0]
+    assert np.allclose(window_after_reset[:3], 0.0)
+    assert np.allclose(window_after_reset[3], 9.0)
+
+
+# ---------------------------------------------------------------------------
+# Test 10 — Model error → safe NOOP (not exception propagated)
 # ---------------------------------------------------------------------------
 
 def test_model_error_returns_safe_noop():
@@ -208,7 +252,7 @@ def test_model_error_returns_safe_noop():
 
 
 # ---------------------------------------------------------------------------
-# Test 10 — Default action is ComputeAction.FULL / RecoveryAction.NONE
+# Test 11 — Default action is ComputeAction.FULL / RecoveryAction.NONE
 # ---------------------------------------------------------------------------
 
 def test_default_action_fields():

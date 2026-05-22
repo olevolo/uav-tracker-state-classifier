@@ -1,4 +1,5 @@
 from __future__ import annotations
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Any
 import numpy as np
@@ -37,9 +38,12 @@ class SALTRDController:
         self._feature_schema = feature_schema
         self._reinit_confidence_threshold = reinit_confidence_threshold
         self._frame_idx = 0
+        self._window_size = int(getattr(policy_net, "window_size", 1) or 1)
+        self._feature_window: deque[np.ndarray] = deque(maxlen=max(1, self._window_size))
 
     def reset(self) -> None:
         self._frame_idx = 0
+        self._feature_window.clear()
 
     def step(self, evidence: EvidenceFrame) -> SALTRDDecision:
         """
@@ -62,15 +66,30 @@ class SALTRDController:
         if not np.isfinite(features).all():
             return self._safe_noop(reason="features_not_finite")
 
-        # Run model — convert numpy (28,) to tensor (1, 1, 28) for GRU forward
+        # Run model with the same left-padded temporal window used by train_policy.py.
+        # Passing a single frame here changes GRU behavior and invalidates calibrated
+        # action thresholds learned from 20-frame windows.
         try:
             import torch
-            x = torch.tensor(features, dtype=torch.float32).unsqueeze(0).unsqueeze(0)
+            window = self._build_feature_window(features)
+            x = torch.tensor(window, dtype=torch.float32).unsqueeze(0)
             output = self._policy_net(x)
         except Exception as e:  # noqa: BLE001
             return self._safe_noop(reason=f"model_error:{e}")
 
         return self._decode_output(output, evidence)
+
+    def _build_feature_window(self, features: np.ndarray) -> np.ndarray:
+        """Return a left-zero-padded ``(window_size, 28)`` feature window."""
+        feat = np.asarray(features, dtype=np.float32).copy()
+        self._feature_window.append(feat)
+
+        hist = list(self._feature_window)
+        pad_len = self._window_size - len(hist)
+        if pad_len > 0:
+            padding = [np.zeros_like(feat) for _ in range(pad_len)]
+            hist = padding + hist
+        return np.stack(hist[-self._window_size:], axis=0).astype(np.float32, copy=False)
 
     def _decode_output(self, output: dict[str, Any], evidence: EvidenceFrame) -> SALTRDDecision:
         """Decode raw model output dict into a SALTRDDecision."""
