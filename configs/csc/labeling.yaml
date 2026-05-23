@@ -1,0 +1,22 @@
+# Stage-1 CSC labeling thresholds.  See CSC.md for rationale.
+# All thresholds are paper-aligned defaults; tweak per dataset only
+# after a manual audit on a held-out subset.
+
+tau_confirmed_iou: 0.5
+tau_uncertain_iou: 0.2
+tau_lost_iou: 0.2
+tau_distractor_iou: 0.3
+
+# FALSE_CONFIRMED — paper's central novelty.  Requires both a low-IoU
+# *and* a high-confidence signal to fire.
+tau_fc_iou: 0.2
+tau_fc_conf: 0.65
+
+# Number of consecutive frames with IoU < tau_lost_iou before LOST is
+# committed (debouncing).  Lower = more LOST events, more sensitive.
+lost_min_consecutive_frames: 3
+
+# Auxiliary multi-label flags
+tau_low_conf: 0.40
+tau_fast_motion_norm: 0.06       # ||(dx, dy)|| / image_diagonal
+tau_scale_change_log: 0.30       # |log(area_t / area_{t-1})|
