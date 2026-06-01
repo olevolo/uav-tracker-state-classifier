@@ -1,0 +1,68 @@
+# Run 4 — V3 response-structure features (V2 + response_entropy + sm_*) TCN16 Stage1
+# Clean ablation vs Run 2: identical recipe (window=16, FCw=4.0, hard-neg sampling),
+# ONLY feature_version v2 -> v3 (16 -> 23 dims). Goal: close the FC-recall gap with
+# response-structure passthroughs. Labels carry the 7 V3 fields via
+# tools/join_v3_features_to_labels.py (v3fix_combined_v3).
+
+seed: 42
+device: cpu
+val_fraction: 0.15
+stratified_split: true
+training_stage: 1
+
+sampler_type: fc_source_balanced
+fc_per_batch: 18
+lasot_fc_cap: 0.56
+aerial_fc_floor: 0.39
+
+# Hard-negative sampling controls
+aerial_non_fc_floor: 16
+hard_scale_cc_floor: 8
+scale_pct_threshold: 75.0
+
+feature:
+  feature_version: v3
+  use_telemetry: true
+  use_bbox_dynamics: true
+  use_geometry_normalised: true
+  window_size: 16
+  clip_value: 8.0
+
+model:
+  kind: tcn
+  feature_dim: 23
+  hidden_dim: 64
+  num_layers: 4
+  dropout: 0.1
+  bidirectional: false
+  n_states: 4
+  enable_forecast_heads: false
+  forecast_horizon: 10
+  tcn:
+    kernel_size: 3
+    num_layers: 4
+    dilations: [1, 2, 4, 8]
+    hidden_dim: 64
+    dropout: 0.1
+
+loss:
+  state_weights: [1.0, 1.5, 2.0, 4.0]
+  risk_weight: 0.0
+  aux_weight: 0.3
+  use_focal: true
+  focal_gamma: 2.0
+
+optim:
+  lr: 5.0e-4
+  weight_decay: 1.0e-4
+  optimizer: adamw
+  epochs: 30
+  batch_size: 64
+  early_stopping_patience: 10
+  grad_clip: 1.0
+  use_balanced_sampler: true
+  scheduler: cosine
+  min_lr_ratio: 0.02
+
+labels_dir: outputs/csc_labels/sglatrack/v3fix_combined_v3
+output_dir: outputs/csc_training/sglatrack_r4_v3feat_tcn16_stage1

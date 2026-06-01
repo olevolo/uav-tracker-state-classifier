@@ -277,6 +277,7 @@ class UAV123Dataset:
         split: str = "test",
         attributes: set[str] | None = None,
         max_frames: int | None = None,
+        frame_stride: int = 1,
     ) -> None:
         if root is None:
             from csc_uav_tracking.paths import data_root
@@ -285,6 +286,7 @@ class UAV123Dataset:
         self.split = split
         self.attributes = attributes
         self.max_frames = max_frames
+        self.frame_stride = frame_stride
 
     @staticmethod
     def _resolve_root(root: Path) -> Path:
@@ -373,6 +375,11 @@ class UAV123Dataset:
                 bboxes = bboxes[: self.max_frames]
                 frame_numbers = frame_numbers[: self.max_frames]
 
+            # Apply frame_stride for subsampled variants (e.g. @10fps = stride 3).
+            if self.frame_stride > 1:
+                bboxes = bboxes[:: self.frame_stride]
+                frame_numbers = frame_numbers[:: self.frame_stride]
+
             if not frame_numbers:
                 continue
 
@@ -393,3 +400,19 @@ class UAV123Dataset:
             attributes=merged,
             max_frames=self.max_frames,
         )
+
+
+@DATASETS.register("uav123_10fps")
+class UAV123Dataset10fps(UAV123Dataset):
+    """UAV123 subsampled to ~10 fps (every 3rd frame).
+
+    Original UAV123 is recorded at ~30 fps.  Subsampling to every 3rd frame
+    simulates a lower frame-rate UAV tracking scenario with larger
+    inter-frame displacements — harder for trackers, expected to produce
+    higher FCR and longer FC episodes.
+    """
+
+    def __init__(self, root=None, split: str = "test",
+                 attributes=None, max_frames=None) -> None:
+        super().__init__(root=root, split=split, attributes=attributes,
+                         max_frames=max_frames, frame_stride=3)

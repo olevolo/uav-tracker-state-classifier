@@ -50,27 +50,28 @@ _MIN_SAMPLES = 1_000  # same guard as the calibrator itself
 # ---------------------------------------------------------------------------
 
 
-def _load_feature(telemetry_dir: Path, feature: str) -> np.ndarray:
-    """Collect all finite values of *feature* from every *.jsonl in dir."""
+def _load_feature(telemetry_dirs: list[Path], feature: str) -> np.ndarray:
+    """Collect all finite values of *feature* from every *.jsonl in dirs."""
     values: list[float] = []
-    for path in sorted(telemetry_dir.glob("*.jsonl")):
-        for line in path.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                row = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            v = row.get(feature)
-            if v is None:
-                continue
-            try:
-                fv = float(v)
-            except (TypeError, ValueError):
-                continue
-            if not (fv != fv) and fv == fv:  # basic NaN guard
-                values.append(fv)
+    for telemetry_dir in telemetry_dirs:
+        for path in sorted(telemetry_dir.glob("*.jsonl")):
+            for line in path.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                v = row.get(feature)
+                if v is None:
+                    continue
+                try:
+                    fv = float(v)
+                except (TypeError, ValueError):
+                    continue
+                if not (fv != fv) and fv == fv:  # basic NaN guard
+                    values.append(fv)
     arr = np.array(values, dtype=np.float64)
     # drop non-finite values
     return arr[np.isfinite(arr)]
@@ -107,9 +108,19 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--tracker", required=True, help="Tracker name (e.g. sglatrack).")
     p.add_argument(
         "--telemetry_dir",
-        required=True,
         type=Path,
-        help="Directory containing *.jsonl telemetry files.",
+        help="Single telemetry directory (backward compat). Use --telemetry_dirs for multi.",
+    )
+    p.add_argument(
+        "--telemetry_dirs",
+        nargs="+",
+        type=Path,
+        help="One or more telemetry directories to pool (e.g. GOT-10k + DTB70 + VisDrone).",
+    )
+    p.add_argument(
+        "--tag",
+        default=None,
+        help="Dataset tag for output filenames (auto-derived if omitted).",
     )
     p.add_argument(
         "--output_dir",
@@ -129,50 +140,69 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
 
-    telemetry_dir: Path = Path(args.telemetry_dir).resolve()
+    # Resolve telemetry directories
+    if args.telemetry_dirs:
+        telemetry_dirs = [Path(d).resolve() for d in args.telemetry_dirs]
+    elif args.telemetry_dir:
+        telemetry_dirs = [Path(args.telemetry_dir).resolve()]
+    else:
+        print("ERROR: provide --telemetry_dir or --telemetry_dirs", file=sys.stderr)
+        return 1
+
     output_dir: Path = Path(args.output_dir).resolve()
 
     # ------------------------------------------------------------------
     # UAV123 guard
     # ------------------------------------------------------------------
-    if "uav123" in str(telemetry_dir).lower():
-        print(
-            "ERROR: --telemetry_dir contains 'uav123'.  "
-            "UAV123 is the test benchmark; calibration must use a "
-            "non-test split (e.g. GOT-10k val, LaSOT train).",
-            file=sys.stderr,
-        )
+    for td in telemetry_dirs:
+        if "uav123" in str(td).lower():
+            print(
+                f"ERROR: telemetry_dir contains 'uav123': {td}. "
+                "UAV123 is the test benchmark; calibration must use a "
+                "non-test split (e.g. GOT-10k val, LaSOT train).",
+                file=sys.stderr,
+            )
+            return 1
+        if not td.exists():
+            print(f"ERROR: telemetry_dir not found: {td}", file=sys.stderr)
+            return 1
+
+    all_jsonl: list[Path] = []
+    for td in telemetry_dirs:
+        all_jsonl.extend(td.glob("*.jsonl"))
+    if not all_jsonl:
+        print(f"ERROR: no *.jsonl files found in {telemetry_dirs}", file=sys.stderr)
         return 1
 
-    if not telemetry_dir.exists():
-        print(f"ERROR: telemetry_dir not found: {telemetry_dir}", file=sys.stderr)
-        return 1
+    # Dataset tag: use --tag if given, else join auto-derived tags
+    if args.tag:
+        dataset_tag = args.tag
+    elif len(telemetry_dirs) == 1:
+        dataset_tag = _dataset_tag(telemetry_dirs[0])
+    else:
+        dataset_tag = "_".join(_dataset_tag(td) for td in telemetry_dirs)
 
-    jsonl_files = list(telemetry_dir.glob("*.jsonl"))
-    if not jsonl_files:
-        print(f"ERROR: no *.jsonl files in {telemetry_dir}", file=sys.stderr)
-        return 1
-
-    dataset_tag = _dataset_tag(telemetry_dir)
     tracker = args.tracker.lower()
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"Tracker : {tracker}")
     print(f"Dataset : {dataset_tag}")
-    print(f"Source  : {telemetry_dir}  ({len(jsonl_files)} files)")
+    for td in telemetry_dirs:
+        print(f"Source  : {td}")
+    print(f"Total   : {len(all_jsonl)} files")
     print(f"Features: {args.features}")
     print()
 
     manifest: dict = {
         "tracker": tracker,
         "dataset": dataset_tag,
-        "source_dir": str(telemetry_dir),
+        "source_dirs": [str(td) for td in telemetry_dirs],
         "features": {},
     }
 
     for feat in args.features:
         print(f"--- {feat} ---")
-        arr = _load_feature(telemetry_dir, feat)
+        arr = _load_feature(telemetry_dirs, feat)
 
         if arr.size == 0:
             print(f"  No data for '{feat}' in telemetry — skipping.")

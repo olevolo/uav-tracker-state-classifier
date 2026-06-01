@@ -1,22 +1,35 @@
 # Stage-1 CSC labeling thresholds.  See CSC.md for rationale.
 # All thresholds are paper-aligned defaults; tweak per dataset only
 # after a manual audit on a held-out subset.
+#
+# FALSE_CONFIRMED fires when (per CLAUDE.md spec):
+#   IoU < tau_lost_iou  (for >= lost_min_consecutive_frames frames)
+#   AND  calibrated_confidence >= tau_high_confidence
+#
+# Calibration is REQUIRED — raw confidence scales differ 50× across trackers
+# (SGLATrack ~0.018 vs OSTrack ~0.97). PercentileConfidenceCalibrator maps
+# raw values to [0,1] percentile rank so tau_high_confidence=0.65 is
+# meaningful (= top 35% per tracker's own distribution).
+#
+# APCE/PSR are NO LONGER part of the FC decision (audit 2026-05-29 showed
+# the prior OR-gate caused 80% of FC labels to violate confidence rule).
+# They remain available as CSC features — just not as label criteria.
 
+# Localization (IoU) thresholds
 tau_confirmed_iou: 0.5
 tau_uncertain_iou: 0.2
 tau_lost_iou: 0.2
 tau_distractor_iou: 0.3
-
-# FALSE_CONFIRMED — paper's central novelty.  Requires both a low-IoU
-# *and* a high-confidence signal to fire.
-tau_fc_iou: 0.2
-tau_fc_conf: 0.65
-
-# Number of consecutive frames with IoU < tau_lost_iou before LOST is
-# committed (debouncing).  Lower = more LOST events, more sensitive.
 lost_min_consecutive_frames: 3
 
-# Auxiliary multi-label flags
-tau_low_conf: 0.40
-tau_fast_motion_norm: 0.06       # ||(dx, dy)|| / image_diagonal
-tau_scale_change_log: 0.30       # |log(area_t / area_{t-1})|
+# Confidence threshold (must be calibrated to be meaningful)
+tau_high_confidence: 0.65       # calibrated confidence ≥ 0.65 → HIGH_CONFIDENCE
+
+# Auxiliary scene flags
+tau_fast_motion_norm: 0.06      # ||(dx, dy)|| / image_diagonal
+tau_scale_change_log: 0.30      # |log(area_t / area_{t-1})|
+
+# DEPRECATED — kept for backward compat with build_scene_state_labels.py
+# auto-override logic; no longer affects FC labeling decision.
+tau_high_apce: 30.0
+tau_high_psr: 8.0

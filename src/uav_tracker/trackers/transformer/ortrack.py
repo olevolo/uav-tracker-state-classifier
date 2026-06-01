@@ -195,6 +195,7 @@ def _make_hann(device: torch.device) -> torch.Tensor:
 # ---------------------------------------------------------------------------
 
 @TRACKERS.register("ortrack_deit")
+@TRACKERS.register("ortrack")  # alias — run_with_csc.py imports this path
 class ORTrackDeiT:
     """ORTrack DeiT-tiny — one-stream robust transformer tracker for UAV.
 
@@ -217,6 +218,7 @@ class ORTrackDeiT:
         self._z_tensor: torch.Tensor | None = None
         self._state: BBox | None = None
         self._is_stub: bool = True
+        self._update_enabled: bool = True  # CSCAdvisor gate (no-op: ORTrack has no internal template update)
 
     @property
     def _device(self) -> torch.device:
@@ -317,9 +319,13 @@ class ORTrackDeiT:
             score_map, out["size_map"], out["offset_map"]
         ).view(-1, 4)
 
-        _sm = torch.softmax(score_map.view(-1), dim=0)
-        _top3 = _sm.topk(3).values.sum()
-        confidence = float(_top3.clamp(0.0, 1.0).cpu())
+        # Confidence = post-Hann score-map peak (f_max), identical to the salrtd
+        # ORTrack adapter's `score_max` (ortrack.py:340) and to the statistic the
+        # ortrack_*_v2 calibrator was fit on. The previous top-3-softmax over the
+        # 16x16 map collapsed to a ~3/256=0.012 floor (softmax of a near-uniform
+        # [0,1] map), which the calibrator mapped to ~0 -> confidence head locked
+        # LOW -> FALSE_CONFIRMED impossible -> FCR identically 0 on UAV123.
+        confidence = float(max(0.0, min(1.0, f_max)))
 
         pred = (pred_boxes.mean(dim=0) * _SEARCH_SIZE / resize_factor).tolist()
         cx_pred, cy_pred, w_pred, h_pred = pred
@@ -359,6 +365,17 @@ class ORTrackDeiT:
     def reset(self) -> None:
         self._z_tensor = None
         self._state = None
+        self._update_enabled = True
+
+    def set_update_enabled(self, enabled: bool) -> None:
+        """CSCAdvisor gate. ORTrack has no internal template update — this is a no-op
+        but satisfies the _try_set_update_enabled() protocol in run_with_csc.py."""
+        self._update_enabled = bool(enabled)
+
+    @property
+    def capabilities(self):
+        from uav_tracker.trackers.capabilities import TrackerCapabilities
+        return TrackerCapabilities()  # all defaults: only can_reject_bbox + can_force_reinit
 
     @property
     def is_stub_mode(self) -> bool:

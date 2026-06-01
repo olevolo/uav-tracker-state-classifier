@@ -1,0 +1,64 @@
+# Sentinel sequences for regression detection across CSC eval runs.
+#
+# Each sentinel is a curated representative of a failure mode.  They are
+# evaluated explicitly on every full eval and compared against historical
+# baselines.  A sentinel that regresses (FCR rises >5pp, FC recall drops
+# >10pp) blocks acceptance of the new model.
+#
+# All sequences live in UAV123 unless noted.  These are NOT used for training
+# (per CLAUDE.md UAV123 = final-test only).
+#
+# Categories:
+#   subtle_fc:  Small / low-contrast targets where FC is hard to detect (S0201
+#               from UAVDT is the canonical aerial-low-contrast example, but
+#               we replicate the pattern in UAV123).
+#   classic_fc: Easy distractor swap, model should detect FC clearly.
+#   clean_aerial: No FC events expected; FCR > 0.5% = false-positive regression.
+#   recovery: Tracker should recover within 30 frames after FC.
+#
+# Baselines are populated from V1 paper model run (see project_csc_v2_results
+# memory). They are illustrative until full V3 run replaces them.
+
+dataset: uav123
+
+sentinels:
+  - name: bird-1
+    category: classic_fc
+    expected_n_fc: 25  # baseline, illustrative
+    expected_fc_recall: 0.55
+    note: "Bird tracking with bird distractors — should detect FC well"
+
+  - name: car-13
+    category: classic_fc
+    expected_n_fc: 40
+    expected_fc_recall: 0.50
+    note: "Multiple parked cars + camera motion — distractor-prone"
+
+  - name: drone-19
+    category: classic_fc
+    expected_n_fc: 15
+    expected_fc_recall: 0.45
+    note: "Drone vs sky — small target FC pattern"
+
+  - name: car-3
+    category: clean_aerial
+    expected_n_fc: 0
+    expected_fc_recall: 1.0   # no FC = trivial recall
+    fcr_max: 0.005           # >0.5% FC = false positive regression
+    note: "Clean aerial car — sentinel for false positives"
+
+  - name: person-5
+    category: subtle_fc
+    expected_n_fc: 30
+    expected_fc_recall: 0.30  # subtle FC, harder
+    note: "Person crowd scene — subtle FC via similar appearance"
+
+# Acceptance gates (applied after eval):
+#   max_fcr_increase: 0.05    # FCR can grow at most 5pp from baseline
+#   min_recall_decrease: -0.10  # recall can drop at most 10pp from baseline
+#   max_clean_fcr: 0.005       # clean_aerial FCR ceiling
+
+gates:
+  max_fcr_increase: 0.05
+  max_recall_decrease: 0.10
+  max_clean_fcr: 0.005

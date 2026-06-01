@@ -19,7 +19,16 @@ import numpy as np
 import torch
 
 from csc_lib.csc.config import CSCFeatureConfig, CSCTrainConfig
-from csc_lib.csc.features import FEATURE_DIM, _State, build_runtime_feature, build_runtime_feature_into
+from csc_lib.csc.features import (
+    FEATURE_DIM,
+    FEATURE_DIM_V2,
+    FEATURE_DIM_V3,
+    _State,
+    build_runtime_feature,
+    build_runtime_feature_into,
+    build_runtime_feature_into_v2,
+    build_runtime_feature_into_v3,
+)
 from csc_lib.csc.labeling.label_schema import (
     AUX_FLAGS,
     ConfidenceState,
@@ -36,6 +45,7 @@ log = logging.getLogger(__name__)
 class CSCPrediction:
     localization_probs: np.ndarray              # (3,)
     confidence_probs: np.ndarray                # (2,)
+    derived_probs: np.ndarray                   # (4,)  CC/CU/LA/FC softmax
     predicted_localization: int                 # LocalizationState
     predicted_confidence: int                   # ConfidenceState
     derived_state: int                          # DerivedState (paper-class)
@@ -58,14 +68,46 @@ class CSCControlPolicy:
     """Decision thresholds that map (loc, conf, aux, risk) → control hints."""
 
     risk_threshold: float = 0.5
+    tau_fc: float = 0.0        # min p(FC) to call FC (0 = off)
+    margin_fc: float = 0.0     # min gap p(FC) - p_second (0 = off)
+    # Fix options (without retraining):
+    freeze_on_la: bool = True  # if False → freeze only FC, not LA
+    fc_streak_required: int = 1  # N consecutive FC before freeze fires (1=immediate)
+
+    def resolve_derived(self, der_probs: "np.ndarray") -> int:
+        """Apply optional FC threshold/margin gate, return derived state index.
+
+        When tau_fc=0 (default): pure argmax — fast path.
+        When tau_fc>0: FC only if p_fc >= tau_fc AND gap >= margin_fc.
+        If gate not met, return best non-FC class (conservative fallback).
+        """
+        import numpy as _np
+        fc_idx = int(DerivedState.FALSE_CONFIRMED)
+
+        if self.tau_fc <= 0:
+            return int(_np.argmax(der_probs))
+
+        p_fc = float(der_probs[fc_idx])
+        sorted_idx = _np.argsort(der_probs)[::-1]
+        top_class = int(sorted_idx[0])
+        gap = float(der_probs[sorted_idx[0]]) - float(der_probs[sorted_idx[1]])
+
+        if top_class == fc_idx and (p_fc < self.tau_fc or gap < self.margin_fc):
+            # FC is top but gate not met → best non-FC class
+            non_fc_probs = _np.delete(der_probs, fc_idx)
+            best_non_fc = int(_np.argmax(non_fc_probs))
+            return best_non_fc if best_non_fc < fc_idx else best_non_fc + 1
+
+        return top_class
 
     def freeze_template(self, derived: int, risk: float) -> bool:
-        # Freeze when we believe the tracker is in a wrong-but-confident
-        # state, or simply lost.
-        return derived in (
-            int(DerivedState.LOST_AWARE),
-            int(DerivedState.FALSE_CONFIRMED),
-        ) or risk >= self.risk_threshold
+        fc = int(DerivedState.FALSE_CONFIRMED)
+        la = int(DerivedState.LOST_AWARE)
+        if self.freeze_on_la:
+            return derived in (la, fc) or risk >= self.risk_threshold
+        else:
+            # Fix: only freeze on FC, not LA — prevents over-freeze on lost sequences
+            return derived == fc or risk >= self.risk_threshold
 
     def expand_search(self, derived: int) -> bool:
         return derived in (
@@ -96,16 +138,47 @@ class CSCRuntime:
         self.policy = policy or CSCControlPolicy()
         self.device = device
 
+        # Actual input feature dim used by this checkpoint (may differ from current FEATURE_DIM
+        # if FEATURE_NAMES was extended after the checkpoint was trained).
+        try:
+            self._feat_dim: int = int(model.proj[0].weight.shape[1])
+        except Exception:
+            self._feat_dim = FEATURE_DIM
+
         T = feature_cfg.window_size
         # Step 4: persistent window — numpy for safe in-place shift (memmove), shared view for torch
-        self._window_np: np.ndarray = np.zeros((T, FEATURE_DIM), dtype=np.float32)
+        self._window_np: np.ndarray = np.zeros((T, self._feat_dim), dtype=np.float32)
         # Persistent torch view of the numpy array — no per-step allocation on CPU
         self._window_view: torch.Tensor = torch.from_numpy(self._window_np).unsqueeze(0)
         self._window_count: int = 0
-        # Step 5: pre-allocated feature buffer — no np.array allocation per frame
-        self._feat_buf: np.ndarray = np.zeros(FEATURE_DIM, dtype=np.float32)
         self._state = _State()
         self._traced_fn = None  # set by _jit_trace() after load
+        self._fc_streak: int = 0  # consecutive FC frames (for fc_streak_required gate)
+
+        # Feature-builder dispatch: V2 checkpoints replace slots 8/11/14/15 with
+        # log_aspect / edge_pressure / scale_smoothness / aspect_instability; V3
+        # appends 7 response-structure passthroughs (response_entropy, sm_*) after
+        # slot 15. Feeding the wrong layout to a model is a silent train/inference
+        # mismatch that collapses every prediction to CC. Select the builder that
+        # matches the checkpoint's feature_version.
+        self._feature_version = str(getattr(feature_cfg, "feature_version", "v1"))
+        if self._feature_version == "v3":
+            self._build_feature_into = build_runtime_feature_into_v3
+            self._builder_takes_extra = True
+            _buf_dim = FEATURE_DIM_V3
+        elif self._feature_version == "v2":
+            self._build_feature_into = build_runtime_feature_into_v2
+            self._builder_takes_extra = False
+            _buf_dim = FEATURE_DIM_V2
+        else:
+            self._build_feature_into = build_runtime_feature_into
+            self._builder_takes_extra = False
+            _buf_dim = FEATURE_DIM
+        # Step 5: pre-allocated feature buffer — sized to the builder's full output
+        # (>= the checkpoint's input dim; step() truncates to self._feat_dim).
+        self._feat_buf: np.ndarray = np.zeros(max(_buf_dim, self._feat_dim), dtype=np.float32)
+        log.info("CSCRuntime: feature builder = %s (feat_dim=%d, buf=%d)",
+                 self._feature_version, self._feat_dim, self._feat_buf.shape[0])
 
         self._cal_apce = None
         self._cal_psr = None
@@ -130,7 +203,7 @@ class CSCRuntime:
             self._traced_fn = None
             return
         T = self.feature_cfg.window_size
-        dummy = torch.zeros(1, T, FEATURE_DIM, dtype=torch.float32, device=self.device)
+        dummy = torch.zeros(1, T, self._feat_dim, dtype=torch.float32, device=self.device)
         try:
             # Temporarily disable grad on all parameters (required for tracing)
             orig_requires_grad = {n: p.requires_grad for n, p in self.model.named_parameters()}
@@ -231,6 +304,7 @@ class CSCRuntime:
         self._window_np.fill(0.0)
         self._window_count = 0
         self._state = _State()
+        self._fc_streak = 0
         if image_size is not None:
             self.image_size = image_size
 
@@ -241,6 +315,7 @@ class CSCRuntime:
         apce: Optional[float] = None,
         psr: Optional[float] = None,
         pred_bbox: Optional[tuple[float, float, float, float]] = None,
+        extra: Optional[dict] = None,
     ) -> CSCPrediction:
         import time
 
@@ -251,24 +326,42 @@ class CSCRuntime:
         apce_cal       = self._calibrate(apce,       self._cal_apce)
         psr_cal        = self._calibrate(psr,        self._cal_psr)
 
-        # Step 5: write feature into pre-allocated buffer (no np.array alloc)
-        build_runtime_feature_into(
-            self._feat_buf,
-            confidence=confidence_cal,
-            apce=apce_cal,
-            psr=psr_cal,
-            pred_bbox=pred_bbox,
-            image_size=self.image_size,
-            state=self._state,
-        )
+        # Step 5: write feature into pre-allocated buffer (no np.array alloc).
+        # Dispatches to the V1/V2/V3 layout to match the checkpoint (see __init__).
+        # V3 additionally consumes the raw telemetry row (response_entropy, sm_*)
+        # via ``extra``; V1/V2 builders do not accept it.
+        if self._builder_takes_extra:
+            self._build_feature_into(
+                self._feat_buf,
+                confidence=confidence_cal,
+                apce=apce_cal,
+                psr=psr_cal,
+                pred_bbox=pred_bbox,
+                image_size=self.image_size,
+                state=self._state,
+                extra=extra,
+            )
+        else:
+            self._build_feature_into(
+                self._feat_buf,
+                confidence=confidence_cal,
+                apce=apce_cal,
+                psr=psr_cal,
+                pred_bbox=pred_bbox,
+                image_size=self.image_size,
+                state=self._state,
+            )
         np.clip(self._feat_buf, -self.feature_cfg.clip_value, self.feature_cfg.clip_value, out=self._feat_buf)
+
+        # Truncate to model's actual input dim (supports checkpoints trained with fewer features)
+        feat_slice = self._feat_buf[:self._feat_dim]
 
         # Step 4: ring-buffer window update via numpy (safe memmove for overlapping shift)
         if self._window_count == 0:
-            self._window_np[:] = self._feat_buf      # first frame: fill all slots (causal pad)
+            self._window_np[:] = feat_slice      # first frame: fill all slots (causal pad)
         else:
             self._window_np[:-1] = self._window_np[1:]  # numpy memmove handles overlap correctly
-            self._window_np[-1]  = self._feat_buf
+            self._window_np[-1]  = feat_slice
         self._window_count += 1
 
         # _window_view is a persistent torch tensor sharing numpy memory — no copy on CPU
@@ -315,10 +408,28 @@ class CSCRuntime:
         loc_idx  = int(np.argmax(loc_probs_np))
         conf_idx = int(np.argmax(conf_probs_np))
 
-        derived = derive_state(LocalizationState(loc_idx), ConfidenceState(conf_idx))
+        # Derived state: ALWAYS use primary head_derived output (der_probs_np).
+        # The old derive_state(loc, conf) composition was a backward-compat
+        # workaround; head_derived has direct FC supervision and is more accurate.
+        # Optional FC gate (tau_fc/margin_fc) reduces false alarms.
+        derived = DerivedState(self.policy.resolve_derived(der_probs_np))
         fc = derived == DerivedState.FALSE_CONFIRMED
 
-        freeze    = self.policy.freeze_template(int(derived), risk_val)
+        # Track consecutive FC streak for fc_streak_required gate
+        if fc:
+            self._fc_streak += 1
+        else:
+            self._fc_streak = 0
+        streak_ok = self._fc_streak >= self.policy.fc_streak_required
+
+        # Apply freeze_template with streak gate:
+        # If streak_required > 1 and streak not met, treat FC as LA for freeze decision
+        if fc and not streak_ok:
+            _derived_for_freeze = int(DerivedState.LOST_AWARE)  # downgrade to LA
+        else:
+            _derived_for_freeze = int(derived)
+
+        freeze    = self.policy.freeze_template(_derived_for_freeze, risk_val)
         expand    = self.policy.expand_search(int(derived))
         redetect  = self.policy.redetect(int(derived))
         skip_update = freeze or fc
@@ -327,6 +438,7 @@ class CSCRuntime:
         return CSCPrediction(
             localization_probs=loc_probs_np,
             confidence_probs=conf_probs_np,
+            derived_probs=der_probs_np,
             predicted_localization=loc_idx,
             predicted_confidence=conf_idx,
             derived_state=int(derived),
@@ -389,9 +501,15 @@ def load_runtime(
     """
     blob = torch.load(checkpoint_path, map_location=device)
     cfg = CSCTrainConfig.from_dict(blob["config"])
-    cfg.model.feature_dim = FEATURE_DIM
-
     state_dict = blob["state_dict"]
+    # Use the actual input dim recorded in the checkpoint instead of the current FEATURE_DIM.
+    # This ensures checkpoints trained with fewer features (e.g. 11) still load correctly
+    # even after FEATURE_NAMES was later extended.
+    _ckpt_feat_dim = state_dict.get("proj.0.weight", state_dict.get("input_proj.weight"))
+    if _ckpt_feat_dim is not None:
+        cfg.model.feature_dim = int(_ckpt_feat_dim.shape[1])
+    else:
+        cfg.model.feature_dim = FEATURE_DIM
     if _is_legacy_checkpoint(state_dict):
         # V0 checkpoint: head_state (6-class) + head_risk (1-class binary).
         # Load via LegacyCSCGRU which remaps old heads to current CSCOutput.

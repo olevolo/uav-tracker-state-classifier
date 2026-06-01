@@ -18,6 +18,10 @@ class CSCFeatureConfig:
     # Normalisation: clip extreme outliers to keep gradients stable.
     clip_value: float = 8.0
 
+    # Feature builder version: "v1" (default) or "v2" (scale-context features).
+    # When "v2", training pipeline uses csc_lib.csc.features.build_sequence_features_v2.
+    feature_version: str = "v1"
+
 
 @dataclass
 class TCNConfig:
@@ -80,6 +84,8 @@ class CSCOptimConfig:
     early_stopping_patience: int = 6
     grad_clip: float = 1.0
     use_balanced_sampler: bool = True
+    scheduler: str = "none"        # "none" | "cosine" — per-epoch LR decay
+    min_lr_ratio: float = 0.02     # cosine eta_min = lr * min_lr_ratio
 
 
 @dataclass
@@ -94,6 +100,21 @@ class CSCTrainConfig:
     labels_dir: Optional[Path] = None
     output_dir: Optional[Path] = None
     val_fraction: float = 0.15
+    stratified_split: bool = False
+
+    # Sampler config (train2_v2+)
+    sampler_type: str = "derived_wrs"   # "derived_wrs" | "fc_source_balanced"
+    fc_per_batch: int = 20
+    lasot_fc_cap: float = 0.60
+    aerial_fc_floor: float = 0.30
+    # v3fix Run 1 hard-negative pools (drone CC with high scale = anti-shortcut)
+    aerial_non_fc_floor: int = 16        # batch slots for drone non-FC (low scale)
+    hard_scale_cc_floor: int = 8         # batch slots for drone non-FC with high log_area_ratio
+    scale_pct_threshold: float = 75.0    # percentile cutoff for "hard scale" CC
+
+    # Two-stage training (Stage 2 = forecast-only fine-tune on frozen Stage-1 encoder)
+    training_stage: int = 1              # 1 = joint, 2 = forecast heads only
+    stage1_checkpoint: Optional[Path] = None  # path to Stage-1 .pth; required when stage=2
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "CSCTrainConfig":
@@ -130,6 +151,8 @@ class CSCTrainConfig:
             early_stopping_patience=optim_d.get("early_stopping_patience", 6),
             grad_clip=optim_d.get("grad_clip", 1.0),
             use_balanced_sampler=optim_d.get("use_balanced_sampler", True),
+            scheduler=optim_d.get("scheduler", "none"),
+            min_lr_ratio=optim_d.get("min_lr_ratio", 0.02),
         )
 
         return cls(
@@ -142,6 +165,16 @@ class CSCTrainConfig:
             labels_dir=Path(d["labels_dir"]) if d.get("labels_dir") else None,
             output_dir=Path(d["output_dir"]) if d.get("output_dir") else None,
             val_fraction=d.get("val_fraction", 0.15),
+            stratified_split=d.get("stratified_split", False),
+            sampler_type=d.get("sampler_type", "derived_wrs"),
+            fc_per_batch=d.get("fc_per_batch", 20),
+            lasot_fc_cap=d.get("lasot_fc_cap", 0.60),
+            aerial_fc_floor=d.get("aerial_fc_floor", 0.30),
+            aerial_non_fc_floor=d.get("aerial_non_fc_floor", 16),
+            hard_scale_cc_floor=d.get("hard_scale_cc_floor", 8),
+            scale_pct_threshold=d.get("scale_pct_threshold", 75.0),
+            training_stage=d.get("training_stage", 1),
+            stage1_checkpoint=Path(d["stage1_checkpoint"]) if d.get("stage1_checkpoint") else None,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -150,4 +183,5 @@ class CSCTrainConfig:
         out = asdict(self)
         out["labels_dir"] = str(self.labels_dir) if self.labels_dir else None
         out["output_dir"] = str(self.output_dir) if self.output_dir else None
+        out["stage1_checkpoint"] = str(self.stage1_checkpoint) if self.stage1_checkpoint else None
         return out

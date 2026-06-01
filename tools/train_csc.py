@@ -19,7 +19,13 @@ import yaml  # noqa: E402
 
 from csc_lib.csc.config import CSCTrainConfig
 from csc_lib.csc.dataset import build_train_val_datasets
-from csc_lib.csc.features import FEATURE_DIM, FEATURE_NAMES
+from csc_lib.csc.features import (
+    FEATURE_DIM,
+    FEATURE_DIM_V2,
+    FEATURE_DIM_V3,
+    FEATURE_NAMES,
+    FEATURE_NAMES_V2,
+)
 from csc_lib.csc.labeling.label_schema import (
     AUX_FLAGS,
     DERIVED_NAMES,
@@ -163,28 +169,60 @@ def main() -> int:
     cfg = CSCTrainConfig.from_dict(raw_cfg)
     if not cfg.labels_dir or not cfg.output_dir:
         raise SystemExit("config must specify labels_dir and output_dir")
-    cfg.model.feature_dim = FEATURE_DIM
+    # Match feature_dim to the actual feature builder (V1 and V2 are both 16-dim today,
+    # but using the right constant makes future expansion safe).
+    feat_ver = (getattr(cfg.feature, "feature_version", "v1") or "v1").lower()
+    if feat_ver == "v3":
+        cfg.model.feature_dim = FEATURE_DIM_V3
+    elif feat_ver == "v2":
+        cfg.model.feature_dim = FEATURE_DIM_V2
+    else:
+        cfg.model.feature_dim = FEATURE_DIM
     cfg.output_dir.mkdir(parents=True, exist_ok=True)
 
     _set_seed(cfg.seed)
     device = cfg.device if (cfg.device != "cuda" or torch.cuda.is_available()) else "cpu"
     model_kind = getattr(cfg.model, "kind", "gru")
-    log.info("device=%s, feature_dim=%d, model_kind=%s", device, FEATURE_DIM, model_kind)
+    log.info("device=%s, feature_dim=%d, feature_version=%s, model_kind=%s",
+             device, cfg.model.feature_dim, feat_ver, model_kind)
 
     # ---- Dataset ----
     use_sampler = getattr(cfg.optim, "use_balanced_sampler", True)
+    stratified   = cfg.stratified_split
+    sampler_type = cfg.sampler_type
+    fc_per_batch = cfg.fc_per_batch
+    lasot_fc_cap = cfg.lasot_fc_cap
+    aerial_fc_floor = cfg.aerial_fc_floor
+    aerial_non_fc_floor = cfg.aerial_non_fc_floor
+    hard_scale_cc_floor = cfg.hard_scale_cc_floor
+    scale_pct_threshold = cfg.scale_pct_threshold
+    ds_fractions = getattr(cfg, "dataset_fractions", None)
+    fc_la_frac   = getattr(cfg, "fc_la_fraction", 0.18)
+
     if use_sampler:
         train_ds, val_ds, info, sampler = build_train_val_datasets(
             cfg.labels_dir, cfg.feature,
             val_fraction=cfg.val_fraction,
             seed=cfg.seed,
             return_sampler=True,
+            stratified_split=stratified,
+            dataset_fractions=ds_fractions,
+            fc_la_fraction=fc_la_frac,
+            sampler_type=sampler_type,
+            batch_size=cfg.optim.batch_size,
+            fc_per_batch=fc_per_batch,
+            lasot_fc_cap=lasot_fc_cap,
+            aerial_fc_floor=aerial_fc_floor,
+            aerial_non_fc_floor=aerial_non_fc_floor,
+            hard_scale_cc_floor=hard_scale_cc_floor,
+            scale_pct_threshold=scale_pct_threshold,
         )
     else:
         train_ds, val_ds, info = build_train_val_datasets(
             cfg.labels_dir, cfg.feature,
             val_fraction=cfg.val_fraction,
             seed=cfg.seed,
+            stratified_split=stratified,
         )
         sampler = None
 
@@ -208,11 +246,16 @@ def main() -> int:
     ))
 
     if sampler is not None:
-        train_loader = DataLoader(
-            train_ds, batch_size=cfg.optim.batch_size,
-            sampler=sampler, num_workers=0,
-        )
-        log.info("using WeightedRandomSampler (balanced classes)")
+        from csc_lib.csc.dataset import FCSourceBalancedSampler as _FCSBS
+        if isinstance(sampler, _FCSBS):
+            # FCSourceBalancedSampler is a batch sampler — yields full batches
+            train_loader = DataLoader(train_ds, batch_sampler=sampler, num_workers=0)
+        else:
+            train_loader = DataLoader(
+                train_ds, batch_size=cfg.optim.batch_size,
+                sampler=sampler, num_workers=0,
+            )
+        log.info("using %s", type(sampler).__name__)
     else:
         train_loader = DataLoader(
             train_ds, batch_size=cfg.optim.batch_size,
@@ -222,6 +265,27 @@ def main() -> int:
 
     model = build_model(cfg.model).to(device)
     log.info("%s params=%d", model_kind.upper(), model.num_params)
+
+    # ---- Two-stage training: Stage 2 loads Stage-1 weights, freezes encoder ----
+    training_stage = getattr(cfg, "training_stage", 1)
+    if training_stage == 2:
+        stage1_ckpt = getattr(cfg, "stage1_checkpoint", None)
+        if stage1_ckpt is None:
+            raise ValueError("training_stage=2 requires stage1_checkpoint in config")
+        blob = torch.load(stage1_ckpt, map_location=device, weights_only=False)
+        missing, unexpected = model.load_state_dict(blob["state_dict"], strict=False)
+        log.info(
+            "Stage-2: loaded Stage-1 weights from %s  (missing=%d, unexpected=%d)",
+            stage1_ckpt, len(missing), len(unexpected),
+        )
+        # Freeze everything except the three forecast heads
+        _forecast_head_names = {"failure_next_10_head", "false_confirmed_next_10_head", "lost_aware_next_10_head"}
+        for name, param in model.named_parameters():
+            top = name.split(".")[0]
+            param.requires_grad = top in _forecast_head_names
+        frozen = sum(1 for p in model.parameters() if not p.requires_grad)
+        trainable = sum(1 for p in model.parameters() if p.requires_grad)
+        log.info("Stage-2 freeze: frozen=%d param tensors, trainable=%d param tensors", frozen, trainable)
 
     enable_forecast = bool(getattr(cfg.model, "enable_forecast_heads", False))
     if enable_forecast:
@@ -266,7 +330,21 @@ def main() -> int:
     # derived_loss is PRIMARY (direct supervision on the 4-class paper state).
     # loc_loss and conf_loss are AUXILIARY (strengthen the shared encoder).
     #   weights: CORRECT_CONFIRMED / CORRECT_UNCERTAIN / LOST_AWARE / FALSE_CONFIRMED
-    der_weights  = torch.tensor([1.0, 1.2, 2.0, 2.5], device=device)
+    # Reads cfg.loss.state_weights — was hardcoded (CRITICAL BUG fixed 2026-05-30).
+    cfg_state_weights = getattr(cfg.loss, "state_weights", None)
+    if cfg_state_weights and len(cfg_state_weights) == NUM_DERIVED_STATES:
+        der_weights = torch.tensor(list(cfg_state_weights), dtype=torch.float32, device=device)
+        log.info("derived state_weights from config: %s", list(cfg_state_weights))
+    else:
+        # 4-class default; we DELIBERATELY do not silently fall back to a 6-class default if
+        # the config provided a different length — fail loud instead.
+        if cfg_state_weights and len(cfg_state_weights) != NUM_DERIVED_STATES:
+            raise SystemExit(
+                f"cfg.loss.state_weights has length {len(cfg_state_weights)}, "
+                f"expected {NUM_DERIVED_STATES}: {cfg_state_weights}"
+            )
+        der_weights = torch.tensor([1.0, 1.2, 2.0, 2.5], device=device)
+        log.info("derived state_weights default: [1.0, 1.2, 2.0, 2.5] (no config override)")
     loc_weights  = torch.tensor([1.0, 1.5, 2.0],       device=device)  # STABLE/UNCERTAIN/LOST
     conf_weights = torch.tensor([1.0, 1.5],             device=device)  # LOW/HIGH
 
@@ -297,10 +375,22 @@ def main() -> int:
             pos_weight=forecast_pos_weights["lost"], reduction="none"
         )
 
+    _trainable_params = [p for p in model.parameters() if p.requires_grad]
     if cfg.optim.optimizer.lower() == "adamw":
-        optim = torch.optim.AdamW(model.parameters(), lr=cfg.optim.lr, weight_decay=cfg.optim.weight_decay)
+        optim = torch.optim.AdamW(_trainable_params, lr=cfg.optim.lr, weight_decay=cfg.optim.weight_decay)
     else:
-        optim = torch.optim.Adam(model.parameters(), lr=cfg.optim.lr, weight_decay=cfg.optim.weight_decay)
+        optim = torch.optim.Adam(_trainable_params, lr=cfg.optim.lr, weight_decay=cfg.optim.weight_decay)
+
+    sched_kind = getattr(cfg.optim, "scheduler", "none").lower()
+    if sched_kind == "cosine":
+        eta_min = cfg.optim.lr * getattr(cfg.optim, "min_lr_ratio", 0.02)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optim, T_max=cfg.optim.epochs, eta_min=eta_min
+        )
+        log.info("LR scheduler: CosineAnnealingLR T_max=%d lr=%.2e eta_min=%.2e",
+                 cfg.optim.epochs, cfg.optim.lr, eta_min)
+    else:
+        scheduler = None
 
     log_path = cfg.output_dir / "train_log.jsonl"
     log_fh = open(log_path, "w")
@@ -452,8 +542,12 @@ def main() -> int:
                 conf_y.reshape(-1),
             )
             l_aux = aux_loss_fn(out.aux_logits, a)
-            # derived is PRIMARY (1.0), loc and conf are AUXILIARY (0.3 each)
-            loss = l_derived + 0.3 * l_loc + 0.3 * l_conf + cfg.loss.aux_weight * l_aux
+            # Stage 1 (joint): derived PRIMARY + loc/conf AUXILIARY
+            # Stage 2: skip classification loss — encoder is frozen, only forecast heads train
+            if training_stage == 2:
+                loss = torch.tensor(0.0, device=device)
+            else:
+                loss = l_derived + 0.3 * l_loc + 0.3 * l_conf + cfg.loss.aux_weight * l_aux
 
             # V3 forecast losses (masked BCE with pos_weight)
             if enable_forecast and out.failure_next_10_logit is not None:
@@ -487,6 +581,9 @@ def main() -> int:
             ep_loss += loss.item() * bs
             n_seen += bs
         train_loss = ep_loss / max(1, n_seen)
+        current_lr = optim.param_groups[0]["lr"]
+        if scheduler is not None:
+            scheduler.step()
         metrics = _evaluate()
         epoch_time = time.perf_counter() - t0
 
@@ -498,6 +595,7 @@ def main() -> int:
         log_row = {
             "epoch": epoch,
             "train_loss": train_loss,
+            "lr":                current_lr,
             "val_derived_f1":    metrics.get("derived_macro_f1", 0.0),
             "val_loc_f1":        metrics.get("loc_macro_f1", 0.0),
             "val_conf_f1":       metrics.get("conf_macro_f1", 0.0),
@@ -516,11 +614,10 @@ def main() -> int:
                 "val_lost_n10_auroc":    metrics.get("lost_aware_next_10_auroc", float("nan")),
                 "val_lost_n10_auprc":    metrics.get("lost_aware_next_10_auprc", float("nan")),
             })
-        log_fh.write(json.dumps(log_row) + "\n")
-        log_fh.flush()
+        log_fh.flush()  # placeholder — actual write happens after sel is computed below
         log.info(
             "ep %d/%d | loss=%.4f | derivedF1=%.3f locF1=%.3f confF1=%.3f "
-            "AUROC=%.3f AUPRC=%.3f FC_recall=%.3f LOST_recall=%.3f | %.1fs",
+            "AUROC=%.3f AUPRC=%.3f FC_recall=%.3f LOST_recall=%.3f | lr=%.2e | %.1fs",
             epoch, epochs, train_loss,
             metrics.get("derived_macro_f1", 0.0),
             metrics.get("loc_macro_f1", 0.0),
@@ -528,6 +625,7 @@ def main() -> int:
             metrics.get("failure_auroc", 0.0),
             metrics.get("failure_auprc", 0.0),
             fc_recall, lost_recall,
+            current_lr,
             epoch_time,
         )
         if enable_forecast:
@@ -538,9 +636,19 @@ def main() -> int:
                 metrics.get("lost_aware_next_10_auprc", float("nan")),
             )
 
-        # Selection: V2 uses derived_F1 + failure_AUPRC (50/50);
-        # V3 uses 4-component blend: 0.4*derived_F1 + 0.3*fc_n10 + 0.2*lost_n10 + 0.1*failure_n10
-        if enable_forecast:
+        # Selection score depends on training stage:
+        # Stage 2 (forecast-only): 0.4*fc_n10 + 0.3*failure_n10 + 0.3*lost_n10
+        # Stage 1 joint with forecast: 0.4*F1 + 0.3*fc_n10 + 0.2*lost_n10 + 0.1*failure_n10
+        # Stage 1 no forecast: 0.3*F1 + 0.3*fail_auprc + 0.25*fc_f1 + 0.15*fc_recall_p
+        if training_stage == 2:
+            def _safe(x):
+                return 0.0 if (x is None or (isinstance(x, float) and np.isnan(x))) else float(x)
+            sel = (
+                0.4 * _safe(metrics.get("false_confirmed_next_10_auprc", 0.0))
+                + 0.3 * _safe(metrics.get("failure_next_10_auprc", 0.0))
+                + 0.3 * _safe(metrics.get("lost_aware_next_10_auprc", 0.0))
+            )
+        elif enable_forecast:
             def _safe(x):
                 return 0.0 if (x is None or (isinstance(x, float) and np.isnan(x))) else float(x)
             sel = (
@@ -550,14 +658,35 @@ def main() -> int:
                 + 0.1 * _safe(metrics.get("failure_next_10_auprc", 0.0))
             )
         else:
-            sel = 0.5 * metrics.get("derived_macro_f1", 0.0) + 0.5 * metrics.get("failure_auprc", 0.0)
+            # train2_v2+: balanced selection — F1 guards CC quality,
+            # failure_auprc guards ranking, fc_f1 guards FC precision+recall,
+            # fc_recall_p = fc_recall × clamp(fc_precision / 0.40, 0, 1)
+            #   rewards recall only when precision is acceptable (>= 40%)
+            def _safe(x):
+                return 0.0 if (x is None or (isinstance(x, float) and np.isnan(x))) else float(x)
+            fc_per = der_per.get("FALSE_CONFIRMED", {})
+            fc_prec = _safe(fc_per.get("precision", 0.0))
+            fc_f1   = _safe(fc_per.get("f1", 0.0))
+            fc_recall_p = _safe(fc_recall) * min(1.0, fc_prec / 0.40)
+            sel = (
+                0.30 * _safe(metrics.get("derived_macro_f1", 0.0))
+                + 0.30 * _safe(metrics.get("failure_auprc", 0.0))
+                + 0.25 * fc_f1
+                + 0.15 * fc_recall_p
+            )
+        # Write log row NOW (after sel is computed) so selection_score is included
+        log_row["selection_score"] = round(sel, 6)
+        log_fh.write(json.dumps(log_row) + "\n")
+        log_fh.flush()
         _save_ckpt(last_path, epoch, metrics)
         if sel > best_metric:
             best_metric = sel
             patience = 0
             _save_ckpt(best_path, epoch, metrics)
+            log.info("  --> new best: sel=%.4f", sel)
         else:
             patience += 1
+            log.info("  patience %d/%d (best=%.4f at prev ep)", patience, cfg.optim.early_stopping_patience, best_metric)
             if patience >= cfg.optim.early_stopping_patience:
                 log.info("early stopping at epoch %d", epoch)
                 break

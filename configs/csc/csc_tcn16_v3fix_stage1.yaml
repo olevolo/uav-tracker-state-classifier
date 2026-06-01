@@ -1,0 +1,63 @@
+# V3-fix TCN16 Stage1 — full classification training with new 16-dim feature set
+# Features redesigned: edge_contact, log_w/h/area_ratio_to_init, motion_angle_change, conf_ema_trend
+# Training data: LaSOT + UAVDTSoT + VisDrone-SOT + DTB70 (407k frames, 5.85% FC)
+
+seed: 42
+device: cpu
+val_fraction: 0.15
+stratified_split: true
+training_stage: 1
+
+sampler_type: fc_source_balanced
+# Updated 2026-05-29 after labels relabel (FC% 5.57% → 1.62%):
+# fc_per_batch lowered from 20→18, lasot cap tightened, aerial floor raised.
+# Effective composition: lasot_fc=10  aerial_fc=7  other_fc=1  hard_cc=8  aerial_cc=16  rest=22
+fc_per_batch: 18
+lasot_fc_cap: 0.56
+aerial_fc_floor: 0.39
+
+feature:
+  use_telemetry: true
+  use_bbox_dynamics: true
+  use_geometry_normalised: true
+  window_size: 16
+  clip_value: 8.0
+
+model:
+  kind: tcn
+  feature_dim: 16
+  hidden_dim: 64
+  num_layers: 4
+  dropout: 0.1
+  bidirectional: false
+  n_states: 4
+  enable_forecast_heads: false
+  forecast_horizon: 10
+  tcn:
+    kernel_size: 3
+    num_layers: 4
+    dilations: [1, 2, 4, 8]
+    hidden_dim: 64
+    dropout: 0.1
+
+loss:
+  state_weights: [1.0, 1.5, 2.0, 4.0]
+  risk_weight: 0.0
+  aux_weight: 0.3
+  use_focal: true
+  focal_gamma: 2.0
+
+optim:
+  lr: 5.0e-4              # was 1.0e-3 — constant 1e-3 caused ep2-peak + oscillation
+  weight_decay: 1.0e-4
+  optimizer: adamw
+  epochs: 30
+  batch_size: 64
+  early_stopping_patience: 10   # was 6 — cosine improves slowly; give it room
+  grad_clip: 1.0
+  use_balanced_sampler: true
+  scheduler: cosine      # per-epoch CosineAnnealingLR — settles instead of bouncing
+  min_lr_ratio: 0.02
+
+labels_dir: outputs/csc_labels/sglatrack/v3fix_combined
+output_dir: outputs/csc_training/sglatrack_v3fix_tcn16_stage1

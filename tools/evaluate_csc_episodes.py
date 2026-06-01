@@ -463,6 +463,9 @@ def main() -> int:
 
         pred_rows = pred_groups.get(seq_key)
         if pred_rows is None:
+            # Fallback: predictions may be keyed by bare sequence name (no dataset/ prefix)
+            pred_rows = pred_groups.get(seq_key.split("/")[-1])
+        if pred_rows is None:
             print(f"  WARNING: no predictions for {seq_key} — skipping.", flush=True)
             continue
 

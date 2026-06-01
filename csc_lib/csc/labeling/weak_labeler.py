@@ -36,9 +36,9 @@ class LabelingThresholds:
     lost_min_consecutive_frames: int = 3
 
     # Confidence (telemetry) -----------------------------------------
-    # Default tuned for SGLATrack-DeiT top-3 softmax mass (~0.01–0.99).
-    # See CSC.md "Uncalibrated tracker confidence" anti-pattern.
-    tau_high_confidence: float = 0.30
+    # Applies only when APCE and PSR are unavailable.
+    # When calibrators are active, use 0.65 (= top 35% → HIGH_CONFIDENCE).
+    tau_high_confidence: float = 0.65
 
     # APCE / PSR thresholds: two sets of defaults.
     # Raw (uncalibrated): SGLATrack APCE ≈ 0–300, PSR ≈ 0–15000.
@@ -104,18 +104,12 @@ def label_frame(
         loc = LocalizationState.UNCERTAIN
 
     # ----- Axis 2 — confidence state (telemetry only) ----------------
-    # Use whichever signal is available, in this order: APCE > PSR > confidence.
-    # APCE/PSR are tracker-agnostic sharp-peak indicators; raw `confidence`
-    # is often uncalibrated (see CSC.md anti-pattern).
-    conf_signal = None
-    if apce is not None:
-        conf_signal = float(apce >= th.tau_high_apce)
-    elif psr is not None:
-        conf_signal = float(psr >= th.tau_high_psr)
-    elif confidence is not None:
-        conf_signal = float(confidence >= th.tau_high_confidence)
-
-    if conf_signal is not None and conf_signal > 0.5:
+    # Per CLAUDE.md spec: confidence is REQUIRED for HIGH_CONFIDENCE.
+    # Calibration handles per-tracker scale (see feedback_csc_calibration_bugs).
+    # APCE/PSR remain available as features in FrameLabel — they MUST NOT
+    # override confidence at the label-decision layer (audit 2026-05-29
+    # found 80% of FC labels violated this rule under the prior OR-gate).
+    if confidence is not None and confidence >= th.tau_high_confidence:
         conf = ConfidenceState.HIGH_CONFIDENCE
     else:
         conf = ConfidenceState.LOW_CONFIDENCE

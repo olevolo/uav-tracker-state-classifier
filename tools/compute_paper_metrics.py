@@ -353,8 +353,246 @@ def compute_uur_proxy(states_rows: list[dict]) -> float:
 
 
 # ---------------------------------------------------------------------------
+# Threshold-aware metrics (AUPRC + operating points)
+# ---------------------------------------------------------------------------
+
+
+def _compute_auprc(scores: np.ndarray, labels: np.ndarray) -> float:
+    """Average-precision (AUPRC) for binary labels via numpy only.
+
+    No sklearn dep — uses precision-recall trapezoid from sorted scores.
+    """
+    if labels.sum() == 0:
+        return float("nan")
+    # Sort by score descending
+    order = np.argsort(-scores, kind="stable")
+    y = labels[order].astype(np.float64)
+    cum_tp = np.cumsum(y)
+    cum_fp = np.cumsum(1.0 - y)
+    n_pos = float(y.sum())
+    recall = cum_tp / max(n_pos, 1.0)
+    precision = cum_tp / np.maximum(cum_tp + cum_fp, 1.0)
+    # AP = sum over k of (recall_k - recall_{k-1}) * precision_k
+    delta_recall = np.diff(recall, prepend=0.0)
+    return float((delta_recall * precision).sum())
+
+
+def _recall_at_max_fpr(
+    scores: np.ndarray,
+    labels: np.ndarray,
+    max_fpr: float,
+) -> tuple[float, float]:
+    """Largest recall achievable while FPR <= max_fpr.
+
+    Returns (recall, threshold).  FPR = false-positive rate over the negatives.
+    """
+    if labels.sum() == 0 or (1 - labels).sum() == 0:
+        return float("nan"), float("nan")
+    order = np.argsort(-scores, kind="stable")
+    y = labels[order].astype(np.float64)
+    s_sorted = scores[order]
+    cum_tp = np.cumsum(y)
+    cum_fp = np.cumsum(1.0 - y)
+    n_pos = float(y.sum())
+    n_neg = float((1 - y).sum())
+    fpr = cum_fp / max(n_neg, 1.0)
+    recall = cum_tp / max(n_pos, 1.0)
+    valid = fpr <= max_fpr
+    if not valid.any():
+        return 0.0, float(s_sorted[0]) if len(s_sorted) else float("nan")
+    last = int(np.where(valid)[0].max())
+    return float(recall[last]), float(s_sorted[last])
+
+
+def compute_threshold_metrics(
+    states_rows: list[dict],
+    gt_states: np.ndarray,
+) -> dict:
+    """Threshold-aware metrics on CSC outputs vs GT-derived states.
+
+    Uses:
+      - p_fc   from row['derived_probs'][3] if available, else row['risk_score']
+      - p_lost from row['derived_probs'][2] if available, else row['risk_score']
+
+    GT positives:
+      - FC_pos: gt_state == FALSE_CONFIRMED (idx 3)
+      - LOST_pos: gt_state == LOST_AWARE (idx 2)
+
+    Returns dict with keys:
+      fc_auprc, fc_recall_at_fpr01, fc_recall_at_fpr03, fc_threshold_at_fpr01
+      lost_auprc, lost_recall_at_fpr01, lost_recall_at_fpr03
+      n_fc_gt, n_lost_gt, source ('derived_probs' | 'risk_score')
+    """
+    p_fc: list[float] = []
+    p_lost: list[float] = []
+    gt_aligned: list[int] = []
+    has_probs = False
+
+    for row in states_rows:
+        if row.get("init"):
+            continue
+        t = int(row.get("frame_idx", -1))
+        if not (0 <= t < len(gt_states)):
+            continue
+        dp = row.get("derived_probs")
+        if dp is not None and isinstance(dp, list) and len(dp) == 4:
+            p_fc.append(float(dp[3]))
+            p_lost.append(float(dp[2]))
+            has_probs = True
+        else:
+            r = float(row.get("risk_score", 0.0))
+            p_fc.append(r)
+            p_lost.append(r)
+        gt_aligned.append(int(gt_states[t]))
+
+    if not p_fc:
+        return {
+            "fc_auprc": float("nan"),
+            "fc_recall_at_fpr01": float("nan"),
+            "fc_recall_at_fpr03": float("nan"),
+            "lost_auprc": float("nan"),
+            "lost_recall_at_fpr01": float("nan"),
+            "lost_recall_at_fpr03": float("nan"),
+            "n_fc_gt": 0,
+            "n_lost_gt": 0,
+            "source": "none",
+        }
+
+    p_fc_arr = np.asarray(p_fc, dtype=np.float64)
+    p_lost_arr = np.asarray(p_lost, dtype=np.float64)
+    gt_arr = np.asarray(gt_aligned, dtype=np.int64)
+
+    fc_label = (gt_arr == FALSE_CONFIRMED_IDX).astype(np.int64)
+    lost_label = (gt_arr == 2).astype(np.int64)  # LOST_AWARE idx
+
+    fc_auprc = _compute_auprc(p_fc_arr, fc_label)
+    fc_r_01, fc_thr_01 = _recall_at_max_fpr(p_fc_arr, fc_label, 0.01)
+    fc_r_03, _ = _recall_at_max_fpr(p_fc_arr, fc_label, 0.03)
+
+    lost_auprc = _compute_auprc(p_lost_arr, lost_label)
+    lost_r_01, _ = _recall_at_max_fpr(p_lost_arr, lost_label, 0.01)
+    lost_r_03, _ = _recall_at_max_fpr(p_lost_arr, lost_label, 0.03)
+
+    return {
+        "fc_auprc": fc_auprc,
+        "fc_recall_at_fpr01": fc_r_01,
+        "fc_recall_at_fpr03": fc_r_03,
+        "fc_threshold_at_fpr01": fc_thr_01,
+        "lost_auprc": lost_auprc,
+        "lost_recall_at_fpr01": lost_r_01,
+        "lost_recall_at_fpr03": lost_r_03,
+        "n_fc_gt": int(fc_label.sum()),
+        "n_lost_gt": int(lost_label.sum()),
+        "source": "derived_probs" if has_probs else "risk_score",
+    }
+
+
+# ---------------------------------------------------------------------------
 # Sequence-level computation
 # ---------------------------------------------------------------------------
+
+
+def _write_sentinel_report(
+    sent_cfg: dict,
+    seq_rows: list[dict],
+    out_dir: Path,
+    tracker: str,
+    dataset: str,
+) -> None:
+    """Write sentinel_report.md flagging regressions vs expected baselines.
+
+    Sentinel YAML schema (see configs/csc/sentinels.yaml):
+      sentinels: [{name, category, expected_n_fc, expected_fc_recall,
+                   note, fcr_max?}]
+      gates: {max_fcr_increase, max_recall_decrease, max_clean_fcr}
+    """
+    sentinels = sent_cfg.get("sentinels", [])
+    gates = sent_cfg.get("gates", {})
+    max_fcr_inc = float(gates.get("max_fcr_increase", 0.05))
+    max_recall_dec = float(gates.get("max_recall_decrease", 0.10))
+    max_clean_fcr = float(gates.get("max_clean_fcr", 0.005))
+
+    by_seq = {row["sequence"]: row for row in seq_rows}
+    fail_count = 0
+    rows_for_table: list[dict] = []
+    for sent in sentinels:
+        name = sent["name"]
+        cat = sent.get("category", "")
+        exp_recall = float(sent.get("expected_fc_recall", float("nan")))
+        exp_n_fc = int(sent.get("expected_n_fc", 0))
+        custom_fcr_max = sent.get("fcr_max")
+
+        row = by_seq.get(name)
+        if row is None:
+            rows_for_table.append({
+                "name": name, "category": cat, "status": "MISSING",
+                "fcr": None, "fc_recall": None, "n_fc": 0, "expected_recall": exp_recall,
+                "note": sent.get("note", ""),
+            })
+            fail_count += 1
+            continue
+
+        cur_fcr = float(row.get("fcr", 0.0))
+        cur_recall = row.get("fc_recall_at_fpr03")
+        cur_n_fc = int(row.get("n_fc_frames", 0))
+
+        flags: list[str] = []
+        # Clean-aerial regression: FCR must stay below floor
+        ceiling = float(custom_fcr_max) if custom_fcr_max is not None else None
+        if cat == "clean_aerial":
+            if ceiling is None:
+                ceiling = max_clean_fcr
+            if cur_fcr > ceiling:
+                flags.append(f"FCR {cur_fcr:.4f} > clean ceiling {ceiling:.4f}")
+        # FC recall regression
+        if cur_recall is not None and not math.isnan(exp_recall):
+            if (exp_recall - float(cur_recall)) > max_recall_dec:
+                flags.append(
+                    f"FC recall {cur_recall:.3f} dropped > {max_recall_dec:.2f} from expected {exp_recall:.3f}"
+                )
+        # FC count too high (only for non-clean)
+        if cat != "clean_aerial" and exp_n_fc > 0 and cur_n_fc > exp_n_fc * (1.0 + max_fcr_inc * 10):
+            flags.append(
+                f"n_fc={cur_n_fc} >> expected {exp_n_fc} (+{max_fcr_inc*10:.0%})"
+            )
+
+        status = "OK" if not flags else "FAIL"
+        if flags:
+            fail_count += 1
+        rows_for_table.append({
+            "name": name, "category": cat, "status": status,
+            "fcr": cur_fcr, "fc_recall": cur_recall, "n_fc": cur_n_fc,
+            "expected_recall": exp_recall, "flags": flags,
+            "note": sent.get("note", ""),
+        })
+
+    # Markdown report
+    out_path = out_dir / "sentinel_report.md"
+    with open(out_path, "w") as fh:
+        fh.write(f"# Sentinel Regression Report — {tracker} on {dataset}\n\n")
+        fh.write(f"**Total sentinels:** {len(sentinels)}  \n")
+        fh.write(f"**Failed:** {fail_count}  \n")
+        fh.write(f"**Gates:** max_fcr_increase={max_fcr_inc}  max_recall_decrease={max_recall_dec}  max_clean_fcr={max_clean_fcr}  \n\n")
+
+        fh.write("| Status | Sentinel | Category | FCR | FC recall@FPR3% | n_fc | Expected recall | Flags |\n")
+        fh.write("|--------|----------|----------|-----|------------------|------|------------------|-------|\n")
+        for r in rows_for_table:
+            recall_str = f"{r['fc_recall']:.3f}" if r["fc_recall"] is not None else "—"
+            fcr_str = f"{r['fcr']:.4f}" if r["fcr"] is not None else "—"
+            exp_recall_str = f"{r['expected_recall']:.2f}" if not (r['expected_recall'] is None or (isinstance(r['expected_recall'], float) and math.isnan(r['expected_recall']))) else "—"
+            flags_str = "; ".join(r.get("flags", [])) if r.get("flags") else "—"
+            fh.write(f"| {r['status']} | {r['name']} | {r['category']} | {fcr_str} | {recall_str} | {r['n_fc']} | {exp_recall_str} | {flags_str} |\n")
+
+        fh.write("\n## Notes\n\n")
+        for r in rows_for_table:
+            if r.get("note"):
+                fh.write(f"- **{r['name']}**: {r['note']}\n")
+
+        fh.write(f"\n## Verdict\n\n")
+        verdict = "PASS" if fail_count == 0 else "FAIL"
+        fh.write(f"**{verdict}** — {fail_count}/{len(sentinels)} sentinels failed.\n")
+
+    log.info("Wrote sentinel report → %s  (failed=%d/%d)", out_path, fail_count, len(sentinels))
 
 
 def _extract_state_array_from_csc(
@@ -415,12 +653,18 @@ def compute_sequence_metrics(
     # Derived state from CSC predictions
     csc_states = _extract_state_array_from_csc(csc_rows, n)
 
+    # GT-derived state (for threshold-aware metrics)
+    gt_states = _extract_state_array_from_labels(gt_label_rows, n)
+
     # Paper metrics
     fcr = compute_fcr(csc_states)
     fcd = compute_fcd(csc_states)
     ttfc = compute_ttfc(csc_states)
     recovery = compute_recovery_at_k(csc_states, k=recovery_k)
     uur_proxy = compute_uur_proxy(csc_rows)
+
+    # Threshold-aware metrics (AUPRC + recall@FPR≤1%/3%)
+    threshold_metrics = compute_threshold_metrics(csc_rows, gt_states)
 
     # State-conditioned AUC
     sc_auc = compute_state_conditioned_auc(ious, csc_states)
@@ -446,6 +690,15 @@ def compute_sequence_metrics(
         f"recovery_at_{recovery_k}": round(recovery, 4),
         "uur_proxy": round(uur_proxy, 6),
         "auc_global": round(global_auc, 6),
+        # Threshold-aware:
+        "fc_auprc": round(threshold_metrics["fc_auprc"], 6) if not math.isnan(threshold_metrics["fc_auprc"]) else None,
+        "fc_recall_at_fpr01": round(threshold_metrics["fc_recall_at_fpr01"], 6) if not math.isnan(threshold_metrics["fc_recall_at_fpr01"]) else None,
+        "fc_recall_at_fpr03": round(threshold_metrics["fc_recall_at_fpr03"], 6) if not math.isnan(threshold_metrics["fc_recall_at_fpr03"]) else None,
+        "lost_auprc": round(threshold_metrics["lost_auprc"], 6) if not math.isnan(threshold_metrics["lost_auprc"]) else None,
+        "lost_recall_at_fpr01": round(threshold_metrics["lost_recall_at_fpr01"], 6) if not math.isnan(threshold_metrics["lost_recall_at_fpr01"]) else None,
+        "n_fc_gt": threshold_metrics["n_fc_gt"],
+        "n_lost_gt": threshold_metrics["n_lost_gt"],
+        "prob_source": threshold_metrics["source"],
     }
     for state_name, auc_val in sc_auc.items():
         row[f"auc_{state_name}"] = round(auc_val, 6) if not math.isnan(auc_val) else None
@@ -500,6 +753,11 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--recovery_k", type=int, default=30)
     p.add_argument("--max_sequences", type=int, default=None)
+    p.add_argument(
+        "--sentinels",
+        default=None,
+        help="YAML file with sentinel sequences (configs/csc/sentinels.yaml).",
+    )
     return p.parse_args()
 
 
@@ -764,6 +1022,28 @@ def main() -> int:
             "no control actions applied to the tracker\n"
         )
     log.info("Wrote %s", report_path)
+
+    # ---------------------------------------------------------------------------
+    # Sentinel report (regression detection on curated sequences)
+    # ---------------------------------------------------------------------------
+    if args.sentinels:
+        sent_yaml_path = Path(args.sentinels)
+        if not sent_yaml_path.exists():
+            log.warning("--sentinels file not found: %s — skipping sentinel report", sent_yaml_path)
+        else:
+            try:
+                import yaml  # lazy import (only needed if --sentinels provided)
+                with open(sent_yaml_path) as fh:
+                    sent_cfg = yaml.safe_load(fh)
+                _write_sentinel_report(
+                    sent_cfg=sent_cfg,
+                    seq_rows=seq_rows[:-1],  # exclude __aggregate__
+                    out_dir=out_dir,
+                    tracker=args.tracker,
+                    dataset=args.dataset,
+                )
+            except Exception as exc:
+                log.warning("Failed to write sentinel report: %s", exc)
 
     # Summary to stdout
     log.info(

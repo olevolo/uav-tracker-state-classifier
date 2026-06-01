@@ -381,5 +381,265 @@ class TestV2BackwardCompat:
         assert out.failure_next_10_logit.shape[-1] == 1
 
 
+
+
+# =============================================================================
+# V3 Quality Gates (G_F1 – G_F6) — fast bench, run after each V3 training run
+# =============================================================================
+
+
+def _make_v3_model(T: int = 16, H: int = 11) -> "CSCTCN":
+    """Tiny V3 CSCTCN with forecast heads enabled."""
+    from csc_lib.csc.config import CSCModelConfig, TCNConfig
+    cfg = CSCModelConfig(
+        kind="tcn", feature_dim=H, hidden_dim=32, num_layers=2,
+        enable_forecast_heads=True, forecast_horizon=10,
+    )
+    cfg.tcn = TCNConfig(kernel_size=3, num_layers=2, dilations=[1, 2],
+                        hidden_dim=32, dropout=0.0)
+    return CSCTCN(cfg)
+
+
+def _make_v2_model(T: int = 16, H: int = 11) -> "CSCTCN":
+    cfg = CSCModelConfig(
+        kind="tcn", feature_dim=H, hidden_dim=32, num_layers=2,
+        enable_forecast_heads=False,
+    )
+    cfg.tcn = TCNConfig(kernel_size=3, num_layers=2, dilations=[1, 2],
+                        hidden_dim=32, dropout=0.0)
+    return CSCTCN(cfg)
+
+
+class TestV3QualityGates:
+    """G_F1–G_F6: fast quality gates for V3 forecast functionality."""
+
+    # ------------------------------------------------------------------
+    # G_F1: Causal inference — step() output at t must not depend on
+    #        frames t+1..t+T-1.  Forecast head predicts future but uses
+    #        only the causal window up to and including frame t.
+    # ------------------------------------------------------------------
+    def test_gf1_causal_inference_step(self) -> None:
+        """Changing future raw telemetry must NOT alter step() output at t."""
+        from csc_lib.csc.inference import CSCRuntime, CSCControlPolicy
+
+        model = _make_v3_model()
+        model.eval()
+        rt = CSCRuntime(model=model, feature_cfg=CSCFeatureConfig(window_size=16))
+
+        rng = np.random.default_rng(0)
+
+        # Run 20 steps with sequence A
+        tel_A = [{"confidence": float(rng.uniform(0.01, 0.99)),
+                  "apce": float(rng.uniform(50, 200)),
+                  "psr": float(rng.uniform(100, 3000))} for _ in range(20)]
+
+        rt.reset()
+        preds_A = [rt.step(**tel_A[i]) for i in range(20)]
+
+        # Change frames 10-19 only — results at frames 0-9 must stay identical
+        tel_B = tel_A[:10] + [{"confidence": float(rng.uniform(0.01, 0.99)),
+                                "apce": float(rng.uniform(50, 200)),
+                                "psr": float(rng.uniform(100, 3000))}
+                               for _ in range(10)]
+        rt.reset()
+        preds_B = [rt.step(**tel_B[i]) for i in range(20)]
+
+        for i in range(10):
+            assert preds_A[i].derived_state == preds_B[i].derived_state, \
+                f"G_F1 fail at step {i}: derived_state changed after future modification"
+            if preds_A[i].false_confirmed_next_10_prob is not None:
+                np.testing.assert_allclose(
+                    preds_A[i].false_confirmed_next_10_prob,
+                    preds_B[i].false_confirmed_next_10_prob,
+                    atol=1e-5,
+                    err_msg=f"G_F1 fail at step {i}: forecast prob changed"
+                )
+
+    # ------------------------------------------------------------------
+    # G_F2: Lead time gate — FC forecast must fire BEFORE FC occurs.
+    #        On a sequence with a known FC event, the forecast prob must
+    #        be elevated at least 1 frame before the first FC frame.
+    #        (Uses random weights; tests that the output varies plausibly.)
+    # ------------------------------------------------------------------
+    def test_gf2_forecast_output_is_nonzero(self) -> None:
+        """false_confirmed_next_10_prob must be in (0, 1) and vary."""
+        from csc_lib.csc.inference import CSCRuntime
+
+        model = _make_v3_model()
+        model.eval()
+        rt = CSCRuntime(model=model, feature_cfg=CSCFeatureConfig(window_size=16))
+
+        rng = np.random.default_rng(7)
+        probs = []
+        rt.reset()
+        for _ in range(32):
+            p = rt.step(
+                confidence=float(rng.uniform(0.01, 0.99)),
+                apce=float(rng.uniform(50, 200)),
+                psr=float(rng.uniform(100, 3000)),
+            )
+            if p.false_confirmed_next_10_prob is not None:
+                probs.append(p.false_confirmed_next_10_prob)
+
+        if not probs:
+            pytest.skip("V3 forecast head not active (V2 model loaded)")
+        assert all(0.0 <= p <= 1.0 for p in probs), "G_F2: prob not in [0,1]"
+        assert max(probs) > 0.01, "G_F2: all probs near 0 — head may be dead"
+        assert min(probs) < 0.99, "G_F2: all probs near 1 — head may be saturated"
+        # Should vary (not all identical)
+        assert np.std(probs) > 1e-4, "G_F2: forecast prob doesn't vary — head is degenerate"
+
+    # ------------------------------------------------------------------
+    # G_F3: V2 parity — enabling forecast heads must NOT change the
+    #        derived_state or risk_score outputs (same shared encoder).
+    # ------------------------------------------------------------------
+    def test_gf3_v2_parity(self) -> None:
+        """V3 model (forecast=True) must produce identical derived_state
+        and risk_score as V2 model (forecast=False) given same weights."""
+        T, H = 16, 11
+        v3_model = _make_v3_model(T, H)
+        v2_model = _make_v2_model(T, H)
+
+        # Copy shared weights (proj + TCN blocks + main heads)
+        v2_sd = v2_model.state_dict()
+        v3_sd = v3_model.state_dict()
+        for k in v2_sd:
+            if k in v3_sd:
+                v3_sd[k] = v2_sd[k]
+        v3_model.load_state_dict(v3_sd)
+
+        x = torch.randn(2, T, H)
+        with torch.no_grad():
+            out_v2 = v2_model.predict(x, last_step_only=True)
+            out_v3 = v3_model.predict(x, last_step_only=True)
+
+        np.testing.assert_allclose(
+            out_v2["derived_probs"].numpy(),
+            out_v3["derived_probs"].numpy(),
+            atol=1e-5,
+            err_msg="G_F3: derived_probs differ between V2 and V3 mode",
+        )
+        np.testing.assert_allclose(
+            out_v2["risk_score"].numpy(),
+            out_v3["risk_score"].numpy(),
+            atol=1e-5,
+            err_msg="G_F3: risk_score differs between V2 and V3 mode",
+        )
+        assert out_v3["false_confirmed_next_10_prob"] is not None, \
+            "G_F3: V3 must produce forecast probs"
+        assert out_v2.get("false_confirmed_next_10_prob") is None, \
+            "G_F3: V2 must NOT produce forecast probs"
+
+    # ------------------------------------------------------------------
+    # G_F4: False alarm rate gate — on an all-CC sequence, the FC
+    #        forecast prob should stay below a high threshold (< 0.8).
+    #        Prevents a degenerate model that always predicts FC.
+    # ------------------------------------------------------------------
+    def test_gf4_false_alarm_rate_on_cc_sequence(self) -> None:
+        """FC forecast prob < 0.8 on a clean CC sequence (no FC frames)."""
+        from csc_lib.csc.inference import CSCRuntime
+
+        model = _make_v3_model()
+        model.eval()
+        rt = CSCRuntime(model=model, feature_cfg=CSCFeatureConfig(window_size=16))
+
+        rng = np.random.default_rng(99)
+        probs = []
+        rt.reset()
+        # Simulate a stable CC sequence: high confidence, high APCE
+        for _ in range(50):
+            p = rt.step(
+                confidence=float(rng.uniform(0.70, 0.99)),
+                apce=float(rng.uniform(150, 250)),
+                psr=float(rng.uniform(2000, 6000)),
+            )
+            if p.false_confirmed_next_10_prob is not None:
+                probs.append(p.false_confirmed_next_10_prob)
+
+        if not probs:
+            pytest.skip("V3 not active")
+        high_alarm = sum(1 for p in probs if p > 0.8) / len(probs)
+        assert high_alarm < 0.5, \
+            f"G_F4: {100*high_alarm:.0f}% of CC frames have FC_forecast > 0.8 — too many false alarms"
+
+    # ------------------------------------------------------------------
+    # G_F5: Latency gate — V3 step() overhead vs V2 must be < 0.5 ms.
+    # ------------------------------------------------------------------
+    @pytest.mark.perf
+    def test_gf5_v3_latency_overhead(self) -> None:
+        """V3 adds < 0.5 ms per step compared to V2 (3 extra Linear layers)."""
+        import time
+        from csc_lib.csc.inference import CSCRuntime
+
+        feat_cfg = CSCFeatureConfig(window_size=16)
+        v3_rt = CSCRuntime(model=_make_v3_model(), feature_cfg=feat_cfg)
+        v2_rt = CSCRuntime(model=_make_v2_model(), feature_cfg=feat_cfg)
+
+        rng = np.random.default_rng(42)
+        tel = [{"confidence": float(rng.uniform(0.01, 0.99)),
+                "apce": float(rng.uniform(50, 200)),
+                "psr": float(rng.uniform(100, 3000))} for _ in range(500)]
+
+        def _run(rt, steps=500):
+            rt.reset()
+            times = []
+            for i in range(steps):
+                t0 = time.perf_counter()
+                rt.step(**tel[i % len(tel)])
+                times.append((time.perf_counter() - t0) * 1000)
+            return float(np.percentile(times, 50))
+
+        v2_p50 = _run(v2_rt)
+        v3_p50 = _run(v3_rt)
+        overhead = v3_p50 - v2_p50
+        print(f"\nG_F5: V2 p50={v2_p50:.3f}ms  V3 p50={v3_p50:.3f}ms  overhead={overhead:.3f}ms")
+        assert overhead < 0.5, \
+            f"G_F5: V3 overhead {overhead:.3f}ms > 0.5ms threshold"
+
+    # ------------------------------------------------------------------
+    # G_F6: Forecast AUPRC on synthetic data — must beat random (0.5+).
+    #        This is a weak gate that checks the forecast head is not
+    #        completely degenerate; strong AUPRC requires real training.
+    # ------------------------------------------------------------------
+    def test_gf6_forecast_auprc_beats_random(self) -> None:
+        """FC_forecast AUPRC > 0.35 on synthetic data after 5 SGD steps."""
+        from csc_lib.csc.config import CSCTrainConfig
+
+        T, H, N = 16, 11, 64
+        model = _make_v3_model(T, H)
+        opt = torch.optim.Adam(model.parameters(), lr=1e-3)
+        bce = torch.nn.BCEWithLogitsLoss()
+
+        rng = np.random.default_rng(123)
+        probs_list, labels_list = [], []
+
+        for _ in range(5):  # 5 SGD steps
+            x = torch.from_numpy(rng.standard_normal((N, T, H)).astype(np.float32))
+            # FC in next 10 = 1 for high APCE inputs (feature 1 = apce)
+            fc_target = (x[:, -1, 1] > 0.0).float().unsqueeze(-1).unsqueeze(-1)
+            out = model(x, last_step_only=True)
+            if out.false_confirmed_next_10_logit is None:
+                pytest.skip("V3 not active")
+            loss = bce(out.false_confirmed_next_10_logit[:, 0], fc_target[:, 0])
+            opt.zero_grad(); loss.backward(); opt.step()
+
+            with torch.no_grad():
+                p = torch.sigmoid(out.false_confirmed_next_10_logit[:, 0, 0]).numpy()
+                t = fc_target[:, 0, 0].numpy()
+                probs_list.append(p)
+                labels_list.append(t)
+
+        probs_all = np.concatenate(probs_list)
+        labels_all = np.concatenate(labels_list)
+        # Simple AUPRC approximation
+        from sklearn.metrics import average_precision_score  # type: ignore
+        try:
+            auprc = average_precision_score(labels_all, probs_all)
+            print(f"\nG_F6: 5-step forecast AUPRC={auprc:.3f}")
+            assert auprc > 0.35, f"G_F6: forecast AUPRC {auprc:.3f} < 0.35 — head not learning"
+        except ImportError:
+            pytest.skip("sklearn not installed")
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

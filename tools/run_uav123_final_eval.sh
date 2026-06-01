@@ -70,7 +70,7 @@ if [[ "${CSC_NOT_TRAINED_ON_UAV123:-0}" != "1" ]]; then
 fi
 
 # Checkpoint name must not contain "uav123" (catches obvious path mistakes)
-CKPT_LOWER="${CSC_CKPT,,}"
+CKPT_LOWER="$(echo "$CSC_CKPT" | tr '[:upper:]' '[:lower:]')"
 if [[ "$CKPT_LOWER" == *"uav123"* ]]; then
     echo "ERROR: CSC checkpoint path contains 'uav123': $CSC_CKPT" >&2
     echo "  This strongly suggests the model was trained on UAV123." >&2
@@ -152,9 +152,8 @@ if [[ "$TRACKER" == "ortrack" ]]; then
     CALIB_CONF="$CALIBRATION_DIR/ortrack_lasot_confidence.json"
     CALIB_MANIFEST="$CALIBRATION_DIR/ortrack_lasot.manifest.json"
 elif [[ "$TRACKER" == "sglatrack" ]]; then
-    # SGLATrack was calibrated on GOT-10k (Issue 5 in memory — lasot calibrator missing)
-    CALIB_CONF="$CALIBRATION_DIR/sglatrack_got10k_confidence.json"
-    CALIB_MANIFEST="$CALIBRATION_DIR/sglatrack_got10k.manifest.json"
+    CALIB_CONF="$CALIBRATION_DIR/sglatrack_lasot_confidence.json"
+    CALIB_MANIFEST="$CALIBRATION_DIR/sglatrack_lasot.manifest.json"
 fi
 
 if [[ ! -f "$CALIB_CONF" ]]; then
@@ -163,13 +162,8 @@ if [[ ! -f "$CALIB_CONF" ]]; then
     exit 1
 fi
 echo "  OK: $CALIB_CONF"
-
-# Emit a warning for SGLATrack: calibrator is GOT-10k not LaSOT (known Issue 5)
-if [[ "$TRACKER" == "sglatrack" ]]; then
-    echo "  WARNING: SGLATrack calibrator was fitted on GOT-10k, not LaSOT." >&2
-    echo "           This is a known gap (Issue 5). Results may have systematically" >&2
-    echo "           miscalibrated confidence thresholds for SGLATrack." >&2
-fi
+# Extract tag for build_scene_state_labels.py (e.g. "sglatrack_lasot" from "sglatrack_lasot_confidence.json")
+CALIB_TAG=$(basename "$CALIB_CONF" .json | sed 's/_confidence$//')
 
 # ---------------------------------------------------------------------------
 # Step 4: CSC passive inference
@@ -189,9 +183,13 @@ else
     # run_with_csc writes to outputs/csc_runs/<run_tag>/; rename to passive/
     # Actually run_with_csc writes inside output_dir/<run_tag>/ — we need to
     # find the latest run_tag directory and symlink/move it.
-    RUN_TAG=$(ls -td "$EVAL_ROOT"/*/metrics.json 2>/dev/null | head -1 | xargs -I{} dirname {} | xargs basename)
-    if [[ -n "$RUN_TAG" && "$RUN_TAG" != "passive" ]]; then
+    # Find the newest non-passive run_tag directory with a metrics.json
+    RUN_TAG=$(ls -td "$EVAL_ROOT"/*/metrics.json 2>/dev/null \
+        | grep -v '/passive/' | head -1 \
+        | xargs -I{} dirname {} | xargs basename 2>/dev/null || true)
+    if [[ -n "$RUN_TAG" ]]; then
         echo "  Moving $EVAL_ROOT/$RUN_TAG → $PASSIVE_DIR"
+        rm -rf "$PASSIVE_DIR"
         mv "$EVAL_ROOT/$RUN_TAG" "$PASSIVE_DIR"
     fi
     echo "  Done."
@@ -201,7 +199,8 @@ fi
 # Step 5: GT label generation (eval-only, never used for training)
 # ---------------------------------------------------------------------------
 echo "[5/8] Generating GT state labels for evaluation → $LABELS_DIR ..."
-if [[ -d "$LABELS_DIR" ]] && [[ -n "$(ls "$LABELS_DIR"/*.jsonl 2>/dev/null | head -1)" ]]; then
+if [[ -d "$LABELS_DIR/$DATASET/$SPLIT/labels_per_sequence" ]] && \
+   [[ -n "$(ls "$LABELS_DIR/$DATASET/$SPLIT/labels_per_sequence/"*.jsonl 2>/dev/null | head -1)" ]]; then
     echo "  SKIP: labels already generated (delete $LABELS_DIR to rerun)"
 else
     mkdir -p "$LABELS_DIR"
@@ -211,6 +210,7 @@ else
         --split "$SPLIT" \
         --baseline_dir "$PROJECT_ROOT/outputs/baselines/$TRACKER" \
         --calibration_dir "$CALIBRATION_DIR" \
+        --calibrator_tag "$CALIB_TAG" \
         --output_dir "$LABELS_DIR"
     echo "  Done."
 fi
@@ -247,7 +247,7 @@ else
         exit 1
     fi
     "$PYTHON" -u "$PROJECT_ROOT/tools/evaluate_csc_episodes.py" \
-        --labels "$LABELS_DIR" \
+        --labels "$LABELS_DIR/$DATASET/$SPLIT" \
         --predictions "$STATES_DIR" \
         --out "$EPISODE_EVAL_DIR"
     echo "  Done."
@@ -268,7 +268,7 @@ else
         --predictions_dir "$BASELINE_DIR/predictions" \
         --telemetry_dir "$BASELINE_DIR/telemetry" \
         --states_dir "$PASSIVE_DIR/states" \
-        --labels_dir "$LABELS_DIR" \
+        --labels_dir "$LABELS_DIR/$DATASET/$SPLIT" \
         --tracking_metrics_dir "$TRACKING_EVAL_DIR" \
         --output_dir "$PAPER_METRICS_DIR" \
         --confidence_calib "$CALIB_CONF" \

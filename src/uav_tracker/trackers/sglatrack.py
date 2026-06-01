@@ -347,6 +347,9 @@ class SGLATracker:
         self._enable_ce = enable_ce
         self._model = None
         self._hann: torch.Tensor | None = None
+        # Exit-router hook: set by run_with_csc.py before each update() call.
+        # -1 = let SGLATrack MLP decide; 0-5 = force MLP output index → block 6-11.
+        self._force_layer_idx: int = -1
         self._z_tensor: torch.Tensor | None = None    # template tensor on device
         self._state: BBox | None = None
         self._is_stub: bool = True
@@ -359,8 +362,13 @@ class SGLATracker:
         self._last_search_score_weighted: torch.Tensor | None = None
         self._last_search_peak_local: torch.Tensor | None = None
         self._last_template_embedding: torch.Tensor | None = None
+        # Identity / appearance drift signals (set in update(), reset in init()).
+        self._initial_template_embedding: torch.Tensor | None = None  # frozen at frame 0
+        self._initial_template_sim: float = 1.0   # cosine(search_t, template_0)
+        self._last_cosine_sim: float = 1.0         # cosine(search_t, template_current)
         # Optional SALT-RD Stage 2 advisory controller.
         self._salt_rd_advisor: object | None = None
+        self._update_enabled: bool = True
 
     def _reset_embedding_cache(self) -> None:
         """Reset per-frame embedding cache. Call at init() and any early-return path."""
@@ -368,6 +376,9 @@ class SGLATracker:
         self._last_search_score_weighted = None
         self._last_search_peak_local = None
         self._last_template_embedding = None
+        self._initial_template_embedding = None
+        self._initial_template_sim = 1.0
+        self._last_cosine_sim = 1.0
 
     @property
     def _device(self) -> torch.device:
@@ -419,6 +430,8 @@ class SGLATracker:
         # previous sequence or tracking episode.
         self._template_update_count = 0
         self._template_last_update = 0
+        self._update_enabled = True
+        self._force_layer_idx = -1
         if self._salt_rd_advisor is not None:
             self._salt_rd_advisor.reset()
         # OpenCV delivers BGR — SGLATrack expects RGB
@@ -437,8 +450,12 @@ class SGLATracker:
         x_tensor = _to_tensor(patch, self._device)
 
         with torch.no_grad():
-            out = self._model(template=self._z_tensor, search=x_tensor,
-                              ce_template_mask=None)
+            out = self._model(
+                template=self._z_tensor,
+                search=x_tensor,
+                ce_template_mask=None,
+                force_layer_idx=int(self._force_layer_idx),
+            )
 
             # --- Per-frame embedding export hook ---
             # Extracts 3 views of search appearance + template embedding.
@@ -466,6 +483,23 @@ class SGLATracker:
 
                 # Template embedding: mean-pool over 64 template tokens
                 self._last_template_embedding = _bfeat[:, :64, :].mean(dim=1).squeeze(0)  # (192,)
+
+                # Identity / drift signals: compare search vs initial and current template.
+                if self._initial_template_embedding is None:
+                    # First update call — freeze the initial template embedding forever.
+                    self._initial_template_embedding = self._last_template_embedding.clone()
+                self._last_cosine_sim = float(
+                    F.cosine_similarity(
+                        self._last_search_global.unsqueeze(0),
+                        self._last_template_embedding.unsqueeze(0),
+                    ).item()
+                )
+                self._initial_template_sim = float(
+                    F.cosine_similarity(
+                        self._last_search_global.unsqueeze(0),
+                        self._initial_template_embedding.unsqueeze(0),
+                    ).item()
+                )
             else:
                 # Reset to None so stale values never silently persist across frames
                 self._last_search_global = None
@@ -581,7 +615,10 @@ class SGLATracker:
             psr=psr,
             response_entropy=response_entropy,
             score_map_stats=_score_map_stats,
-            aux={"score_map_stats": _score_map_stats},
+            aux={
+                "score_map_stats": _score_map_stats,
+                "selected_block": out.get("selected_block"),
+            },
         )
 
     def update_with_action(self, frame: np.ndarray, action: "TrackerAction") -> "TrackState":
@@ -647,8 +684,8 @@ class SGLATracker:
         """
         if self._z_tensor is None:
             return False
-
-        # Advisor veto is checked by the caller (salt_runner) before calling this method.
+        if not self._update_enabled:
+            return False
         # Do not call should_block_template_update() here — it has counter side effects
         # (increments n_blocked / n_allowed) and would double-count if called again here.
 
@@ -688,12 +725,29 @@ class SGLATracker:
         self._state = None
         self._template_last_update = 0
         self._template_update_count = 0
+        self._update_enabled = True
+        self._force_layer_idx = -1
         if self._salt_rd_advisor is not None:
             self._salt_rd_advisor.reset()
 
     def set_salt_rd_advisor(self, advisor: object) -> None:
         """Attach a SALTRDAdvisor instance for Stage 2 advisory/veto mode."""
         self._salt_rd_advisor = advisor
+
+    def set_update_enabled(self, enabled: bool) -> None:
+        """CSCAdvisor gate: allow or block the next try_update_template() call."""
+        self._update_enabled = bool(enabled)
+
+    @property
+    def capabilities(self):
+        from uav_tracker.trackers.capabilities import TrackerCapabilities
+        return TrackerCapabilities(
+            can_freeze_template=True,   # set_update_enabled() + try_update_template() wired
+            can_widen_search=False,     # TODO: refactor _SEARCH_FACTOR to instance var
+            can_force_reinit=True,
+            can_reject_bbox=True,
+            can_reduce_pruning=False,   # pruning_mode CE exists but not validated
+        )
 
     def override_search_center(self, cx: float, cy: float, w: float, h: float) -> None:
         """Override the search center for the next update() call.

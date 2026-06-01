@@ -79,7 +79,7 @@ def _image_diag_from_first_frame(seq) -> float:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Evaluate tracking results.")
-    p.add_argument("--dataset", required=True, choices=["lasot", "got10k", "uav123", "dtb70", "visdrone_sot"])
+    p.add_argument("--dataset", required=True, choices=["lasot", "got10k", "uav123", "uav123_10fps", "dtb70", "visdrone_sot", "uavtrack112", "uavdt_sot"])
     p.add_argument("--split", default="val")
     p.add_argument("--pred_dir", required=True, help="Directory containing <seq>.txt files.")
     p.add_argument("--telemetry_dir", default=None)

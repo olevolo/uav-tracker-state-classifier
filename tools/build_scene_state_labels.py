@@ -185,7 +185,7 @@ def _apply_calibrator(values: list[Optional[float]], cal) -> list[Optional[float
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Generate weak CSC labels.")
-    p.add_argument("--dataset", required=True, choices=["lasot", "got10k", "uav123", "dtb70", "visdrone_sot", "uavdt_sot"])
+    p.add_argument("--dataset", required=True, choices=["lasot", "got10k", "uav123", "dtb70", "visdrone_sot", "uavdt_sot", "uavtrack112", "uav123_10fps"])
     p.add_argument("--split", default="val")
     p.add_argument("--baseline_dir", default="outputs/baselines/sglatrack")
     p.add_argument("--tracker", default="sglatrack",

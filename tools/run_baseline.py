@@ -34,11 +34,12 @@ import psutil as _psutil
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 # Make both the new src package and the archived SALT-RD package importable.
-sys.path.insert(0, str(PROJECT_ROOT / "src"))
+# NEW src must come BEFORE salrtd/src so updated adapters (with identity features) take priority.
 sys.path.insert(0, str(PROJECT_ROOT / "salrtd" / "src"))
+sys.path.insert(0, str(PROJECT_ROOT / "src"))   # takes priority over salrtd
 sys.path.insert(0, str(PROJECT_ROOT))
 
-_TRACKER_NAMES = ["sglatrack", "ostrack", "ortrack", "avtrack", "evptrack"]
+_TRACKER_NAMES = ["sglatrack", "ostrack", "ortrack", "avtrack", "evptrack", "fartrack", "uetrack"]
 
 
 def _git_commit() -> Optional[str]:
@@ -89,6 +90,8 @@ def _load_tracker(name: str, weights_path: Optional[str], device: str,
         "ortrack":   "uav_tracker.trackers.ortrack",
         "avtrack":   "uav_tracker.trackers.avtrack",
         "evptrack":  "uav_tracker.trackers.evptrack",
+        "fartrack":  "uav_tracker.trackers.fartrack",
+        "uetrack":   "uav_tracker.trackers.uetrack",
     }
     if name not in _adapter_map:
         raise SystemExit(
@@ -253,6 +256,10 @@ def _run_one_sequence(
             row = _telemetry_from_state(state)
             row["frame_idx"] = frame_idx
             row["latency_ms"] = dt_ms
+            # Identity / appearance drift signals from SGLATrack (others return default 1.0/0.0)
+            row["initial_template_sim"] = float(getattr(tracker, "_initial_template_sim", 1.0))
+            row["last_cosine_sim"]       = float(getattr(tracker, "_last_cosine_sim", 1.0))
+            row["appearance_drift"]      = float(1.0 - row["initial_template_sim"])
             _write_tel(row)
             if pred_fh and frame_idx % 200 == 0:
                 pred_fh.flush()
@@ -307,7 +314,7 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     p.add_argument(
         "--dataset",
         required=True,
-        choices=["lasot", "got10k", "uav123", "dtb70", "visdrone_sot"],
+        choices=["lasot", "got10k", "uav123", "dtb70", "visdrone_sot", "uavdt_sot", "uavtrack112", "uav123_10fps"],
     )
     p.add_argument("--split", default="val", choices=["train", "val", "test"])
     p.add_argument("--device", default="cuda")
