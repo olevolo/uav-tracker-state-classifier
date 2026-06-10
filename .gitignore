@@ -146,3 +146,30 @@ saltr/checkpoints/
 *.mp4
 *.avi
 *.mov
+
+# ---- Garbage / infra (local) ----
+garbage/
+infra/
+salrtd/garbage/
+salrtd/infra/
+
+# ---- Notebooks (local-only) ----
+notebooks/
+*.ipynb
+
+# ---- Logs / archives / handoffs ----
+logs/
+archive/
+thoughts/
+salrtd/archive/
+
+# ---- Scratch markdown reports (keep README.md and CLAUDE.md only) ----
+CSC.md
+CSC_PIPELINE_OVERVIEW.md
+DATASETS.md
+DATASETS_UK.md
+FINAL_REPORT.md
+RESULTS.md
+V4_SPEC.md
+codex.md
+salrtd/DATASETS.md
