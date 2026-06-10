@@ -17,7 +17,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 EVAL = ROOT / "outputs/eval"
-TRACKERS = ["sglatrack", "avtrack", "ortrack", "ostrack"]
+TRACKERS = ["sglatrack", "avtrack", "ortrack", "ostrack", "evptrack", "mobiletrack"]
 ST = {0: "CC", 1: "CU", 2: "LA", 3: "FC"}
 
 

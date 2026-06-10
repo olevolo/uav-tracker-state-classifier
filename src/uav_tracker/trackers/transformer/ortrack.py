@@ -24,6 +24,7 @@ import torch
 
 from uav_tracker.registry import TRACKERS
 from uav_tracker.types import BBox, FrameContext, TrackState
+from uav_tracker.trackers._redetect_common import run_redetect as _run_redetect
 
 logger = logging.getLogger(__name__)
 
@@ -219,6 +220,7 @@ class ORTrackDeiT:
         self._state: BBox | None = None
         self._is_stub: bool = True
         self._update_enabled: bool = True  # CSCAdvisor gate (no-op: ORTrack has no internal template update)
+        self._search_factor: float = _SEARCH_FACTOR
 
     @property
     def _device(self) -> torch.device:
@@ -279,7 +281,7 @@ class ORTrackDeiT:
             return TrackState(bbox=BBox(0, 0, 1, 1), confidence=0.0, status="lost")
 
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        patch, resize_factor = _sample_target(rgb, self._state, _SEARCH_FACTOR, _SEARCH_SIZE)
+        patch, resize_factor = _sample_target(rgb, self._state, self._search_factor, _SEARCH_SIZE)
         x_tensor = _to_tensor(patch, self._device)
 
         with torch.no_grad():
@@ -340,6 +342,16 @@ class ORTrackDeiT:
             w=max(1.0, w_pred),
             h=max(1.0, h_pred),
         )
+        # Clamp to frame bounds (project rule: every adapter must clip bbox to
+        # frame; the OSTrack/ORTrack family clips natively via lib.utils.box_ops,
+        # this adapter had dropped it -> off-frame drift scored IoU~0, understating
+        # baseline AUC/Pr@20 and inflating FCR). Restores faithful behaviour.
+        _H_img, _W_img = frame.shape[:2]
+        _bx = min(max(new_bbox.x, 0.0), max(0.0, float(_W_img) - 1.0))
+        _by = min(max(new_bbox.y, 0.0), max(0.0, float(_H_img) - 1.0))
+        _bw = max(1.0, min(new_bbox.w, float(_W_img) - _bx))
+        _bh = max(1.0, min(new_bbox.h, float(_H_img) - _by))
+        new_bbox = BBox(x=_bx, y=_by, w=_bw, h=_bh)
         self._state = new_bbox
 
         if confidence > 0.25:
@@ -366,16 +378,87 @@ class ORTrackDeiT:
         self._z_tensor = None
         self._state = None
         self._update_enabled = True
+        self._search_factor = _SEARCH_FACTOR
 
     def set_update_enabled(self, enabled: bool) -> None:
         """CSCAdvisor gate. ORTrack has no internal template update — this is a no-op
         but satisfies the _try_set_update_enabled() protocol in run_with_csc.py."""
         self._update_enabled = bool(enabled)
 
+    def override_search_center(self, cx: float, cy: float, w: float, h: float) -> None:
+        """Relocate the search region for the next update() (control hook).
+
+        ORTrack crops the search region around ``self._state`` each frame, so
+        setting it relocates where the tracker looks next — the lever behind
+        motion_bridge LA recovery and FC hold_lastgood. Mirrors SGLATracker."""
+        self._state = BBox(x=cx - w / 2, y=cy - h / 2, w=w, h=h)
+
+    def set_search_factor(self, factor: float) -> None:
+        """Widen/narrow the search region for the next update() (LA recovery hook).
+
+        Search crop side = sqrt(w*h) * factor. Clamped to [base, 4*base]."""
+        base = _SEARCH_FACTOR
+        self._search_factor = float(min(max(float(factor), base), 4.0 * base))
+
+    def reset_search_factor(self) -> None:
+        """Restore the default search-region factor (recovery complete)."""
+        self._search_factor = _SEARCH_FACTOR
+
+    def redetect(
+        self,
+        frame: np.ndarray,
+        *,
+        factors: tuple[float, ...] | list[float] | None = None,
+        anchor_bboxes: list[BBox] | None = None,
+        include_current: bool = True,
+        grid_size: int = 0,
+        max_candidates: int = 3,
+        min_apce: float = 0.0,
+        rank_by: str = "quality",
+        top_k: int = 1,
+        frame_idx: int = -1,
+    ) -> "dict | list[dict] | None":
+        """Event-driven wide-crop re-detection (shared loop, frozen template).
+
+        Same interface as SGLATracker/AVTrack.redetect() so the CSC runner's
+        ``_try_sgla_redetect`` works for ORTrack unchanged. ORTrack exposes no
+        backbone embedding, so candidates carry sim_to_init=NaN — the FC challenge
+        association (proximity-based) and quality-ranked LA sgla_redetect both
+        work; only the identity switch_mode is unavailable."""
+        if self._model is None or self._z_tensor is None or self._state is None:
+            return None
+        if self._hann is None:
+            self._hann = _make_hann(self._device)
+
+        def _fwd(x_tensor):
+            return self._model(template=self._z_tensor, search=x_tensor, is_distill=False)
+
+        return _run_redetect(
+            model_forward=_fwd,
+            sample_target=_sample_target,
+            to_tensor=_to_tensor,
+            hann=self._hann,
+            device=self._device,
+            state_bbox=self._state,
+            frame=frame,
+            factors=factors or (8.0, 12.0, 16.0),
+            anchor_bboxes=anchor_bboxes,
+            include_current=include_current,
+            grid_size=grid_size,
+            max_candidates=max_candidates,
+            min_apce=min_apce,
+            rank_by=rank_by,
+            top_k=top_k,
+            initial_template_embedding=None,
+        )
+
     @property
     def capabilities(self):
         from uav_tracker.trackers.capabilities import TrackerCapabilities
-        return TrackerCapabilities()  # all defaults: only can_reject_bbox + can_force_reinit
+        # override_search_center() + set_search_factor() are now wired (ORTrack
+        # crops around self._state like SGLATrack), so search-region control
+        # levers (widen / relocate / motion_bridge / FC hold_lastgood) apply.
+        return TrackerCapabilities(can_widen_search=True)
 
     @property
     def is_stub_mode(self) -> bool:

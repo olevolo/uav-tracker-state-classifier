@@ -371,9 +371,26 @@ def main() -> int:
         forecast_fc_loss_fn = torch.nn.BCEWithLogitsLoss(
             pos_weight=forecast_pos_weights["fc"], reduction="none"
         )
-        forecast_lost_loss_fn = torch.nn.BCEWithLogitsLoss(
-            pos_weight=forecast_pos_weights["lost"], reduction="none"
-        )
+        _lost_focal_gamma = float(getattr(cfg.loss, "forecast_lost_focal_gamma", 0.0))
+        if _lost_focal_gamma > 0.0:
+            _lost_pw = forecast_pos_weights["lost"]
+
+            def forecast_lost_loss_fn(logit, target, _g=_lost_focal_gamma, _pw=_lost_pw):
+                # Focal BCE: (1 - p_t)^gamma * BCE — down-weights confident-correct
+                # frames so the over-saturated lost_aware head de-saturates.
+                import torch.nn.functional as _F
+                bce = _F.binary_cross_entropy_with_logits(
+                    logit, target, pos_weight=_pw, reduction="none"
+                )
+                p = torch.sigmoid(logit)
+                p_t = p * target + (1.0 - p) * (1.0 - target)
+                return ((1.0 - p_t) ** _g) * bce
+
+            log.info("forecast LOST head: focal BCE gamma=%.1f (de-saturation)", _lost_focal_gamma)
+        else:
+            forecast_lost_loss_fn = torch.nn.BCEWithLogitsLoss(
+                pos_weight=forecast_pos_weights["lost"], reduction="none"
+            )
 
     _trainable_params = [p for p in model.parameters() if p.requires_grad]
     if cfg.optim.optimizer.lower() == "adamw":

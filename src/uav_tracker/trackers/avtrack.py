@@ -46,6 +46,13 @@ import torch
 
 from uav_tracker.registry import TRACKERS
 from uav_tracker.types import BBox, FrameContext, TrackState
+from uav_tracker.trackers._redetect_common import (
+    select_candidate_peak_indices as _select_candidate_peak_indices,
+    candidate_bbox_from_peak as _candidate_bbox_from_peak,
+    redetect_rank_key as _redetect_rank_key,
+    redetect_topk as _redetect_topk,
+    sim_init_at_cell as _sim_init_at_cell,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -279,8 +286,11 @@ class AVTrackAdapter:
         self._hann: torch.Tensor | None = None
         self._z_tensor: torch.Tensor | None = None
         self._state: BBox | None = None
+        self._search_factor: float = _SEARCH_FACTOR
         self._is_stub: bool = True
         self._update_enabled: bool = True  # CSCAdvisor gate (no-op: AVTrack has no internal template update)
+        self._initial_template_embedding: torch.Tensor | None = None  # frozen at frame 0 for redetect identity
+        self._last_cosine_sim: float = 1.0  # cosine(mean search tokens, template); matches SGLATrack signal
 
     # --------------------------------------------------------------------- #
     # Lifecycle                                                               #
@@ -359,6 +369,8 @@ class AVTrackAdapter:
         patch, _ = _sample_target(rgb, bbox, _TEMPLATE_FACTOR, _TEMPLATE_SIZE)
         self._z_tensor = _to_tensor(patch, self._device)
         self._state = bbox
+        self._initial_template_embedding = None
+        self._last_cosine_sim = 1.0
 
     def update(self, frame: np.ndarray) -> TrackState:
         if self._model is None or self._z_tensor is None or self._state is None:
@@ -366,7 +378,7 @@ class AVTrackAdapter:
 
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         patch, resize_factor = _sample_target(
-            rgb, self._state, _SEARCH_FACTOR, _SEARCH_SIZE
+            rgb, self._state, self._search_factor, _SEARCH_SIZE
         )
         x_tensor = _to_tensor(patch, self._device)
 
@@ -380,6 +392,26 @@ class AVTrackAdapter:
                 search_anno=[],
                 is_distill=False,
             )
+
+        # Freeze initial template embedding on first frame for redetect identity.
+        if self._initial_template_embedding is None and "backbone_feat" in out:
+            _bfeat = out["backbone_feat"]  # (1, N_Z+N_X, C) = (1, 320, 192)
+            self._initial_template_embedding = _bfeat[:, :_N_Z, :].mean(dim=1).squeeze(0).detach()
+
+        # Compute cosine similarity between mean search tokens and template.
+        # Matches SGLATrack's _last_cosine_sim so the 'cosine' LA gate works cross-tracker.
+        if self._initial_template_embedding is not None and "backbone_feat" in out:
+            with torch.no_grad():
+                _bfeat_cur = out["backbone_feat"]
+                _search_mean = _bfeat_cur[:, _N_Z:, :].mean(dim=1).squeeze(0)
+                self._last_cosine_sim = float(
+                    torch.nn.functional.cosine_similarity(
+                        _search_mean.unsqueeze(0),
+                        self._initial_template_embedding.unsqueeze(0),
+                    ).item()
+                )
+        else:
+            self._last_cosine_sim = 1.0
 
         # ----- Adaptive-layer telemetry (the key AVTrack signal) -----
         # ``probs_active`` is a list of (B, 1) sigmoid tensors, one per gated
@@ -449,6 +481,15 @@ class AVTrackAdapter:
             w=max(1.0, w_pred),
             h=max(1.0, h_pred),
         )
+        # Clamp to frame bounds (project rule: every adapter must clip bbox to
+        # frame). Off-frame drift was scoring IoU~0 even when the on-screen part
+        # overlapped the target -> baseline AUC/Pr@20 understated, FCR inflated.
+        _H_img, _W_img = frame.shape[:2]
+        _bx = min(max(new_bbox.x, 0.0), max(0.0, float(_W_img) - 1.0))
+        _by = min(max(new_bbox.y, 0.0), max(0.0, float(_H_img) - 1.0))
+        _bw = max(1.0, min(new_bbox.w, float(_W_img) - _bx))
+        _bh = max(1.0, min(new_bbox.h, float(_H_img) - _by))
+        new_bbox = BBox(x=_bx, y=_by, w=_bw, h=_bh)
         self._state = new_bbox
 
         # Confidence = score_max (per task spec). The CENTER head emits a
@@ -487,20 +528,216 @@ class AVTrackAdapter:
         """Action routing stub — AVTrack does not support CE/search overrides."""
         return self.update(frame)
 
+    def redetect(
+        self,
+        frame: np.ndarray,
+        *,
+        factors: tuple[float, ...] | list[float] | None = None,
+        anchor_bboxes: list[BBox] | None = None,
+        include_current: bool = True,
+        grid_size: int = 0,
+        max_candidates: int = 3,
+        min_apce: float = 0.0,
+        rank_by: str = "quality",
+        top_k: int = 1,
+        frame_idx: int = -1,
+    ) -> dict | list[dict] | None:
+        """Event-driven self re-detection using the frozen AVTrack template.
+
+        Wide-crop forward passes with the frozen template; returns the best
+        frame-space candidate without mutating ``self._state``. Same interface
+        as SGLATracker.redetect() so the CSC runner's ``_try_sgla_redetect``
+        works for AVTrack unchanged (it calls ``tracker.redetect()`` generically).
+        """
+        if self._model is None or self._z_tensor is None or self._state is None:
+            return None
+        if self._hann is None:
+            self._hann = _make_hann(self._device)
+
+        _factors = tuple(float(f) for f in (factors or (8.0, 12.0, 16.0)) if float(f) > 0.0)
+        if not _factors:
+            return None
+
+        H, W = frame.shape[:2]
+        anchors: list[tuple[str, BBox]] = []
+        if include_current:
+            anchors.append(("current", self._state))
+        if anchor_bboxes:
+            for i, b in enumerate(anchor_bboxes):
+                if b is not None and b.w > 0 and b.h > 0:
+                    anchors.append((f"hint{i}", b))
+
+        if grid_size and grid_size > 1:
+            ref = anchor_bboxes[0] if anchor_bboxes else self._state
+            gw = max(1.0, float(ref.w))
+            gh = max(1.0, float(ref.h))
+            for gy in range(int(grid_size)):
+                cy = (gy + 0.5) * float(H) / float(grid_size)
+                for gx in range(int(grid_size)):
+                    cx = (gx + 0.5) * float(W) / float(grid_size)
+                    anchors.append((
+                        f"grid{gy}_{gx}",
+                        BBox(x=cx - gw / 2.0, y=cy - gh / 2.0, w=gw, h=gh),
+                    ))
+
+        # De-duplicate near-identical anchors.
+        uniq: list[tuple[str, BBox]] = []
+        seen: set[tuple[int, int, int, int]] = set()
+        for name, b in anchors:
+            key = (
+                int(round(b.x + b.w / 2.0)),
+                int(round(b.y + b.h / 2.0)),
+                int(round(b.w)),
+                int(round(b.h)),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            uniq.append((name, b))
+
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        best: dict | None = None
+        collected: list[dict] = []
+
+        for anchor_name, anchor in uniq:
+            for factor in _factors:
+                patch, resize_factor = _sample_target(rgb, anchor, factor, _SEARCH_SIZE)
+                x_tensor = _to_tensor(patch, self._device)
+                with torch.no_grad():
+                    out = self._model(
+                        template=self._z_tensor,
+                        search=x_tensor,
+                        template_anno=[],
+                        search_anno=[],
+                        is_distill=False,
+                    )
+                    score_map = self._hann * out["score_map"]
+
+                    # Identity verification via backbone_feat (same N_Z+N_X layout as SGLATrack).
+                    _bf = None
+                    _crop_sim_init = float("nan")
+                    if self._initial_template_embedding is not None and "backbone_feat" in out:
+                        _bf = out["backbone_feat"][:, -_N_X:, :].squeeze(0)  # (256, 192) search tokens
+                        _scf = score_map.reshape(_N_X)
+                        _pk = int(_scf.argmax().item())
+                        _crop_sim_init = _sim_init_at_cell(
+                            _bf, _pk // _FEAT_SZ, _pk % _FEAT_SZ, self._initial_template_embedding
+                        )
+
+                    flat = score_map.reshape(-1)
+                    f_max = float(flat.max())
+                    f_min = float(flat.min())
+                    denom = float(((flat - f_min) ** 2).mean())
+                    apce = float((f_max - f_min) ** 2 / max(denom, 1e-8))
+                    if apce < min_apce:
+                        continue
+
+                    f_pos = flat - flat.min()
+                    probs = f_pos / (f_pos.sum() + 1e-8)
+                    entropy = float(-(probs * (probs + 1e-8).log()).sum())
+
+                    peak_indices = _select_candidate_peak_indices(
+                        score_map, max_candidates=max(1, int(max_candidates))
+                    )
+                    top_score = float(flat[peak_indices[0]]) if peak_indices else 0.0
+
+                for cand_idx in peak_indices:
+                    cand = _candidate_bbox_from_peak(
+                        idx=cand_idx,
+                        score=float(flat[cand_idx]),
+                        top_score=top_score,
+                        size_map=out["size_map"],
+                        offset_map=out["offset_map"],
+                        prev_bbox=anchor,
+                        resize_factor=resize_factor,
+                        rank=peak_indices.index(cand_idx),
+                    )
+                    x, y, bw, bh = cand["bbox"]
+                    bx = min(max(float(x), 0.0), max(0.0, float(W) - 1.0))
+                    by = min(max(float(y), 0.0), max(0.0, float(H) - 1.0))
+                    bw = max(1.0, min(float(bw), float(W) - bx))
+                    bh = max(1.0, min(float(bh), float(H) - by))
+                    cx = bx + bw / 2.0
+                    cy = by + bh / 2.0
+                    cand["bbox"] = [float(bx), float(by), float(bw), float(bh)]
+                    cand["center"] = [float(cx), float(cy)]
+
+                    score_ratio = float(cand.get("score_ratio", 0.0))
+                    quality = float(apce) * max(0.05, score_ratio)
+
+                    _c_row = cand.get("row")
+                    _c_col = cand.get("col")
+                    if _bf is not None and _c_row is not None and _c_col is not None:
+                        _cand_sim_init = _sim_init_at_cell(
+                            _bf, int(_c_row), int(_c_col), self._initial_template_embedding
+                        )
+                    else:
+                        _cand_sim_init = float(_crop_sim_init)
+
+                    out_cand = {
+                        "bbox": cand["bbox"],
+                        "center": cand["center"],
+                        "score": float(cand.get("score", 0.0)),
+                        "score_ratio": score_ratio,
+                        "rank": int(cand.get("rank", 0)),
+                        "factor": float(factor),
+                        "anchor": anchor_name,
+                        "apce": float(apce),
+                        "response_entropy": float(entropy),
+                        "quality": float(quality),
+                        "sim_to_init": float(_cand_sim_init),
+                    }
+                    if best is None or _redetect_rank_key(out_cand, rank_by) > _redetect_rank_key(best, rank_by):
+                        best = out_cand
+                    if top_k and top_k > 1:
+                        collected.append(out_cand)
+
+        if top_k and top_k > 1:
+            return _redetect_topk(collected, rank_by, int(top_k))
+        return best
+
     def reset(self) -> None:
         self._z_tensor = None
         self._state = None
         self._update_enabled = True
+        self._search_factor = _SEARCH_FACTOR
+        self._initial_template_embedding = None
+        self._last_cosine_sim = 1.0
 
     def set_update_enabled(self, enabled: bool) -> None:
         """CSCAdvisor gate. AVTrack has no internal template update — this is a no-op
         but satisfies the _try_set_update_enabled() protocol in run_with_csc.py."""
         self._update_enabled = bool(enabled)
 
+    def override_search_center(self, cx: float, cy: float, w: float, h: float) -> None:
+        """Relocate the search region for the next update() (control hook).
+
+        AVTrack crops the search region around ``self._state`` each frame, so
+        setting it relocates where the tracker looks next — the lever behind
+        motion_bridge LA recovery, FC hold_lastgood, and the FC challenge switch.
+        Mirrors SGLATracker.override_search_center."""
+        self._state = BBox(x=cx - w / 2, y=cy - h / 2, w=w, h=h)
+
+    def set_search_factor(self, factor: float) -> None:
+        """Widen/narrow the search region for the next update() (LA recovery hook).
+
+        Search crop side = sqrt(w*h) * factor. Clamped to [base, 4*base] to avoid
+        degenerate low-resolution crops. Mirrors SGLATracker.set_search_factor."""
+        base = _SEARCH_FACTOR
+        self._search_factor = float(min(max(float(factor), base), 4.0 * base))
+
+    def reset_search_factor(self) -> None:
+        """Restore the default search-region factor (recovery complete)."""
+        self._search_factor = _SEARCH_FACTOR
+
     @property
     def capabilities(self):
         from uav_tracker.trackers.capabilities import TrackerCapabilities
-        return TrackerCapabilities()  # all defaults: only can_reject_bbox + can_force_reinit
+        # can_widen_search: set_search_factor() + override_search_center() are now
+        # wired (AVTrack crops around self._state like SGLATrack), so search-region
+        # control levers (widen / relocate / motion_bridge / FC hold_lastgood) apply.
+        # can_freeze_template stays False: AVTrack has no online template update.
+        return TrackerCapabilities(can_widen_search=True)
 
     @property
     def is_stub_mode(self) -> bool:

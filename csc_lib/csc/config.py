@@ -72,6 +72,10 @@ class CSCLossConfig:
     forecast_failure_weight: float = 0.5
     forecast_fc_weight: float = 0.8
     forecast_lost_weight: float = 0.6
+    # Focal modulation for the LOST forecast head only (0 = plain BCE).
+    # >0 down-weights confident-correct positives → de-saturates an over-confident
+    # lost_aware head so its probability spreads enough to be a control gate.
+    forecast_lost_focal_gamma: float = 0.0
 
 
 @dataclass
@@ -138,6 +142,7 @@ class CSCTrainConfig:
             forecast_failure_weight=loss_d.get("forecast_failure_weight", 0.5),
             forecast_fc_weight=loss_d.get("forecast_fc_weight", 0.8),
             forecast_lost_weight=loss_d.get("forecast_lost_weight", 0.6),
+            forecast_lost_focal_gamma=loss_d.get("forecast_lost_focal_gamma", 0.0),
         )
 
         # Parse optim config — allow extra keys gracefully

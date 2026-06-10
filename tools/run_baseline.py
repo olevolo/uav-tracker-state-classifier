@@ -39,7 +39,7 @@ sys.path.insert(0, str(PROJECT_ROOT / "salrtd" / "src"))
 sys.path.insert(0, str(PROJECT_ROOT / "src"))   # takes priority over salrtd
 sys.path.insert(0, str(PROJECT_ROOT))
 
-_TRACKER_NAMES = ["sglatrack", "ostrack", "ortrack", "avtrack", "evptrack", "fartrack", "uetrack"]
+_TRACKER_NAMES = ["sglatrack", "ostrack", "ortrack", "avtrack", "evptrack", "fartrack", "uetrack", "mobiletrack"]
 
 
 def _git_commit() -> Optional[str]:
@@ -92,6 +92,7 @@ def _load_tracker(name: str, weights_path: Optional[str], device: str,
         "evptrack":  "uav_tracker.trackers.evptrack",
         "fartrack":  "uav_tracker.trackers.fartrack",
         "uetrack":   "uav_tracker.trackers.uetrack",
+        "mobiletrack": "uav_tracker.trackers.siamese.mobiletrack",
     }
     if name not in _adapter_map:
         raise SystemExit(
