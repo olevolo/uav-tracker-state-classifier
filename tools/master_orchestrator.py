@@ -27,7 +27,6 @@ PYTHON = sys.executable
 # Make tools/ importable as a flat namespace
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT / "src"))
-sys.path.insert(0, str(ROOT / "salrtd/src"))
 TOOLS = ROOT / "tools"
 CONFIGS = ROOT / "configs/csc"
 CALIB_DIR = ROOT / "outputs/calibration"

@@ -19,9 +19,8 @@ from pathlib import Path
 import numpy as np
 
 # Replicate run_with_csc.py sys.path so src/ csc_uav_tracking + csc_lib resolve
-# (src/ wins over salrtd/src/ and the editable entropy-tracker install).
+# (src/ is the canonical lib path).
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(PROJECT_ROOT / "salrtd" / "src"))
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 sys.path.insert(0, str(PROJECT_ROOT))
 

@@ -50,7 +50,7 @@ import numpy as np
 
 # ---- sys.path: mirror tools/la_smoke.py header EXACTLY (live tracker shadows) ----
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-for _p in (PROJECT_ROOT / "salrtd" / "src", PROJECT_ROOT / "src", PROJECT_ROOT, PROJECT_ROOT / "tools"):
+for _p in (PROJECT_ROOT / "src", PROJECT_ROOT, PROJECT_ROOT / "tools"):
     sys.path.insert(0, str(_p))
 
 # v4 shared enums (single source of truth for subtype meanings).

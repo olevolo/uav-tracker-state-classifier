@@ -21,7 +21,7 @@ import torch
 from sklearn.metrics import roc_auc_score, average_precision_score
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-for _p in (PROJECT_ROOT / "salrtd" / "src", PROJECT_ROOT / "src", PROJECT_ROOT, PROJECT_ROOT / "tools"):
+for _p in (PROJECT_ROOT / "src", PROJECT_ROOT, PROJECT_ROOT / "tools"):
     sys.path.insert(0, str(_p))
 
 from csc_lib.csc.v4.model_v4 import CSCv4

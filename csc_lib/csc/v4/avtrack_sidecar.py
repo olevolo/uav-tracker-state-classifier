@@ -315,7 +315,7 @@ class AVTrackSidecar:
                 return False
 
             # INTEGRATION: import the live AVTrack adapter. Requires src/ on sys.path
-            # (the loader tools prepend salrtd/src, src, PROJECT_ROOT — see la_smoke.py).
+            # (the loader tools prepend src, PROJECT_ROOT — see la_smoke.py).
             from uav_tracker.trackers.avtrack import AVTrackAdapter  # type: ignore
 
             adapter = AVTrackAdapter(

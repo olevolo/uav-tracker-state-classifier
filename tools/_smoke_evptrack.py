@@ -27,7 +27,6 @@ def main() -> int:
     log(f"[1/8] python={sys.version.split()[0]}  CUDA={torch.cuda.is_available()}  threads={torch.get_num_threads()}")
 
     _REPO = Path(__file__).resolve().parents[1]
-    sys.path.insert(0, str(_REPO / "salrtd" / "src"))
     sys.path.insert(0, str(_REPO / "src"))
 
     log("[2/8] importing uav_tracker registry")

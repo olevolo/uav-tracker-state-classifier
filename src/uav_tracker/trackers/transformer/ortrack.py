@@ -321,7 +321,7 @@ class ORTrackDeiT:
             score_map, out["size_map"], out["offset_map"]
         ).view(-1, 4)
 
-        # Confidence = post-Hann score-map peak (f_max), identical to the salrtd
+        # Confidence = post-Hann score-map peak (f_max), identical to the legacy
         # ORTrack adapter's `score_max` (ortrack.py:340) and to the statistic the
         # ortrack_*_v2 calibrator was fit on. The previous top-3-softmax over the
         # 16x16 map collapsed to a ~3/256=0.012 floor (softmax of a near-uniform

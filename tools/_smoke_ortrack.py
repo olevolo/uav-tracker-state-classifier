@@ -12,7 +12,7 @@ from pathlib import Path
 
 # Inject src/ paths so this script works without `pip install -e .`
 ROOT = Path(__file__).resolve().parents[1]
-for sub in ("salrtd/src", "src"):
+for sub in ("src"):
     p = str(ROOT / sub)
     if p not in sys.path:
         sys.path.insert(0, p)

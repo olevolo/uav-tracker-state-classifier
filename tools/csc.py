@@ -217,7 +217,7 @@ def _run_pipeline(args: argparse.Namespace) -> None:
     # ------------------------------------------------------------------
     step += 1
     # Check adapter file freshness
-    adapter_file = _REPO / "salrtd" / "src" / "uav_tracker" / "trackers" / f"{tracker}.py"
+    adapter_file = _REPO / "src" / "uav_tracker" / "trackers" / f"{tracker}.py"
     need_baseline = not manifest_path.exists() or not _is_fresh(
         state, "baseline", adapter_file if adapter_file.exists() else None
     )

@@ -4,7 +4,7 @@ State-aware diagnostic and optional control layer for visual trackers.
 Predicts tracking state (confirmed / uncertain / occluded / lost / distractor /
 false_confirmed) from tracker telemetry.
 
-Reused from prior SALT-RD work (now archived under ../salrtd/):
+Reused from prior SALT-RD work:
     - dataset loaders (UAV123, DTB70, VisDrone-SOT, LaSOT, GOT-10k)
     - telemetry features (motion entropy, tracker confidence, optical flow)
     - feature schema (28-dim telemetry window)

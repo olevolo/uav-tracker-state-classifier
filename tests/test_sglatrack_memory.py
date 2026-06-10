@@ -24,7 +24,6 @@ import pytest
 # Make the source packages importable without installation.
 _PROJECT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_PROJECT / "src"))
-sys.path.insert(0, str(_PROJECT / "salrtd" / "src"))
 
 
 def _weights_present() -> bool:

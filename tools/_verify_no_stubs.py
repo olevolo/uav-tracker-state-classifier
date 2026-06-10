@@ -28,7 +28,6 @@ from pathlib import Path
 import cv2, torch
 
 repo = Path(__file__).resolve().parents[1] if "__file__" in dir() else Path(os.getcwd())
-sys.path.insert(0, str(repo / "salrtd" / "src"))
 sys.path.insert(0, str(repo / "src"))
 
 name = sys.argv[1]

@@ -6,6 +6,8 @@ from uav_tracker.registry import DATASETS  # noqa: F401
 from uav_tracker.datasets.base import Dataset, Sequence  # noqa: F401
 
 from uav_tracker.datasets import synthetic as _synthetic_plugin  # noqa: F401
-# The import above triggers the @DATASETS.register("synthetic") side-effect.
+from uav_tracker.datasets import lasot as _lasot_plugin  # noqa: F401
+from uav_tracker.datasets import got10k as _got10k_plugin  # noqa: F401
+# The imports above trigger @DATASETS.register(...) side-effects.
 
 __all__ = ["DATASETS", "Dataset", "Sequence"]

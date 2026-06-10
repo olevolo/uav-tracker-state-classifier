@@ -13,9 +13,9 @@ import sys
 import time
 from pathlib import Path
 
-# Ensure salrtd/src and src/ are importable before any project imports.
+# Ensure src/ is importable before any project imports.
 _REPO = Path(__file__).resolve().parents[1]
-for sub in ("salrtd/src", "src"):
+for sub in ("src"):
     p = _REPO / sub
     if str(p) not in sys.path:
         sys.path.insert(0, str(p))

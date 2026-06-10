@@ -22,9 +22,9 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-# Add the salrtd src dir so ``import uav_tracker`` works without install.
+# Add the src dir so ``import uav_tracker`` works without install.
 _REPO_ROOT = Path(__file__).resolve().parents[1]
-_SALRTD_SRC = _REPO_ROOT / "salrtd" / "src"
+_SRC = _REPO_ROOT / "src"
 if str(_SALRTD_SRC) not in sys.path:
     sys.path.insert(0, str(_SALRTD_SRC))
 

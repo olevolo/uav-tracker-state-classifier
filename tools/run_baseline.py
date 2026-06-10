@@ -5,7 +5,7 @@ Saves:
     outputs/baselines/<tracker>/<dataset>/<split>/telemetry/<seq>.jsonl
     outputs/baselines/<tracker>/<dataset>/<split>/manifest.json
 
-Tracker adapters live in ``salrtd/src/uav_tracker/trackers/<name>.py``.
+Tracker adapters live in ``src/uav_tracker/trackers/<name>.py``.
 This script imports each adapter explicitly before building via the registry
 so the ``@TRACKERS.register(...)`` decorator fires at the right time.
 
@@ -34,9 +34,8 @@ import psutil as _psutil
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 # Make both the new src package and the archived SALT-RD package importable.
-# NEW src must come BEFORE salrtd/src so updated adapters (with identity features) take priority.
-sys.path.insert(0, str(PROJECT_ROOT / "salrtd" / "src"))
-sys.path.insert(0, str(PROJECT_ROOT / "src"))   # takes priority over salrtd
+# src/uav_tracker has the canonical adapters.
+sys.path.insert(0, str(PROJECT_ROOT / "src"))
 sys.path.insert(0, str(PROJECT_ROOT))
 
 _TRACKER_NAMES = ["sglatrack", "ostrack", "ortrack", "avtrack", "evptrack", "fartrack", "uetrack", "mobiletrack"]
@@ -105,9 +104,9 @@ def _load_tracker(name: str, weights_path: Optional[str], device: str,
         from uav_tracker.registry import TRACKERS
     except Exception as exc:
         raise SystemExit(
-            f"Failed to import tracker adapter {name!r} from salrtd/src/uav_tracker.\n"
+            f"Failed to import tracker adapter {name!r} from src/uav_tracker.\n"
             f"Underlying error: {exc!r}\n"
-            "Ensure salrtd/ exists and the relevant external tracker repo is present."
+            "Ensure the relevant external tracker repo is present at papers/code/."
         )
 
     if name not in TRACKERS:

@@ -24,7 +24,7 @@ from typing import Iterable
 import numpy as np
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-for _p in (PROJECT_ROOT / "salrtd" / "src", PROJECT_ROOT / "src", PROJECT_ROOT):
+for _p in (PROJECT_ROOT / "src", PROJECT_ROOT):
     sys.path.insert(0, str(_p))
 
 import csc_uav_tracking  # noqa: F401

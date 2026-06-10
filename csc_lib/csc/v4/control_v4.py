@@ -60,14 +60,14 @@ import numpy as np
 
 # L13: when run as a standalone script (`python csc_lib/csc/v4/control_v4.py`) the
 # repo root is not on sys.path, so the absolute `csc_lib...` import below would fail.
-# Mirror the la_smoke header (salrtd/src, src, repo root) so the smoke runs both
+# Mirror the la_smoke header (src, repo root) so the smoke runs both
 # standalone AND via `-m`. Guarded on __package__ so normal imports are untouched.
 if not __package__:  # executed directly, not imported / not `-m`
     import sys as _sys
     from pathlib import Path as _Path
 
     _ROOT = _Path(__file__).resolve().parents[3]  # csc_lib/csc/v4/.. -> repo root
-    for _p in (_ROOT / "salrtd" / "src", _ROOT / "src", _ROOT):
+    for _p in (_ROOT / "src", _ROOT):
         _sp = str(_p)
         if _sp not in _sys.path:
             _sys.path.insert(0, _sp)
@@ -1480,7 +1480,7 @@ def _smoke() -> None:
 
 
 if __name__ == "__main__":
-    # The la_smoke-style sys.path header (salrtd/src, src, repo root) is applied at
+    # The la_smoke-style sys.path header (src, repo root) is applied at
     # module top under `if not __package__` (L13) so the absolute csc_lib import
     # resolves when this file is run standalone as well as via `-m`.
     _smoke()

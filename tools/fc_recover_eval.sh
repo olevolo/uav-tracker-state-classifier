@@ -19,7 +19,7 @@ if [ ! -d "$RUN_DIR/predictions" ]; then
 fi
 
 echo "[1/3] evaluate predictions -> $EVAL_DIR"
-PYTHONPATH=src:csc_uav_tracking_sdk/src:salrtd/src:. .venv/bin/python \
+PYTHONPATH=src:csc_uav_tracking_sdk/src:. .venv/bin/python \
   tools/evaluate_tracking_results.py \
     --dataset uav123 --split test \
     --pred_dir "$RUN_DIR/predictions" \

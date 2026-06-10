@@ -38,10 +38,7 @@ from typing import Any, Optional
 import numpy as np
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-
-sys.path.insert(0, str(PROJECT_ROOT / "salrtd" / "src"))
-sys.path.insert(0, str(PROJECT_ROOT / "src"))   # src/ wins over salrtd/src/
-sys.path.insert(0, str(PROJECT_ROOT))
+sys.path.insert(0, str(PROJECT_ROOT / "src"))   sys.path.insert(0, str(PROJECT_ROOT))
 
 # Limit PyTorch thread-pool to avoid tracker/CSC inter-thread contention.
 # Hardware: M4 Pro (10 P-cores + 4 E-cores). Under typical dev load with
