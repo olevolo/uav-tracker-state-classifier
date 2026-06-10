@@ -136,3 +136,13 @@ salrtd/saltr/tmp/
 *.pkl
 *.npz
 *.bin
+
+# ---- saltr (subproject) heavy artifacts ----
+saltr/results/
+saltr/archive/
+saltr/checkpoints/
+
+# ---- video demos ----
+*.mp4
+*.avi
+*.mov
