@@ -1,0 +1,34 @@
+# MobileTrack — IET Image Processing 2022 deep tracker (UAV-tuned SiamBAN).
+#
+# Reference: Xue, F. et al. (2022). "MobileTrack: Lightweight mobile network
+#            for UAV single object tracking." *IET Image Processing* 16,
+#            3300-3313. DOI: 10.1049/ipr2.12553
+#
+# Backbone: MobileNetV2 (width_mult=1.4, used_layers=[3,5,7])
+# Neck:     AdjustAllLayer (44/134/448 -> 256/256/256)
+# Head:     MultiBAN (3 DepthwiseBAN branches, weighted average)
+# Crops:    template 127x127, search 255x255, score-map 25x25
+#
+# Tracker is registered as `mobiletrack`. The adapter module lives at
+# `src/uav_tracker/trackers/siamese/mobiletrack.py` and self-registers
+# on import (see `trackers/__init__.py`).
+#
+# Hyper-parameters below match the upstream config.yaml TRACK section
+# (and Optuna best on UAV123).
+
+name: mobiletrack
+tier_hint: 1
+args:
+  device: auto                # "auto" picks cuda > mps > cpu
+  dtype: float32              # "float16" needs CUDA or MPS
+  # SiamBAN-derived MobileTrack source repo (provides siamban.models.*).
+  # Can also be set via the $SIAMBAN_REPO environment variable.
+  mobiletrack_repo: ~/projects/MobileTrack
+  # Default checkpoint location. We point at the existing checkpoint in the
+  # sibling project so no copy / symlink is required. Override via
+  # $UAV_WEIGHTS_ROOT/mobiletrack/MobileTrack-UAV123-DTB70.pth or pass
+  # weights_path explicitly.
+  weights_path: /Users/voleksiuk/projects/uav-entropy-tracker/mobiletrack_data/[IET 2022] MobileTrack/MobileTrack-UAV123-DTB70.pth
+  window_influence: 0.061     # cosine-window dampening
+  penalty_k: 0.130            # scale / aspect-ratio penalty exponent
+  scale_lr: 0.782             # bbox-size update learning rate

@@ -12,7 +12,9 @@ Expected weights: $UAV_WEIGHTS_ROOT/sglatrack/sglatrack_ep0297.pth.tar
 from __future__ import annotations
 
 import logging
+import json
 import math
+import os
 import pickle
 import sys
 import types
@@ -133,14 +135,19 @@ def _sample_target(frame: np.ndarray, bbox: BBox, factor: float,
                    out_size: int) -> tuple[np.ndarray, float]:
     """Mean-padded square crop centred on bbox. Returns (patch_rgb, resize_factor)."""
     x, y, w, h = bbox.x, bbox.y, bbox.w, bbox.h
+    H, W = frame.shape[:2]
     crop_sz = max(1, round(math.sqrt(w * h) * factor))
+    # Defensive cap: a drifted/large bbox combined with a widened search factor
+    # can blow crop_sz up to tens of thousands of px → huge cv2 allocations / OOM.
+    # Cap at 1.5x the long frame side — still allows a near-whole-frame search for
+    # a lost target, but bounds the allocation. Normal target crops are far below.
+    crop_sz = min(crop_sz, max(out_size, int(1.5 * max(H, W))))
     cx, cy = x + w / 2, y + h / 2
     x1 = round(cx - crop_sz / 2)
     y1 = round(cy - crop_sz / 2)
     x2 = x1 + crop_sz
     y2 = y1 + crop_sz
 
-    H, W = frame.shape[:2]
     x1p = max(0, -x1);  y1p = max(0, -y1)
     x2p = max(x2 - W, 0); y2p = max(y2 - H, 0)
 
@@ -168,100 +175,14 @@ def _make_hann(device: torch.device) -> torch.Tensor:
     return (h1d.unsqueeze(1) * h1d.unsqueeze(0)).unsqueeze(0).unsqueeze(0).to(device)
 
 
-def _select_candidate_peak_indices(
-    score_map: torch.Tensor,
-    max_candidates: int = 5,
-    nms_radius: int = 1,
-    min_score_ratio: float = 0.05,
-) -> list[int]:
-    """Select spatially distinct score-map peaks with greedy NMS.
-
-    The raw top-2 cells are often adjacent samples from the same response peak.
-    For distractor analysis we need separate candidate modes, so we greedily
-    suppress cells within ``nms_radius`` grid steps of already selected peaks.
-    """
-    flat = score_map.reshape(-1)
-    if flat.numel() == 0 or max_candidates <= 0:
-        return []
-
-    order = torch.argsort(flat, descending=True)
-    top_score = float(flat[order[0]])
-    selected: list[int] = []
-
-    for idx_t in order:
-        idx = int(idx_t.item())
-        score = float(flat[idx])
-        if selected and top_score > 0.0 and score < top_score * min_score_ratio:
-            break
-        row, col = divmod(idx, _FEAT_SZ)
-        too_close = False
-        for prev_idx in selected:
-            prev_row, prev_col = divmod(prev_idx, _FEAT_SZ)
-            if max(abs(row - prev_row), abs(col - prev_col)) <= nms_radius:
-                too_close = True
-                break
-        if too_close:
-            continue
-        selected.append(idx)
-        if len(selected) >= max_candidates:
-            break
-
-    return selected
-
-
-def _candidate_bbox_from_peak(
-    idx: int,
-    score: float,
-    top_score: float,
-    size_map: torch.Tensor,
-    offset_map: torch.Tensor,
-    prev_bbox: BBox,
-    resize_factor: float,
-    rank: int,
-) -> dict:
-    """Decode one score-map peak into frame-space bbox metadata."""
-    row, col = divmod(int(idx), _FEAT_SZ)
-    size_flat = size_map.flatten(2)
-    offset_flat = offset_map.flatten(2)
-
-    gather_idx = torch.tensor([[[idx]]], device=size_map.device, dtype=torch.long)
-    gather_idx = gather_idx.expand(size_flat.shape[0], 2, 1)
-    size = size_flat.gather(dim=2, index=gather_idx).squeeze(-1)[0]
-    offset = offset_flat.gather(dim=2, index=gather_idx).squeeze(-1)[0]
-
-    cx_norm = (float(col) + float(offset[0])) / _FEAT_SZ
-    cy_norm = (float(row) + float(offset[1])) / _FEAT_SZ
-    w_norm = float(size[0])
-    h_norm = float(size[1])
-
-    cx_pred = cx_norm * _SEARCH_SIZE / resize_factor
-    cy_pred = cy_norm * _SEARCH_SIZE / resize_factor
-    w_pred = max(1.0, w_norm * _SEARCH_SIZE / resize_factor)
-    h_pred = max(1.0, h_norm * _SEARCH_SIZE / resize_factor)
-
-    cx_prev = prev_bbox.x + prev_bbox.w / 2
-    cy_prev = prev_bbox.y + prev_bbox.h / 2
-    half = _SEARCH_SIZE / (2 * resize_factor)
-
-    x = cx_prev + cx_pred - half - w_pred / 2
-    y = cy_prev + cy_pred - half - h_pred / 2
-    cx = x + w_pred / 2
-    cy = y + h_pred / 2
-
-    score_ratio = float(score / (top_score + 1e-8)) if top_score > 0 else 0.0
-    grid_center_distance = float((((row - 7.5) ** 2 + (col - 7.5) ** 2) ** 0.5))
-
-    return {
-        "rank": int(rank),
-        "index": int(idx),
-        "row": int(row),
-        "col": int(col),
-        "score": float(score),
-        "score_ratio": score_ratio,
-        "grid_center_distance": grid_center_distance,
-        "bbox": [float(x), float(y), float(w_pred), float(h_pred)],
-        "center": [float(cx), float(cy)],
-    }
+from uav_tracker.trackers._redetect_common import (
+    select_candidate_peak_indices as _select_candidate_peak_indices,
+    candidate_bbox_from_peak as _candidate_bbox_from_peak,
+    redetect_rank_key as _redetect_rank_key,
+    redetect_topk as _redetect_topk,
+    sim_init_at_cell as _sim_init_at_cell,
+    peak_local_embedding as _peak_local_embedding,
+)
 
 
 def _extract_candidate_diagnostics(
@@ -347,6 +268,16 @@ class SGLATracker:
         self._enable_ce = enable_ce
         self._model = None
         self._hann: torch.Tensor | None = None
+        # Exit-router hook: set by run_with_csc.py before each update() call.
+        # -1 = let SGLATrack MLP decide; 0-5 = force MLP output index → block 6-11.
+        self._force_layer_idx: int = -1
+        # Wider-search hook: search-crop area factor for the NEXT update(). The
+        # crop side is sqrt(w*h)*factor; default 4.0 == baseline behaviour. The
+        # control loop raises this on LOST (LA) to widen the search region (the
+        # proper recovery action) and resets it on recovery. Back-projection is
+        # done via resize_factor, so a per-frame factor change is localisation-
+        # consistent. See set_search_factor() / capabilities.can_widen_search.
+        self._search_factor: float = _SEARCH_FACTOR
         self._z_tensor: torch.Tensor | None = None    # template tensor on device
         self._state: BBox | None = None
         self._is_stub: bool = True
@@ -359,8 +290,13 @@ class SGLATracker:
         self._last_search_score_weighted: torch.Tensor | None = None
         self._last_search_peak_local: torch.Tensor | None = None
         self._last_template_embedding: torch.Tensor | None = None
+        # Identity / appearance drift signals (set in update(), reset in init()).
+        self._initial_template_embedding: torch.Tensor | None = None  # frozen at frame 0
+        self._initial_template_sim: float = 1.0   # cosine(search_t, template_0)
+        self._last_cosine_sim: float = 1.0         # cosine(search_t, template_current)
         # Optional SALT-RD Stage 2 advisory controller.
         self._salt_rd_advisor: object | None = None
+        self._update_enabled: bool = True
 
     def _reset_embedding_cache(self) -> None:
         """Reset per-frame embedding cache. Call at init() and any early-return path."""
@@ -368,6 +304,9 @@ class SGLATracker:
         self._last_search_score_weighted = None
         self._last_search_peak_local = None
         self._last_template_embedding = None
+        self._initial_template_embedding = None
+        self._initial_template_sim = 1.0
+        self._last_cosine_sim = 1.0
 
     @property
     def _device(self) -> torch.device:
@@ -419,6 +358,9 @@ class SGLATracker:
         # previous sequence or tracking episode.
         self._template_update_count = 0
         self._template_last_update = 0
+        self._update_enabled = True
+        self._force_layer_idx = -1
+        self._search_factor = _SEARCH_FACTOR
         if self._salt_rd_advisor is not None:
             self._salt_rd_advisor.reset()
         # OpenCV delivers BGR — SGLATrack expects RGB
@@ -433,12 +375,16 @@ class SGLATracker:
             return TrackState(bbox=BBox(0, 0, 1, 1), confidence=0.0, status="lost")
 
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        patch, resize_factor = _sample_target(rgb, self._state, _SEARCH_FACTOR, _SEARCH_SIZE)
+        patch, resize_factor = _sample_target(rgb, self._state, self._search_factor, _SEARCH_SIZE)
         x_tensor = _to_tensor(patch, self._device)
 
         with torch.no_grad():
-            out = self._model(template=self._z_tensor, search=x_tensor,
-                              ce_template_mask=None)
+            out = self._model(
+                template=self._z_tensor,
+                search=x_tensor,
+                ce_template_mask=None,
+                force_layer_idx=int(self._force_layer_idx),
+            )
 
             # --- Per-frame embedding export hook ---
             # Extracts 3 views of search appearance + template embedding.
@@ -466,6 +412,23 @@ class SGLATracker:
 
                 # Template embedding: mean-pool over 64 template tokens
                 self._last_template_embedding = _bfeat[:, :64, :].mean(dim=1).squeeze(0)  # (192,)
+
+                # Identity / drift signals: compare search vs initial and current template.
+                if self._initial_template_embedding is None:
+                    # First update call — freeze the initial template embedding forever.
+                    self._initial_template_embedding = self._last_template_embedding.clone()
+                self._last_cosine_sim = float(
+                    F.cosine_similarity(
+                        self._last_search_global.unsqueeze(0),
+                        self._last_template_embedding.unsqueeze(0),
+                    ).item()
+                )
+                self._initial_template_sim = float(
+                    F.cosine_similarity(
+                        self._last_search_global.unsqueeze(0),
+                        self._initial_template_embedding.unsqueeze(0),
+                    ).item()
+                )
             else:
                 # Reset to None so stale values never silently persist across frames
                 self._last_search_global = None
@@ -564,6 +527,16 @@ class SGLATracker:
             w=max(1.0, w_pred),
             h=max(1.0, h_pred),
         )
+        # Clamp to frame bounds (project rule: every adapter must clip bbox to
+        # frame dims). Without this a drifted prediction can grow unbounded and,
+        # under the wider-search lever, feed an ever-larger search crop (runaway /
+        # OOM). On well-tracked frames the box is inside the frame → no-op.
+        _H_img, _W_img = frame.shape[:2]
+        _bx = min(max(new_bbox.x, 0.0), max(0.0, float(_W_img) - 1.0))
+        _by = min(max(new_bbox.y, 0.0), max(0.0, float(_H_img) - 1.0))
+        _bw = max(1.0, min(new_bbox.w, float(_W_img) - _bx))
+        _bh = max(1.0, min(new_bbox.h, float(_H_img) - _by))
+        new_bbox = BBox(x=_bx, y=_by, w=_bw, h=_bh)
         self._state = new_bbox
 
         if confidence > 0.25:
@@ -581,8 +554,233 @@ class SGLATracker:
             psr=psr,
             response_entropy=response_entropy,
             score_map_stats=_score_map_stats,
-            aux={"score_map_stats": _score_map_stats},
+            aux={
+                "score_map_stats": _score_map_stats,
+                "selected_block": out.get("selected_block"),
+            },
         )
+
+    def redetect(
+        self,
+        frame: np.ndarray,
+        *,
+        factors: tuple[float, ...] | list[float] | None = None,
+        anchor_bboxes: list[BBox] | None = None,
+        include_current: bool = True,
+        grid_size: int = 0,
+        max_candidates: int = 3,
+        min_apce: float = 0.0,
+        rank_by: str = "quality",
+        top_k: int = 1,
+        frame_idx: int = -1,
+    ) -> dict | list[dict] | None:
+        """Event-driven self re-detection using the frozen SGLATrack template.
+
+        This is intentionally side-effect-light: it runs extra template/search
+        forwards on wide crops and returns the best frame-space candidate, but it
+        does not mutate ``self._state`` or the template. The CSC runner decides
+        whether to accept the candidate and applies it causally before the next
+        ``update()`` via ``override_search_center``.
+
+        If the env var ``SGLA_REDETECT_DUMP`` points at a path, one JSON line per
+        decoded candidate is appended for offline separation analysis (the chosen
+        best candidate is flagged ``"chosen": true``). Zero overhead when unset.
+        """
+        if self._model is None or self._z_tensor is None or self._state is None:
+            return None
+        if self._hann is None:
+            self._hann = _make_hann(self._device)
+
+        _factors = tuple(float(f) for f in (factors or (8.0, 12.0, 16.0)) if float(f) > 0.0)
+        if not _factors:
+            return None
+
+        H, W = frame.shape[:2]
+        anchors: list[tuple[str, BBox]] = []
+        if include_current:
+            anchors.append(("current", self._state))
+        if anchor_bboxes:
+            for i, b in enumerate(anchor_bboxes):
+                if b is not None and b.w > 0 and b.h > 0:
+                    anchors.append((f"hint{i}", b))
+
+        if grid_size and grid_size > 1:
+            ref = anchor_bboxes[0] if anchor_bboxes else self._state
+            gw = max(1.0, float(ref.w))
+            gh = max(1.0, float(ref.h))
+            for gy in range(int(grid_size)):
+                cy = (gy + 0.5) * float(H) / float(grid_size)
+                for gx in range(int(grid_size)):
+                    cx = (gx + 0.5) * float(W) / float(grid_size)
+                    anchors.append((
+                        f"grid{gy}_{gx}",
+                        BBox(x=cx - gw / 2.0, y=cy - gh / 2.0, w=gw, h=gh),
+                    ))
+
+        # De-duplicate near-identical anchors; current + last-good often match.
+        uniq: list[tuple[str, BBox]] = []
+        seen: set[tuple[int, int, int, int]] = set()
+        for name, b in anchors:
+            key = (
+                int(round(b.x + b.w / 2.0)),
+                int(round(b.y + b.h / 2.0)),
+                int(round(b.w)),
+                int(round(b.h)),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            uniq.append((name, b))
+
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        best: dict | None = None
+        collected: list[dict] = []   # only populated when top_k > 1 (association)
+
+        # Optional per-candidate debug dump (env-gated → zero overhead when unset).
+        _dump_path = os.environ.get("SGLA_REDETECT_DUMP") or None
+        _dump_rows: list[dict] = []
+
+        for anchor_name, anchor in uniq:
+            for factor in _factors:
+                patch, resize_factor = _sample_target(rgb, anchor, factor, _SEARCH_SIZE)
+                x_tensor = _to_tensor(patch, self._device)
+                with torch.no_grad():
+                    out = self._model(
+                        template=self._z_tensor,
+                        search=x_tensor,
+                        ce_template_mask=None,
+                        force_layer_idx=-1,
+                    )
+                    score_map = self._hann * out["score_map"]
+                    # Candidate appearance-verification signal: cosine of a
+                    # peak-LOCAL search embedding to the FROZEN initial template
+                    # (the V4 verifier's identity floor). Lets the runner REJECT
+                    # distractor jumps where the score map is sharp but the
+                    # content is the wrong object (bird1_1/car11).
+                    #
+                    # ``_bf`` are the 256 search tokens for THIS (anchor, factor)
+                    # crop; the per-candidate sim is gathered at each candidate's
+                    # own grid cell below. ``_crop_sim_init`` is the TOP-peak value,
+                    # retained only as a fallback when a candidate has no locatable
+                    # grid index.
+                    _bf = None
+                    _crop_sim_init = float("nan")
+                    if self._initial_template_embedding is not None and "backbone_feat" in out:
+                        _bf = out["backbone_feat"][:, -256:, :].squeeze(0)   # (256,192) search tokens
+                        _scf = score_map.reshape(256)
+                        _pk = int(_scf.argmax().item())
+                        _crop_sim_init = _sim_init_at_cell(
+                            _bf, _pk // 16, _pk % 16, self._initial_template_embedding)
+                    flat = score_map.reshape(-1)
+                    f_max = float(flat.max())
+                    f_min = float(flat.min())
+                    denom = float(((flat - f_min) ** 2).mean())
+                    apce = float((f_max - f_min) ** 2 / max(denom, 1e-8))
+                    if apce < min_apce:
+                        continue
+                    f_pos = flat - flat.min()
+                    probs = f_pos / (f_pos.sum() + 1e-8)
+                    entropy = float(-(probs * (probs + 1e-8).log()).sum())
+                    diag = _extract_candidate_diagnostics(
+                        score_map=score_map,
+                        size_map=out["size_map"],
+                        offset_map=out["offset_map"],
+                        prev_bbox=anchor,
+                        resize_factor=resize_factor,
+                        max_candidates=max(1, int(max_candidates)),
+                    )
+
+                for cand in diag["candidates"]:
+                    try:
+                        x, y, bw, bh = cand["bbox"]
+                    except (KeyError, TypeError, ValueError):
+                        continue
+                    bx = min(max(float(x), 0.0), max(0.0, float(W) - 1.0))
+                    by = min(max(float(y), 0.0), max(0.0, float(H) - 1.0))
+                    bw = max(1.0, min(float(bw), float(W) - bx))
+                    bh = max(1.0, min(float(bh), float(H) - by))
+                    cx = bx + bw / 2.0
+                    cy = by + bh / 2.0
+                    score_ratio = float(cand.get("score_ratio", 0.0))
+                    # APCE chooses a sharp re-detection crop; score_ratio keeps
+                    # secondary candidates below the crop's dominant mode unless
+                    # they are genuinely competitive.
+                    quality = float(apce) * max(0.05, score_ratio)
+                    # Per-candidate identity floor: gather the peak-local search
+                    # embedding around THIS candidate's own grid cell (its score-map
+                    # row/col) rather than broadcasting the top peak. Falls back to
+                    # the top-peak value only if the candidate lacks a grid index or
+                    # the search tokens are unavailable.
+                    _c_row = cand.get("row")
+                    _c_col = cand.get("col")
+                    _cand_emb_np = None
+                    if _bf is not None and _c_row is not None and _c_col is not None:
+                        _cand_sim_init = _sim_init_at_cell(
+                            _bf, int(_c_row), int(_c_col), self._initial_template_embedding)
+                        # Also extract the raw 192-D peak-local embedding so the
+                        # recover/verifier (csc_lib.csc.recover) can score this
+                        # candidate against memory (anchor / recent / distractor).
+                        _cand_emb_t = _peak_local_embedding(_bf, int(_c_row), int(_c_col))
+                        if _cand_emb_t is not None:
+                            _cand_emb_np = _cand_emb_t.detach().cpu().numpy()
+                    else:
+                        _cand_sim_init = float(_crop_sim_init)
+                    out_cand = {
+                        "bbox": [float(bx), float(by), float(bw), float(bh)],
+                        "center": [float(cx), float(cy)],
+                        "score": float(cand.get("score", 0.0)),
+                        "score_ratio": score_ratio,
+                        "rank": int(cand.get("rank", 0)),
+                        "factor": float(factor),
+                        "anchor": anchor_name,
+                        "apce": float(apce),
+                        "response_entropy": float(entropy),
+                        "quality": float(quality),
+                        "sim_to_init": float(_cand_sim_init),
+                        "embedding": _cand_emb_np,
+                    }
+                    if best is None or _redetect_rank_key(out_cand, rank_by) > _redetect_rank_key(best, rank_by):
+                        best = out_cand
+                    if top_k and top_k > 1:
+                        collected.append(out_cand)
+
+                    if _dump_path:
+                        _dump_rows.append({
+                            "frame_idx": int(frame_idx),
+                            "anchor": anchor_name,
+                            "factor": float(factor),
+                            "rank": int(cand.get("rank", 0)),
+                            "row": (int(_c_row) if _c_row is not None else None),
+                            "col": (int(_c_col) if _c_col is not None else None),
+                            "bbox": [float(bx), float(by), float(bw), float(bh)],
+                            "center": [float(cx), float(cy)],
+                            "score": float(cand.get("score", 0.0)),
+                            "score_ratio": score_ratio,
+                            "apce": float(apce),
+                            "response_entropy": float(entropy),
+                            "quality": float(quality),
+                            "sim_to_init": float(_cand_sim_init),
+                        })
+
+        if _dump_path and _dump_rows:
+            _best_key = None
+            if best is not None:
+                _best_key = (best["anchor"], best["factor"], best["rank"])
+            for _r in _dump_rows:
+                _r["chosen"] = bool(
+                    _best_key is not None
+                    and (_r["anchor"], _r["factor"], _r["rank"]) == _best_key
+                )
+            try:
+                with open(_dump_path, "a") as _fh:
+                    for _r in _dump_rows:
+                        _fh.write(json.dumps(_r) + "\n")
+            except OSError:
+                pass
+
+        if top_k and top_k > 1:
+            return _redetect_topk(collected, rank_by, int(top_k))
+        return best
 
     def update_with_action(self, frame: np.ndarray, action: "TrackerAction") -> "TrackState":
         """Update tracker for one frame using a SALT-RD TrackerAction.
@@ -647,8 +845,8 @@ class SGLATracker:
         """
         if self._z_tensor is None:
             return False
-
-        # Advisor veto is checked by the caller (salt_runner) before calling this method.
+        if not self._update_enabled:
+            return False
         # Do not call should_block_template_update() here — it has counter side effects
         # (increments n_blocked / n_allowed) and would double-count if called again here.
 
@@ -688,12 +886,47 @@ class SGLATracker:
         self._state = None
         self._template_last_update = 0
         self._template_update_count = 0
+        self._update_enabled = True
+        self._force_layer_idx = -1
+        self._search_factor = _SEARCH_FACTOR
         if self._salt_rd_advisor is not None:
             self._salt_rd_advisor.reset()
 
     def set_salt_rd_advisor(self, advisor: object) -> None:
         """Attach a SALTRDAdvisor instance for Stage 2 advisory/veto mode."""
         self._salt_rd_advisor = advisor
+
+    def set_update_enabled(self, enabled: bool) -> None:
+        """CSCAdvisor gate: allow or block the next try_update_template() call."""
+        self._update_enabled = bool(enabled)
+
+    def set_search_factor(self, factor: float) -> None:
+        """Control hook: set the search-region area factor for the next update().
+
+        The search crop side is ``sqrt(w*h) * factor`` (default 4.0). A larger
+        factor widens the search region — the proper LOST/recovery action when
+        the target may have left the normal crop. Coordinate back-projection
+        flows entirely through ``resize_factor`` (= out_size / crop_sz), so a
+        per-frame factor change stays localisation-consistent. Clamped to
+        ``[base, 4*base]`` to avoid degenerate low-resolution crops.
+        """
+        base = _SEARCH_FACTOR
+        self._search_factor = float(min(max(float(factor), base), 4.0 * base))
+
+    def reset_search_factor(self) -> None:
+        """Restore the default search-region factor (recovery complete)."""
+        self._search_factor = _SEARCH_FACTOR
+
+    @property
+    def capabilities(self):
+        from uav_tracker.trackers.capabilities import TrackerCapabilities
+        return TrackerCapabilities(
+            can_freeze_template=True,   # set_update_enabled() + try_update_template() wired
+            can_widen_search=True,      # set_search_factor() widens the search crop on LOST
+            can_force_reinit=True,
+            can_reject_bbox=True,
+            can_reduce_pruning=False,   # pruning_mode CE exists but not validated
+        )
 
     def override_search_center(self, cx: float, cy: float, w: float, h: float) -> None:
         """Override the search center for the next update() call.

@@ -188,6 +188,7 @@ markers = [
     "property: hypothesis-based property tests",
     "contract: plugin protocol conformance tests",
     "slow: takes >1s; skipped in quick runs",
+    "perf: latency regression tests; skipped when CSC_SKIP_PERF=1",
 ]
 filterwarnings = [
     "error",

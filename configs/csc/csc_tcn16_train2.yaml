@@ -1,0 +1,58 @@
+# train2_v2 Experiment A config
+# - Unified calibration (sglatrack_all_v2)
+# - FCSourceBalancedSampler: LaSOT FC ≤60%, aerial FC ≥30% per batch
+# - Stratified deterministic val split
+# - FC focal weight 4.0, selection: 0.30×F1 + 0.30×AUPRC + 0.25×fc_f1 + 0.15×fc_recall_p
+
+seed: 42
+device: cpu
+val_fraction: 0.15
+stratified_split: true
+
+# FCSourceBalancedSampler config
+sampler_type: fc_source_balanced
+fc_per_batch: 20          # FC windows per batch (of 64 total)
+lasot_fc_cap: 0.60        # max 60% of FC from LaSOT
+aerial_fc_floor: 0.30     # min 30% of FC from aerial (UAVDT+VisDrone)
+
+feature:
+  use_telemetry: true
+  use_bbox_dynamics: true
+  use_geometry_normalised: true
+  window_size: 16
+  clip_value: 8.0
+
+model:
+  kind: tcn
+  feature_dim: 11
+  hidden_dim: 64
+  num_layers: 4
+  dropout: 0.1
+  bidirectional: false
+  n_states: 4
+  tcn:
+    kernel_size: 3
+    num_layers: 4
+    dilations: [1, 2, 4, 8]
+    hidden_dim: 64
+    dropout: 0.1
+
+loss:
+  state_weights: [1.0, 1.5, 2.0, 4.0]
+  risk_weight: 1.0
+  aux_weight: 0.3
+  use_focal: true
+  focal_gamma: 2.0
+
+optim:
+  lr: 1.0e-3
+  weight_decay: 1.0e-4
+  optimizer: adamw
+  epochs: 30
+  batch_size: 64
+  early_stopping_patience: 8
+  grad_clip: 1.0
+  use_balanced_sampler: true
+
+labels_dir: outputs/csc_labels/sglatrack/train2_v2_combined
+output_dir: outputs/csc_training/sglatrack_train2_v2_tcn16

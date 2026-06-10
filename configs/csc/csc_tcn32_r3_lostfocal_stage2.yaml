@@ -1,0 +1,74 @@
+# R3-fcw3 Stage2 RETRAIN — STRONGER lost_aware forecast head.
+# Loads the SAME PROD stage1 (sglatrack_r3_fcw3_w32_tcn32_stage1) and freezes the
+# encoder + loc/conf/derived heads → the 4-state DIAGNOSIS (derived_state, FC) is
+# IDENTICAL to csc_prod. ONLY the 3 forecast heads retrain. Change vs prod:
+#   forecast_lost_weight 0.8 -> 2.5  +  forecast_lost_focal_gamma 2.0
+# (de-saturate the over-confident lost_aware head so it can serve as a control gate).
+# Validation showed the prod lost_aware head saturates ~0.99 on true losses → unusable
+# as a precision/proactive trigger (project_forecast_control_validation).
+# Data = v3fix_combined (lasot+got10k+dtb70+visdrone+uavdt); DTB70 train-only (eval never uses it).
+seed: 42
+device: cpu
+val_fraction: 0.15
+stratified_split: true
+training_stage: 2
+stage1_checkpoint: outputs/csc_training/sglatrack_r3_fcw3_w32_tcn32_stage1/checkpoint_best.pth
+
+sampler_type: fc_source_balanced
+fc_per_batch: 18
+lasot_fc_cap: 0.56
+aerial_fc_floor: 0.39
+aerial_non_fc_floor: 16
+hard_scale_cc_floor: 8
+scale_pct_threshold: 75.0
+
+feature:
+  use_telemetry: true
+  use_bbox_dynamics: true
+  use_geometry_normalised: true
+  window_size: 32
+  clip_value: 8.0
+  feature_version: v2
+
+model:
+  kind: tcn
+  feature_dim: 16
+  hidden_dim: 64
+  num_layers: 4
+  dropout: 0.1
+  bidirectional: false
+  n_states: 4
+  enable_forecast_heads: true
+  forecast_horizon: 10
+  tcn:
+    kernel_size: 3
+    num_layers: 4
+    dilations: [1, 2, 4, 8]
+    hidden_dim: 64
+    dropout: 0.1
+
+loss:
+  state_weights: [1.0, 1.5, 2.0, 3.0]
+  risk_weight: 1.0
+  aux_weight: 0.3
+  use_focal: false
+  focal_gamma: 2.0
+  forecast_failure_weight: 0.8
+  forecast_fc_weight: 1.2
+  forecast_lost_weight: 2.5
+  forecast_lost_focal_gamma: 2.0
+
+optim:
+  lr: 5.0e-4
+  weight_decay: 1.0e-4
+  optimizer: adamw
+  epochs: 25
+  batch_size: 64
+  early_stopping_patience: 10
+  grad_clip: 1.0
+  use_balanced_sampler: true
+  scheduler: cosine
+  min_lr_ratio: 0.02
+
+labels_dir: outputs/csc_labels/sglatrack/v3fix_combined
+output_dir: outputs/csc_training/sglatrack_r3_fcw3lost_w32_tcn32_stage2

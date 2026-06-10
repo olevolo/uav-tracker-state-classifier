@@ -1,0 +1,63 @@
+# R3 (FCw=3) — V2 features + window=32 (clone of R25 + bigger temporal window)
+# Used IF R25 wins vs R2 in fc_n10 score.
+seed: 42
+device: cpu
+val_fraction: 0.15
+stratified_split: true
+training_stage: 1
+
+sampler_type: fc_source_balanced
+fc_per_batch: 18
+lasot_fc_cap: 0.56
+aerial_fc_floor: 0.39
+
+aerial_non_fc_floor: 16
+hard_scale_cc_floor: 8
+scale_pct_threshold: 75.0
+
+feature:
+  feature_version: v2
+  use_telemetry: true
+  use_bbox_dynamics: true
+  use_geometry_normalised: true
+  window_size: 32
+  clip_value: 8.0
+
+model:
+  kind: tcn
+  feature_dim: 16
+  hidden_dim: 64
+  num_layers: 4
+  dropout: 0.1
+  bidirectional: false
+  n_states: 4
+  enable_forecast_heads: false
+  forecast_horizon: 10
+  tcn:
+    kernel_size: 3
+    num_layers: 4
+    dilations: [1, 2, 4, 8]
+    hidden_dim: 64
+    dropout: 0.1
+
+loss:
+  state_weights: [1.0, 1.5, 2.0, 3.0]
+  risk_weight: 0.0
+  aux_weight: 0.3
+  use_focal: true
+  focal_gamma: 2.0
+
+optim:
+  lr: 5.0e-4
+  weight_decay: 1.0e-4
+  optimizer: adamw
+  epochs: 30
+  batch_size: 64
+  early_stopping_patience: 10
+  grad_clip: 1.0
+  use_balanced_sampler: true
+  scheduler: cosine
+  min_lr_ratio: 0.02
+
+labels_dir: outputs/csc_labels/sglatrack/v3fix_combined
+output_dir: outputs/csc_training/sglatrack_r3_fcw3_w32_tcn32_stage1

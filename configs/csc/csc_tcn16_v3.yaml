@@ -1,0 +1,60 @@
+# CSC-V3 TCN-16 — proactive forecast model.
+# Adds 3 binary forecast heads (failure_next_10, false_confirmed_next_10,
+# lost_aware_next_10) on top of the locked V2 3-head architecture.
+#
+# Receptive field: 1 + 2*(1+2+4+8) = 31 — covers the 16-frame window twice.
+# Input features and causality contract are identical to csc_tcn16.yaml.
+# Forecast horizon = 10 frames (paper default).
+
+seed: 42
+device: cpu
+val_fraction: 0.15
+
+feature:
+  use_telemetry: true
+  use_bbox_dynamics: true
+  use_geometry_normalised: true
+  window_size: 16
+  clip_value: 8.0
+
+model:
+  kind: tcn
+  feature_dim: 11        # auto-overridden by builder
+  hidden_dim: 64
+  num_layers: 4
+  dropout: 0.1
+  bidirectional: false
+  n_states: 4
+  enable_forecast_heads: true
+  forecast_horizon: 10
+  tcn:
+    kernel_size: 3
+    num_layers: 4
+    dilations: [1, 2, 4, 8]
+    hidden_dim: 64
+    dropout: 0.1
+
+loss:
+  state_weights: [1.0, 1.5, 2.0, 2.5]
+  risk_weight: 1.0
+  aux_weight: 0.3
+  use_focal: true
+  focal_gamma: 2.0
+  # Forecast head weights (failure / fc / lost) — fc highest because it is
+  # both rarer and the paper's central novelty.
+  forecast_failure_weight: 0.5
+  forecast_fc_weight: 0.8
+  forecast_lost_weight: 0.6
+
+optim:
+  lr: 1.0e-3
+  weight_decay: 1.0e-4
+  optimizer: adamw
+  epochs: 30
+  batch_size: 64
+  early_stopping_patience: 6
+  grad_clip: 1.0
+  use_balanced_sampler: true
+
+labels_dir: outputs/csc_labels
+output_dir: outputs/csc_training/csc_tcn16_v3

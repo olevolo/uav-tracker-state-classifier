@@ -74,6 +74,7 @@ _PLUGIN_MODULES: tuple[str, ...] = (
     "uav_tracker.trackers.kcf_henriques",          # registers "kcf_henriques"
     "uav_tracker.trackers.transformer.ostrack",    # registers "ostrack_256"
     "uav_tracker.trackers.transformer.ortrack",    # registers "ortrack_deit"
+    "uav_tracker.trackers.ostrack",                # registers "ostrack" / "ostrack_384"
 
     # Datasets
     "uav_tracker.datasets.uav123",
