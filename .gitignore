@@ -115,3 +115,24 @@ saltr/tmp/
 
 # ---- Conference / presentation materials (local only) ----
 конференція/
+
+# ---- Heavy assets / vendored upstream ----
+papers/
+docs/
+salrtd/saltr/results/
+salrtd/saltr/archive/
+salrtd/saltr/tmp/
+
+# ---- Archives ----
+*.zip
+*.tar
+*.tar.gz
+*.7z
+*.rar
+
+# ---- Model checkpoints / large binaries ----
+*.pth
+*.pth.tar
+*.pkl
+*.npz
+*.bin
